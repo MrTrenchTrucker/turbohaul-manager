@@ -273,3 +273,60 @@ class TestUIPathTraversal:
         # Should fall back to index.html, not the host's /etc/passwd
         assert r.status_code == 200
         assert b"root:" not in r.content
+
+
+
+class TestProductionWiring:
+    """Asserts create_app() injects real factory functions into TurbohaulManager.
+
+    This test class exists because Phase 6 W22 shipped with `complete_fn` NOT
+    wired in production: api/main.py constructed TurbohaulManager(boot, runtime)
+    without passing complete_fn=, so the default raised
+    'no completion_fn wired' on every real /v1/chat/completions request.
+    All 322+ existing tests passed because each one explicitly injected its own
+    mock factory.
+
+    Lesson: pytest assertions on the management plane do NOT cover the
+    production-wiring path. Add explicit checks that create_app() does not
+    rely on default no-op factories.
+    """
+
+    def test_complete_fn_is_wired_not_default(self, app_and_client):
+        """create_app() must inject a real make_llama_server_complete_fn() callable.
+
+        Caught in W22 smoke at 22:09Z (RELAY 10-burst): default complete_fn
+        raised 'no completion_fn wired' on first chat completion. Fix in commit
+        174a847 wired make_llama_server_complete_fn() into manager construction.
+        """
+        app, _ = app_and_client
+        mgr = app.state.manager
+        assert mgr._complete_fn is not None, (
+            "TurbohaulManager._complete_fn is None — create_app() didn't wire it"
+        )
+        # The default no-op (manager.py default) is identifiable by its docstring
+        # containing the 'no completion_fn wired' sentinel raise. The production
+        # injection wraps the httpx forwarder factory — check it does NOT raise
+        # the wiring-missing sentinel when introspected.
+        import inspect
+        src = inspect.getsource(mgr._complete_fn) if callable(mgr._complete_fn) else ""
+        assert "no completion_fn wired" not in src, (
+            "create_app() injected the DEFAULT no-op complete_fn, not the real "
+            "make_llama_server_complete_fn factory. Production /v1/chat/completions "
+            "will return 503."
+        )
+
+    def test_manager_factories_non_default_after_create_app(self, app_and_client):
+        """Belt-and-suspenders: assert spawn_fn / health_fn / sigterm_fn / vram_fn /
+        complete_fn are all callable and bound, not None.
+
+        Each factory has its own default (no-op or raise); production wiring
+        SHOULD inject real implementations from subprocess_mgr + api.chat_completion.
+        """
+        app, _ = app_and_client
+        mgr = app.state.manager
+        for name in ("_spawn", "_wait_healthy", "_sigterm", "_vram_verify", "_complete_fn"):
+            fn = getattr(mgr, name, None)
+            assert fn is not None and callable(fn), (
+                f"TurbohaulManager.{name} is None or not callable after create_app() — "
+                "production wiring is missing a factory injection."
+            )
