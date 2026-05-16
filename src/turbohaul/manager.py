@@ -137,7 +137,11 @@ class TurbohaulManager:
         self._active_slot: Slot | None = None
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
-        self._lock = asyncio.Lock()
+        # GRIP M-2 fix: removed unused self._lock = asyncio.Lock(). It had
+        # zero acquire sites (single-task worker_loop discipline protects
+        # _active_handle / _active_slot mutations). If Wave-6 lands a
+        # second mutating task, re-add it purposefully and wrap the call
+        # sites that actually need it.
         self._binary_fd: int | None = None  # HAUL P-4: TOCTOU-pinned fd
         # Event bus for /ws/state subscribers (v0.2 §11.1 redacted)
         self.event_bus = EventBus()
@@ -529,6 +533,38 @@ class TurbohaulManager:
                             and not matched.completion_future.done()
                         ):
                             matched.completion_future.set_result(result2)
+                    except asyncio.CancelledError:
+                        # AM-2 fix (HAUL DAG): cancellation mid-ACTIVE_MATCH
+                        # must terminal-park the matched slot so it does not
+                        # rot as a zombie ACTIVE row in state.sqlite, then
+                        # re-raise so worker_loop's teardown runs cleanly.
+                        self._fail_completion_future(
+                            matched,
+                            asyncio.CancelledError("shutdown during active_match"),
+                        )
+                        try:
+                            transition(matched, SlotState.POPPED)
+                        except InvalidTransition:
+                            pass
+                        self._audit(matched, "active_match_cancelled")
+                        try:
+                            _am_conn = open_state_db(
+                                self.boot.storage.state_db_path
+                            )
+                            try:
+                                mark_slot_ended(
+                                    _am_conn,
+                                    matched.slot_id,
+                                    "active_match_cancelled",
+                                )
+                            finally:
+                                _am_conn.close()
+                        except Exception:
+                            log.exception(
+                                "AM-2 cleanup mark_slot_ended failed for %s",
+                                matched.slot_id,
+                            )
+                        raise
                     except Exception as e:  # noqa: BLE001 -- per-slot isolation
                         completed_ok = False
                         self._fail_completion_future(matched, e)
