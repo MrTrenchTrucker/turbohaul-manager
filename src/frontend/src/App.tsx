@@ -1,6 +1,8 @@
 import { Routes, Route, Link, useLocation } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import Dashboard from './components/Dashboard';
+import Queue from './components/Queue';
+import Blob from './components/Blob';
 
 function Layout({ children }: { children: ReactNode }) {
   const loc = useLocation();
@@ -52,8 +54,8 @@ export default function App() {
     <Layout>
       <Routes>
         <Route path="/" element={<Dashboard />} />
-        <Route path="/queue" element={<Stub name="Queue" />} />
-        <Route path="/blob" element={<Stub name="Blob" />} />
+        <Route path="/queue" element={<Queue />} />
+        <Route path="/blob" element={<Blob />} />
         <Route path="/config" element={<Stub name="Config" />} />
         <Route path="/logs" element={<Stub name="Logs" />} />
         <Route path="/settings" element={<Stub name="Settings" />} />
