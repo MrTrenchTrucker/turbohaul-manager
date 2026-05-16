@@ -258,6 +258,10 @@ def write_manifest_atomic(
             f.write(yaml_text)
             f.flush()
             os.fsync(f.fileno())
+        # HAUL M-3: chmod the tempfile BEFORE rename so the final inode
+        # never has a window with tempfile's default mode (mkstemp is
+        # 0o600 on Linux already, this is paranoia-grade defense in depth).
+        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, target)
         # fsync parent dir (POSIX durability)
         dir_fd = os.open(str(target.parent), os.O_RDONLY)
@@ -265,7 +269,6 @@ def write_manifest_atomic(
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
-        os.chmod(target, 0o600)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_path)

@@ -17,12 +17,59 @@ import fcntl
 import logging
 import os
 import signal
+import shutil
 import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+# HAUL P-5: absolute path for nvidia-smi (PATH-injection-resistant).
+_NVIDIA_SMI_PATH = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
+
+
+def _detect_subreaper_pid() -> int | None:
+    """HAUL Si-1: detect a sub-reaper PID for orphan-detection (containers
+    using tini / systemd Restart=always / PR_SET_CHILD_SUBREAPER).
+
+    Returns the PID of the manager process's OLDEST ancestor that is
+    NOT pid 1, or None if the manager IS pid 1. Anything reparented to
+    this subreaper (or to pid 1) is a candidate orphan.
+    """
+    try:
+        ppid = os.getppid()
+    except Exception:
+        return None
+    if ppid == 1:
+        return None
+    # Walk parent chain until we hit pid 1.
+    seen: set[int] = set()
+    current = ppid
+    for _ in range(50):  # bounded
+        if current in seen or current <= 1:
+            break
+        seen.add(current)
+        try:
+            status_text = Path(f"/proc/{current}/status").read_text(
+                errors="ignore"
+            )
+        except (FileNotFoundError, PermissionError, OSError):
+            break
+        next_ppid: int | None = None
+        for line in status_text.splitlines():
+            if line.startswith("PPid:"):
+                with contextlib.suppress(ValueError, IndexError):
+                    next_ppid = int(line.split()[1])
+                break
+        if next_ppid is None or next_ppid <= 1:
+            break
+        current = next_ppid
+    return current if current > 1 else None
+
+
+_SUBREAPER_PID: int | None = _detect_subreaper_pid()
 
 
 class SingletonViolation(RuntimeError):
@@ -62,7 +109,7 @@ def scan_gpu_compute_apps() -> list[dict]:
     try:
         out = subprocess.check_output(
             [
-                "nvidia-smi",
+                _NVIDIA_SMI_PATH,
                 "--query-compute-apps=pid,used_memory",
                 "--format=csv,noheader,nounits",
             ],
@@ -127,7 +174,13 @@ def find_orphan_llama_servers(port_base: int, port_range_size: int = 100) -> lis
         cmdline = _read_proc_cmdline(pid)
         if not cmdline or "llama-server" not in cmdline:
             continue
-        if _read_proc_ppid(pid) != 1:
+        ppid = _read_proc_ppid(pid)
+        # HAUL Si-1: accept PPid in {1, subreaper} so we catch orphans
+        # reparented to a sub-reaper (tini / systemd) rather than init.
+        allowed_reapers = {1}
+        if _SUBREAPER_PID is not None:
+            allowed_reapers.add(_SUBREAPER_PID)
+        if ppid not in allowed_reapers:
             continue
         # Try to find --port in cmdline
         port: int | None = None
@@ -143,8 +196,35 @@ def find_orphan_llama_servers(port_base: int, port_range_size: int = 100) -> lis
     return orphans
 
 
+def _read_proc_starttime(pid: int) -> int | None:
+    """HAUL Si-2: read /proc/<pid>/stat field 22 (starttime, jiffies-since-boot).
+
+    Used to distinguish original process from a PID-reused replacement on
+    busy systems where the kernel can recycle a freed pid within seconds.
+    """
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(errors="ignore")
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    # Field 22 is starttime. Fields 1-2 may include spaces in the comm,
+    # so split off the comm parenthesized region first.
+    rp = stat_text.rfind(")")
+    if rp == -1:
+        return None
+    rest = stat_text[rp + 1:].split()
+    if len(rest) < 20:  # field 3..22 -> indices 0..19 in rest
+        return None
+    with contextlib.suppress(ValueError):
+        return int(rest[19])
+    return None
+
 def reap_orphan(pid: int, sigterm_wait_s: float = 5.0) -> tuple[bool, str]:
-    """SIGTERM the orphan; wait; SIGKILL on timeout. Returns (success, status_str)."""
+    """SIGTERM the orphan; wait; SIGKILL on timeout. Returns (success, status_str).
+
+    HAUL Si-2: capture starttime BEFORE signaling; compare in final check to
+    distinguish original process from a PID-reused replacement.
+    """
+    original_starttime = _read_proc_starttime(pid)
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -164,6 +244,16 @@ def reap_orphan(pid: int, sigterm_wait_s: float = 5.0) -> tuple[bool, str]:
         os.kill(pid, signal.SIGKILL)
         time.sleep(0.5)
         os.kill(pid, 0)
+        # HAUL Si-2: verify the alive pid is still our original process by
+        # comparing starttime; if different the original is gone and a
+        # new process re-used the pid.
+        current_starttime = _read_proc_starttime(pid)
+        if (
+            original_starttime is not None
+            and current_starttime is not None
+            and current_starttime != original_starttime
+        ):
+            return True, "sigkill-clean-pid-reused"
         return False, "sigkill-failed-still-alive"
     except ProcessLookupError:
         return True, "sigkill-clean"

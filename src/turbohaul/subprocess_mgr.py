@@ -18,6 +18,7 @@ import hashlib
 import logging
 import os
 import signal
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
@@ -28,6 +29,12 @@ import httpx
 
 
 log = logging.getLogger(__name__)
+
+
+# HAUL P-5 fix: resolve nvidia-smi to absolute path at module load so a
+# later PATH-poisoning attempt (env injection, attacker-controlled $PATH
+# entry) cannot redirect the lookup at run time.
+_NVIDIA_SMI_PATH = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
 
 
 class HealthCheckFailed(RuntimeError):
@@ -172,7 +179,7 @@ async def wait_until_healthy(
 def _default_nvidia_smi_runner() -> str:
     return subprocess.check_output(
         [
-            "nvidia-smi",
+            _NVIDIA_SMI_PATH,
             "--query-gpu=memory.used",
             "--format=csv,noheader,nounits",
             "-i", "0",

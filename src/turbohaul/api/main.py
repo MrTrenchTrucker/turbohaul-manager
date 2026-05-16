@@ -145,20 +145,23 @@ def create_app(
         live_runtime = mgr.runtime
         return {
             "server": boot.server.model_dump(mode="json"),
+            # HAUL A-1: redact internal paths to basename. Disclosing full
+            # absolute paths gave a rebind-pivoting attacker the exact
+            # write targets on disk. UI only needs basenames anyway.
             "storage": {
-                "blob_store_path": str(boot.storage.blob_store_path),
-                "manifests_path": str(boot.storage.manifests_path),
-                "import_allowed_root": str(boot.storage.import_allowed_root),
-                "state_db_path": str(boot.storage.state_db_path),
+                "blob_store_path": boot.storage.blob_store_path.name,
+                "manifests_path": boot.storage.manifests_path.name,
+                "import_allowed_root": boot.storage.import_allowed_root.name,
+                "state_db_path": boot.storage.state_db_path.name,
             },
             "runtime": {
-                "llama_server_binary": str(boot.runtime.llama_server_binary),
+                "llama_server_binary": boot.runtime.llama_server_binary.name,
                 "llama_server_binary_sha256": boot.runtime.llama_server_binary_sha256,
                 "default_port_base": boot.runtime.default_port_base,
             },
             "ui": {
                 "enabled": boot.ui.enabled,
-                "static_path": str(boot.ui.static_path),
+                "static_path": boot.ui.static_path.name,
             },
             "queue": live_runtime.queue.model_dump(mode="json"),
             "pull": live_runtime.pull.model_dump(mode="json"),

@@ -96,7 +96,7 @@ def write_stream_atomic(
     bytes_written = 0
 
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             with os.fdopen(fd, "wb") as f:
                 for chunk in chunks:
@@ -170,7 +170,7 @@ async def write_stream_atomic_async(
     bytes_written = 0
 
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             with os.fdopen(fd, "wb") as f:
                 async for chunk in chunks:
@@ -255,12 +255,15 @@ def verify_blob_on_stage(blobs_root: Path, expected_sha256: str) -> bool:
 
 
 def delete_blob(blobs_root: Path, sha256: str) -> bool:
-    """Delete a blob. Returns True if existed + removed."""
+    """Delete a blob. Returns True if existed + removed.
+
+    HAUL B-2: unlink does not require write permission on the file (POSIX
+    only checks write on the parent dir); the prior chmod 0o400 -> 0o600
+    created a needless tamper window.
+    """
     path = blob_path(blobs_root, sha256)
     if not path.exists():
         return False
-    # 0o400 is read-only - need to chmod first
-    os.chmod(str(path), 0o600)
     os.unlink(str(path))
     return True
 
