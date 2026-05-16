@@ -24,7 +24,7 @@ LEGAL_TRANSITIONS: dict[SlotState, set[SlotState]] = {
     # from queue.remove() while its DB state stays STAGED forever — the
     # alternating-pattern bug observed during RELAY's 10-burst at 22:13Z.
     SlotState.STAGED: {SlotState.LOADING, SlotState.COLD, SlotState.ACTIVE_MATCH},
-    SlotState.LOADING: {SlotState.ACTIVE, SlotState.LOADING_FAIL},
+    SlotState.LOADING: {SlotState.ACTIVE, SlotState.LOADING_FAIL, SlotState.COLD},  # +COLD per GRIP H-5
     # Retry from LOADING_FAIL → re-STAGED; on retry-exhaust → POPPED
     SlotState.LOADING_FAIL: {SlotState.STAGED, SlotState.POPPED},
     SlotState.ACTIVE: {SlotState.GRACE, SlotState.ACTIVE_MATCH},

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from turbohaul.config import BootConfig, RuntimeConfig
-from turbohaul.fsm import InvalidTransition, is_terminal, transition
+from turbohaul.fsm import LEGAL_TRANSITIONS, InvalidTransition, is_terminal, transition
 from turbohaul.manifest import flags_to_argv, read_manifest
 from turbohaul.queue import GraceTimer, IdleHotTimer, TurbohaulQueue
 from turbohaul.singleton import boot_orphan_reaper, detect_foreign_gpu_apps
@@ -478,10 +478,29 @@ class TurbohaulManager:
                     matched.port = handle.port
                     matched.pid = handle.pid
                     self._active_slot = matched
-                    transition(matched, SlotState.ACTIVE_MATCH)
-                    self._audit(matched, "active_match_promoted")
-                    transition(matched, SlotState.ACTIVE)
+                    # AM-1 fix (HAUL DAG): state-drift guard. If matched.state
+                    # drifted between find_matched_thread + here (concurrent
+                    # reconcile, retry path, etc.), transition raises
+                    # InvalidTransition which would crash worker_loop. Wrap
+                    # the promotion + park-on-drift instead of propagate.
+                    try:
+                        transition(matched, SlotState.ACTIVE_MATCH)
+                        self._audit(matched, "active_match_promoted")
+                        transition(matched, SlotState.ACTIVE)
+                    except InvalidTransition as drift_err:
+                        log.warning(
+                            "active_match state drift: slot %s in %s — terminal-park; %s",
+                            matched.slot_id, matched.state.value, drift_err,
+                        )
+                        self._fail_completion_future(matched, drift_err)
+                        await self._force_cold(
+                            matched,
+                            f"active_match_state_drift:{matched.state.value}",
+                        )
+                        self._active_slot = slot
+                        continue
                     matched.started_active_at = time.monotonic()
+                    completed_ok = True
                     try:
                         result2 = await self._complete_fn(matched, handle)
                         if (
@@ -490,34 +509,41 @@ class TurbohaulManager:
                         ):
                             matched.completion_future.set_result(result2)
                     except Exception as e:  # noqa: BLE001 -- per-slot isolation
+                        completed_ok = False
                         self._fail_completion_future(matched, e)
                         log.exception(
                             "active_match completion failed for slot %s",
                             matched.slot_id,
                         )
+                    # GRIP M-1 fix: on completion failure, skip grace pretense
+                    # — go ACTIVE → GRACE → POPPED + mark failed, keep state
+                    # machine honest. (transition validates each hop.)
                     transition(matched, SlotState.GRACE)
-                    self._audit(matched, "active_match_to_grace")
-                    if self.grace.restart_for_followup():
-                        deadline = time.monotonic() + self.runtime.queue.grace_seconds
-                        self._audit_event_only(
-                            matched.slot_id,
-                            "grace_extended_via_active_match",
-                            {"extension_count": self.grace.extension_count},
-                        )
+                    if completed_ok:
+                        self._audit(matched, "active_match_to_grace")
+                        if self.grace.restart_for_followup():
+                            # GRIP H-1 fix: also bump per-slot extension_count
+                            # (was always 0 in sqlite — only GraceTimer's was).
+                            matched.extension_count = self.grace.extension_count
+                            deadline = time.monotonic() + self.runtime.queue.grace_seconds
+                            self._audit_event_only(
+                                matched.slot_id,
+                                "grace_extended_via_active_match",
+                                {"extension_count": self.grace.extension_count},
+                            )
+                    else:
+                        self._audit(matched, "active_match_failed")
                     # C1 fix (GRIP DAG): matched slot's request is done; its
                     # sidecar was the anchor's warm process (reused, not its own).
-                    # Without this transition, every match accumulates a zombie
-                    # sqlite row in GRACE state with ended_at=NULL, which
-                    # boot_reconcile mistakenly counts as alive (inherited pid).
                     # Anchor `slot` remains the GRACE driver until grace expiry.
                     transition(matched, SlotState.POPPED)
-                    self._audit(matched, "active_match_completed")
+                    self._audit(matched, "active_match_completed" if completed_ok else "active_match_failed_terminal")
                     _am_conn = open_state_db(self.boot.storage.state_db_path)
                     try:
                         mark_slot_ended(
                             _am_conn,
                             matched.slot_id,
-                            "active_match_completed",
+                            "active_match_completed" if completed_ok else "active_match_failed",
                         )
                     finally:
                         _am_conn.close()
@@ -559,16 +585,41 @@ class TurbohaulManager:
                 conn.close()
 
     async def _force_cold(self, slot: Slot, reason: str) -> None:
-        """Mark a slot COLD when processing dies mid-flight."""
+        """Mark a slot COLD when processing dies mid-flight.
+
+        GRIP H-5 fix: walk legal transitions to COLD from any non-terminal
+        state instead of silent direct-mutation. fsm.py LEGAL_TRANSITIONS now
+        carries STAGED→COLD, LOADING→COLD, LOADING_FAIL→POPPED, POPPED→COLD,
+        ACTIVE→GRACE→POPPED→COLD, IDLE_HOT→COLD. Memory and DB state stay
+        in sync (no drift where slot.state stays e.g. LOADING in Python
+        while sqlite reads state='COLD').
+        """
+        # Walk legal hops to COLD per the new FSM table.
+        # Worst case: ACTIVE → GRACE → POPPED → COLD (3 hops).
         if not is_terminal(slot.state):
-            try:
-                # Best-effort - jump directly to a terminal state via legal path
-                if slot.state == SlotState.ACTIVE or slot.state == SlotState.GRACE:
-                    transition(slot, SlotState.POPPED)
-                if slot.state == SlotState.POPPED:
+            for _ in range(4):  # bounded — FSM diameter to COLD is 3
+                if slot.state == SlotState.COLD:
+                    break
+                legal = LEGAL_TRANSITIONS.get(slot.state, set())
+                if SlotState.COLD in legal:
                     transition(slot, SlotState.COLD)
-            except InvalidTransition:
-                slot.state = SlotState.COLD
+                    break
+                # Step toward COLD via the cheapest-distance hop.
+                if SlotState.POPPED in legal:
+                    transition(slot, SlotState.POPPED)
+                elif SlotState.GRACE in legal:
+                    transition(slot, SlotState.GRACE)
+                elif SlotState.LOADING_FAIL in legal:
+                    transition(slot, SlotState.LOADING_FAIL)
+                else:
+                    # No legal hop — terminal-park as COLD directly only as
+                    # absolute last resort. Log for diagnostics.
+                    log.warning(
+                        "_force_cold: no legal hop from %s — direct-set COLD",
+                        slot.state.value,
+                    )
+                    slot.state = SlotState.COLD
+                    break
         conn = open_state_db(self.boot.storage.state_db_path)
         try:
             mark_slot_ended(conn, slot.slot_id, reason)
