@@ -85,7 +85,7 @@ class PullConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hf_api_key_env: str = "HF_API_KEY"
-    hf_host_allowlist: list[str] = Field(default_factory=lambda: ["huggingface.co", "hf.co"])
+    hf_host_allowlist: list[str] = Field(default_factory=lambda: ["huggingface.co", "hf.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.hf.co", "cdn-lfs-eu-1.hf.co"])
     pull_url_https_only: bool = True
     pull_concurrency: int = Field(default=2, ge=1, le=16)
     pull_chunk_size_mb: int = Field(default=64, ge=1, le=1024)

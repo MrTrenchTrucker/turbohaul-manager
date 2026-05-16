@@ -49,7 +49,7 @@ queue:
   drained_sigterm_window_cold_s: 5
 pull:
   hf_api_key_env: HF_API_KEY
-  hf_host_allowlist: ["huggingface.co", "hf.co"]
+  hf_host_allowlist: ["huggingface.co", "hf.co", "cdn-lfs.huggingface.co"]
   pull_url_https_only: true
   pull_concurrency: 2
   pull_chunk_size_mb: 64

@@ -10,6 +10,7 @@ ceiling. Progress events emit to /ws/state via mgr.event_bus.
 import logging
 import os
 import secrets
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -61,11 +62,73 @@ def _double_resolve_check(url: str) -> tuple[str, str]:
 
 
 async def _stream_chunks(client: httpx.AsyncClient, url: str, headers: dict):
-    """Yield bytes from an HTTP GET stream."""
+    """Legacy one-shot streamer kept for tests / non-redirect callers."""
     async with client.stream("GET", url, headers=headers) as resp:
         resp.raise_for_status()
         async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
             yield chunk
+
+
+async def _stream_with_redirects(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    *,
+    allowlist_check=None,
+    max_hops: int = 5,
+):
+    """HAUL S-2 fix: redirect-aware streaming with per-hop SSRF validation.
+
+    On each hop:
+    - run _double_resolve_check(current_url) to catch DNS rebind +
+      RFC1918 / NAT64 / IPv4-compat-IPv6 / metadata-IP bypass (S-1 + S-3)
+    - if allowlist_check is not None: assert it accepts the current host
+      (HF allowlist gating; pull_url passes None)
+    - strip Authorization header on any cross-host hop (defense in depth;
+      httpx 0.21+ does this by default but make the policy explicit so a
+      requirements.txt downgrade does not silently regress)
+    - bail after max_hops to bound redirect-loop blast radius
+
+    Yields bytes once a non-30x response with the body lands.
+    """
+    current_url = url
+    current_headers = dict(headers)
+    prev_host: str | None = None
+    for hop in range(max_hops):
+        host, _ip = _double_resolve_check(current_url)
+        if allowlist_check is not None and not allowlist_check(host):
+            raise UrlSafetyError(
+                f"redirect host {host} not in allowlist (hop={hop})"
+            )
+        if prev_host is not None and host != prev_host:
+            current_headers = {
+                k: v
+                for k, v in current_headers.items()
+                if k.lower() != "authorization"
+            }
+        async with client.stream(
+            "GET", current_url, headers=current_headers
+        ) as resp:
+            location = None
+            try:
+                location = resp.headers.get("location")
+            except AttributeError:
+                location = None
+            if (
+                300 <= resp.status_code < 400
+                and location
+            ):
+                next_url = urljoin(current_url, location)
+                prev_host = host
+                current_url = next_url
+                continue
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                yield chunk
+            return
+    raise UrlSafetyError(
+        f"too many redirects (>{max_hops}) starting from {url}"
+    )
 
 
 def _http_client_factory_from_app(app):
@@ -100,7 +163,7 @@ async def pull_url(payload: dict, request: Request) -> dict:
         async with factory() as client:
             sha, bytes_written = await write_stream_atomic_async(
                 blobs_root,
-                _stream_chunks(client, url, {}),
+                _stream_with_redirects(client, url, {}),
                 expected_sha256=expected_sha256,
                 per_stream_max_bytes=mgr.runtime.pull.per_stream_max_bytes,
             )
@@ -200,7 +263,12 @@ async def pull_hf(payload: dict, request: Request) -> dict:
         async with factory() as client:
             sha, bytes_written = await write_stream_atomic_async(
                 blobs_root,
-                _stream_chunks(client, url, headers),
+                _stream_with_redirects(
+                    client,
+                    url,
+                    headers,
+                    allowlist_check=lambda h: is_hf_host(h, allowlist),
+                ),
                 expected_sha256=expected_sha256,
                 per_stream_max_bytes=mgr.runtime.pull.per_stream_max_bytes,
             )
