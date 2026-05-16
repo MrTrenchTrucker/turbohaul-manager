@@ -6,6 +6,7 @@ streaming implementation lands in Wave 6 alongside the API layer that forwards
 to llama-server.
 """
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -30,6 +31,7 @@ from turbohaul.state import (
 from turbohaul.subprocess_mgr import (
     SidecarHandle,
     drained_sigterm,
+    open_and_verify_binary,
     spawn_sidecar,
     verify_binary_sha256,
     verify_vram_cleared,
@@ -136,6 +138,7 @@ class TurbohaulManager:
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._binary_fd: int | None = None  # HAUL P-4: TOCTOU-pinned fd
         # Event bus for /ws/state subscribers (v0.2 §11.1 redacted)
         self.event_bus = EventBus()
         # Injection points (default = real subprocess_mgr; tests inject mocks)
@@ -223,11 +226,31 @@ class TurbohaulManager:
         }
 
     def verify_binary(self) -> bool:
-        """Verify llama_server_binary sha256 pin at boot (v0.2 §7.1)."""
-        return verify_binary_sha256(
-            self.boot.runtime.llama_server_binary,
-            self.boot.runtime.llama_server_binary_sha256,
-        )
+        """Verify + TOCTOU-pin llama_server_binary at boot (v0.2 §7.1 + HAUL P-4).
+
+        Empty expected_sha256 = dev mode -- verify_binary_sha256 returns True
+        with no fd pinning; spawn_sidecar falls back to path-based exec.
+        Non-empty + matching hash = an inode-pinned fd is held on
+        self._binary_fd and every spawn execs via ``/proc/self/fd/<fd>``,
+        closing the swap window.
+        """
+        binary_path = self.boot.runtime.llama_server_binary
+        expected = self.boot.runtime.llama_server_binary_sha256
+        if not verify_binary_sha256(binary_path, expected):
+            return False
+        if self._binary_fd is not None:
+            # Defensive: close prior fd if verify_binary called twice
+            with contextlib.suppress(OSError):
+                os.close(self._binary_fd)
+            self._binary_fd = None
+        if expected:
+            self._binary_fd = open_and_verify_binary(binary_path, expected)
+            if self._binary_fd is None:
+                log.error(
+                    "binary hash drift between verify and fd-pin -- refusing"
+                )
+                return False
+        return True
 
     # === Request acceptance =================================================
 
@@ -428,6 +451,7 @@ class TurbohaulManager:
                 port,
                 slot.model_tag,
                 argv,
+                binary_fd=self._binary_fd,
             )
             slot.port = handle.port
             slot.pid = handle.pid
@@ -682,3 +706,8 @@ class TurbohaulManager:
             except asyncio.CancelledError:
                 pass
         await self.queue.close()
+        # HAUL P-4: release the TOCTOU-pinned binary fd on shutdown
+        if self._binary_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._binary_fd)
+            self._binary_fd = None

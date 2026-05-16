@@ -73,7 +73,7 @@ class TestWorkerLoopFullCycle:
         vram_calls = []
         complete_calls = []
 
-        def fake_spawn(binary, gguf, port, model_tag, argv):
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
             spawn_calls.append({"model_tag": model_tag, "port": port, "argv": argv})
             return _make_fake_handle(model_tag, port)
 
@@ -128,7 +128,7 @@ class TestWorkerLoopFullCycle:
         """Verify the FSM transition events land in audit_events table."""
         boot, runtime = _boot_runtime(tmp_path, grace_seconds=0)
 
-        def fake_spawn(binary, gguf, port, model_tag, argv):
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
             return _make_fake_handle(model_tag, port)
 
         async def fake_health(port, timeout_s, **kwargs):
@@ -171,7 +171,7 @@ class TestWorkerLoopFullCycle:
     async def test_loading_fail_health_timeout_pops(self, tmp_path):
         boot, runtime = _boot_runtime(tmp_path, grace_seconds=0)
 
-        def fake_spawn(binary, gguf, port, model_tag, argv):
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
             return _make_fake_handle(model_tag, port)
 
         async def fake_health_timeout(port, timeout_s, **kwargs):
@@ -214,7 +214,7 @@ class TestWorkerLoopFullCycle:
         boot, runtime = _boot_runtime(tmp_path, grace_seconds=0)
         spawn_calls = []
 
-        def fake_spawn(binary, gguf, port, model_tag, argv):
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
             spawn_calls.append(model_tag)
             return _make_fake_handle(model_tag, port)
 

@@ -61,7 +61,7 @@ def app_with_completion(tmp_path):
     mgr = app.state.manager
 
     # Wire mocked spawn / health / sigterm / vram / complete that return canned responses
-    def fake_spawn(binary, gguf, port, model_tag, argv):
+    def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
         return _make_handle(model_tag, port)
 
     async def fake_health(port, timeout_s, **kwargs):
@@ -211,7 +211,7 @@ def app_completion_autostart(tmp_path):
     app = create_app(boot, runtime, auto_start_worker=True, auto_boot_reconcile=False)
     mgr = app.state.manager
 
-    def fake_spawn(binary, gguf, port, model_tag, argv):
+    def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
         return _make_handle(model_tag, port)
 
     async def fake_health(port, timeout_s, **kwargs):

@@ -63,20 +63,35 @@ def spawn_sidecar(
     model_tag: str,
     argv_flags: list[str],
     popen_factory: Callable[..., subprocess.Popen] | None = None,
+    binary_fd: int | None = None,
 ) -> SidecarHandle:
     """Spawn a llama-server child in its own process group (setsid).
 
     popen_factory exists for test injection. Default = subprocess.Popen.
     """
     factory = popen_factory or subprocess.Popen
+    # HAUL P-4 fix: if a pinned fd is provided, exec via /proc/self/fd/<fd>
+    # so the inode we hashed at boot is exactly what we exec; the path could
+    # have been swapped after verify, but the fd still points to the right
+    # inode. Falls back to path-based exec when binary_fd is None (dev mode
+    # / empty sha256).
+    if binary_fd is not None:
+        exec_path = f"/proc/self/fd/{binary_fd}"
+        pass_fds: tuple[int, ...] = (binary_fd,)
+    else:
+        exec_path = str(binary)
+        pass_fds = ()
     cmd = [
-        str(binary),
+        exec_path,
         "--port", str(port),
         "--host", "127.0.0.1",
         "-m", str(gguf_path),
         *argv_flags,
     ]
-    log.info("spawning llama-server pid=? port=%d model=%s", port, model_tag)
+    log.info(
+        "spawning llama-server pid=? port=%d model=%s pinned_fd=%s",
+        port, model_tag, "yes" if binary_fd is not None else "no",
+    )
     # HAUL P-3 fix: stdout/stderr to DEVNULL — PIPE without an active drainer
     # fills the 64KB OS pipe buffer once llama-server emits enough log lines
     # (model load + slot ops + per-token perf), at which point write(2) blocks
@@ -88,6 +103,7 @@ def spawn_sidecar(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,  # setsid - own process group → killpg works
+        pass_fds=pass_fds,
     )
     return SidecarHandle(proc=proc, port=port, model_tag=model_tag)
 
@@ -287,3 +303,46 @@ def verify_binary_sha256(binary_path: Path, expected_sha256: str) -> bool:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest() == expected_sha256
+
+
+def open_and_verify_binary(binary_path: Path, expected_sha256: str) -> int | None:
+    """HAUL P-4 fix: open llama-server binary fd at boot + verify sha256 via fd.
+
+    Returns:
+      - the open fd (caller must keep it alive for process lifetime) on hash match
+      - None on empty expected_sha256 (dev mode, no pinning needed)
+      - None on hash mismatch or path missing
+
+    Pairs with ``spawn_sidecar(..., binary_fd=fd)`` which execs via
+    ``/proc/self/fd/<fd>``. Because the fd points at a specific inode that has
+    already been hashed, any later attacker-write to ``binary_path`` cannot
+    redirect the spawn to a different binary -- even if the path is overwritten,
+    renamed, or replaced. The TOCTOU window between hash-check and exec is
+    closed at the kernel level (inode pin via open fd).
+
+    O_CLOEXEC is intentionally NOT set: the fd must survive fork+exec so the
+    child can resolve ``/proc/self/fd/<fd>`` at exec time. subprocess.Popen
+    ``pass_fds`` keeps the fd inheritable across its close-fds sweep.
+    """
+    if not expected_sha256:
+        return None  # dev mode -- no pinning needed
+    if not binary_path.exists():
+        return None
+    fd = os.open(str(binary_path), os.O_RDONLY)
+    try:
+        h = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+        if h.hexdigest() != expected_sha256:
+            os.close(fd)
+            return None
+        # Reset offset (defensive; exec doesn't care).
+        os.lseek(fd, 0, 0)
+        return fd
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
