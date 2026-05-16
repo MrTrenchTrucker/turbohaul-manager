@@ -172,3 +172,36 @@ class TestReconcileOrphanedSlots:
             row = cur.fetchone()
             assert row["state"] == "COLD"
             assert row["end_reason"] == "boot-reconcile-orphaned-pid"
+
+    def test_marks_pid_null_pre_active_orphans_cold(self, tmp_path):
+        """GRIP H-2: slots with pid=NULL in pre-active state are reconciled."""
+        with state_db_session(tmp_path / "state.sqlite") as conn:
+            upsert_slot(
+                conn, {"slot_id": "s_staged", "model_tag": "m", "state": "STAGED"}
+            )
+            upsert_slot(
+                conn, {"slot_id": "s_received", "model_tag": "m", "state": "RECEIVED"}
+            )
+            upsert_slot(
+                conn, {"slot_id": "s_loading_fail", "model_tag": "m", "state": "LOADING_FAIL"}
+            )
+            # pre-existing COLD slot must NOT be touched again
+            upsert_slot(
+                conn, {"slot_id": "s_cold", "model_tag": "m", "state": "COLD"}
+            )
+            n = reconcile_orphaned_slots(conn, live_pids=set())
+            assert n == 3
+            for sid in ("s_staged", "s_received", "s_loading_fail"):
+                cur = conn.execute(
+                    "SELECT state, end_reason FROM slots WHERE slot_id=?", (sid,)
+                )
+                row = cur.fetchone()
+                assert row["state"] == "COLD"
+                assert row["end_reason"] == "boot-reconcile-pre-active-orphan"
+            cur = conn.execute(
+                "SELECT state, end_reason FROM slots WHERE slot_id=?", ("s_cold",)
+            )
+            row = cur.fetchone()
+            assert row["state"] == "COLD"
+            # No end_reason rewrite on pre-cold slots
+            assert row["end_reason"] is None

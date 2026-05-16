@@ -169,9 +169,19 @@ def mark_slot_ended(conn: sqlite3.Connection, slot_id: str, reason: str) -> None
 
 
 def reconcile_orphaned_slots(conn: sqlite3.Connection, live_pids: set[int]) -> int:
-    """Mark slots as COLD if their pid is no longer alive.
+    """Mark slots as COLD if their pid is no longer alive OR if pre-active orphan.
 
     Called at boot after orphan reaper runs. Returns count of slots marked.
+
+    Two passes:
+    1. Slots with pid set but pid NOT in live_pids -> 'boot-reconcile-orphaned-pid'
+    2. Slots with pid IS NULL in a pre-active state (RECEIVED / STAGED /
+       LOADING / LOADING_FAIL / GRACE / ACTIVE_MATCH) -> 
+       'boot-reconcile-pre-active-orphan'. These cannot be live since they
+       were never assigned a pid (caller crashed pre-spawn).
+
+    GRIP H-2 fix: previously pid=NULL slots survived reboots in pre-active
+    state forever; new second pass catches them.
     """
     cur = conn.execute(
         """SELECT slot_id, pid FROM slots
@@ -185,4 +195,16 @@ def reconcile_orphaned_slots(conn: sqlite3.Connection, live_pids: set[int]) -> i
         if row["pid"] not in live_pids:
             mark_slot_ended(conn, row["slot_id"], "boot-reconcile-orphaned-pid")
             n += 1
+    # GRIP H-2: pid-NULL pre-active orphans (never spawned, never have a pid)
+    cur = conn.execute(
+        """SELECT slot_id FROM slots
+           WHERE pid IS NULL
+             AND state NOT IN ('POPPED', 'COLD', 'IDLE_HOT')
+             AND ended_at IS NULL"""
+    )
+    for row in cur.fetchall():
+        mark_slot_ended(
+            conn, row["slot_id"], "boot-reconcile-pre-active-orphan"
+        )
+        n += 1
     return n
