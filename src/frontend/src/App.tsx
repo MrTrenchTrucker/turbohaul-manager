@@ -3,6 +3,9 @@ import type { ReactNode } from 'react';
 import Dashboard from './components/Dashboard';
 import Queue from './components/Queue';
 import Blob from './components/Blob';
+import Config from './components/Config';
+import Logs from './components/Logs';
+import Settings from './components/Settings';
 
 function Layout({ children }: { children: ReactNode }) {
   const loc = useLocation();
@@ -38,17 +41,6 @@ function Layout({ children }: { children: ReactNode }) {
   );
 }
 
-function Stub({ name }: { name: string }) {
-  return (
-    <div className="text-slate-400">
-      <div className="text-xl font-semibold text-slate-300">{name}</div>
-      <div className="mt-2 text-sm">
-        Wave 18-20 populates this view (data-bound to /api/tags + /api/manifests + WS).
-      </div>
-    </div>
-  );
-}
-
 export default function App() {
   return (
     <Layout>
@@ -56,9 +48,9 @@ export default function App() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/queue" element={<Queue />} />
         <Route path="/blob" element={<Blob />} />
-        <Route path="/config" element={<Stub name="Config" />} />
-        <Route path="/logs" element={<Stub name="Logs" />} />
-        <Route path="/settings" element={<Stub name="Settings" />} />
+        <Route path="/config" element={<Config />} />
+        <Route path="/logs" element={<Logs />} />
+        <Route path="/settings" element={<Settings />} />
       </Routes>
     </Layout>
   );
