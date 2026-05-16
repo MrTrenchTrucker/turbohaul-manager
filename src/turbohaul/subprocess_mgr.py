@@ -77,10 +77,16 @@ def spawn_sidecar(
         *argv_flags,
     ]
     log.info("spawning llama-server pid=? port=%d model=%s", port, model_tag)
+    # HAUL P-3 fix: stdout/stderr to DEVNULL — PIPE without an active drainer
+    # fills the 64KB OS pipe buffer once llama-server emits enough log lines
+    # (model load + slot ops + per-token perf), at which point write(2) blocks
+    # inside the child and the drained-SIGTERM contract no longer holds.
+    # llama-server has its own --log-file argv option if structured log capture
+    # is required; wire it via argv_flags rather than re-introducing PIPE here.
     proc = factory(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,  # setsid - own process group → killpg works
     )
     return SidecarHandle(proc=proc, port=port, model_tag=model_tag)
