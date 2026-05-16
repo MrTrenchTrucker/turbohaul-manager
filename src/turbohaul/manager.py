@@ -246,7 +246,20 @@ class TurbohaulManager:
         - If grace window is open for this thread+model → enqueue at FIFO HEAD
           + restart grace timer (max_grace_extensions cap applies).
         - Otherwise → normal FIFO enqueue.
+
+        Raises RuntimeError if the manager is shutting down (v0.2.1 RC GRIP-C3).
         """
+        # C3 fix (GRIP DAG): refuse new submissions after shutdown signal so
+        # callers fail fast instead of hanging on a completion_future that
+        # will never resolve (worker is dead, queue.close() clears staging).
+        # Raises queue.QueueClosed to match existing test_manager contract +
+        # the documented queue-closed exception type.
+        if self._stop_event.is_set():
+            from turbohaul.queue import QueueClosed
+            raise QueueClosed(
+                "TurbohaulManager is shutting down — new submissions are refused."
+            )
+
         if not thread_id:
             thread_id = derive_thread_id_prefix_hash(prompt, model_tag)
 
@@ -367,6 +380,19 @@ class TurbohaulManager:
             except Exception as e:
                 log.exception("slot %s processing failed", slot.slot_id)
                 self._fail_completion_future(slot, e)
+                # C2 fix (GRIP DAG): teardown active sidecar BEFORE force_cold
+                # to prevent PID leak. _force_cold only updates DB state; without
+                # teardown the spawned llama-server keeps running and the
+                # single-slot invariant breaks until boot_orphan_reaper at next
+                # restart. Best-effort — don't let teardown failure mask the
+                # original exception that triggered this path.
+                if self._active_handle is not None:
+                    try:
+                        await self._teardown(slot, "worker-uncaught-exception")
+                    except Exception:
+                        log.exception(
+                            "teardown during worker exception failed (best-effort)"
+                        )
                 await self._force_cold(slot, "worker-uncaught-exception")
         log.info("worker_loop exited")
 
@@ -478,6 +504,23 @@ class TurbohaulManager:
                             "grace_extended_via_active_match",
                             {"extension_count": self.grace.extension_count},
                         )
+                    # C1 fix (GRIP DAG): matched slot's request is done; its
+                    # sidecar was the anchor's warm process (reused, not its own).
+                    # Without this transition, every match accumulates a zombie
+                    # sqlite row in GRACE state with ended_at=NULL, which
+                    # boot_reconcile mistakenly counts as alive (inherited pid).
+                    # Anchor `slot` remains the GRACE driver until grace expiry.
+                    transition(matched, SlotState.POPPED)
+                    self._audit(matched, "active_match_completed")
+                    _am_conn = open_state_db(self.boot.storage.state_db_path)
+                    try:
+                        mark_slot_ended(
+                            _am_conn,
+                            matched.slot_id,
+                            "active_match_completed",
+                        )
+                    finally:
+                        _am_conn.close()
                     self._active_slot = slot  # anchor for teardown bookkeeping
                     continue
                 await asyncio.sleep(0.05)
