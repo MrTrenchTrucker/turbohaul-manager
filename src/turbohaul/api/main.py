@@ -1,14 +1,14 @@
 """FastAPI app for Turbohaul-Manager.
 
-Per v0.2 ARCHITECTURE.md §9. Phase 2 Wave 6 ships the skeleton: /health, /status,
-/api/version, /api/config (GET only for now). Phase 3 will add Ollama + OpenAI
-compat routes and the worker_loop completion forwarding to llama-server.
+Per v0.2 ARCHITECTURE.md §9 + §11. Phase 5 Wave 16 adds /ui static-file serving
+with SPA fallback + CSP + security headers.
 """
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 
 from turbohaul import __version__
 from turbohaul.api.chat_completion import router as chat_completion_router
@@ -23,6 +23,40 @@ from turbohaul.manager import TurbohaulManager
 
 
 log = logging.getLogger(__name__)
+
+
+# CSP verified against Logbook src/frontend/nginx.conf (production-validated 2026-05).
+# Adopted verbatim to inherit prod hardening. Permits same-origin scripts, inline
+# styles (Tailwind injects), data: + blob: images, ws/wss connections same-origin,
+# self-hosted fonts. Denies object/embed and framing.
+_CSP_HEADER = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self' ws: wss:; "
+    "font-src 'self' data:; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "object-src 'none'"
+)
+
+
+def _ui_security_headers() -> dict[str, str]:
+    """Headers applied to every /ui/* response per v0.2 §11.2."""
+    return {
+        "Content-Security-Policy": _CSP_HEADER,
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "same-origin",
+    }
+
+
+# Vite-emitted file extensions that carry content-hashes — safe to cache long-term.
+_HASHED_ASSET_EXTENSIONS = frozenset(
+    {".js", ".css", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".woff", ".woff2"}
+)
 
 
 def create_app(
@@ -65,7 +99,7 @@ def create_app(
         version=__version__,
         lifespan=lifespan,
     )
-    app.state.manager = mgr  # for tests + future routes
+    app.state.manager = mgr
     app.include_router(ollama_router)
     app.include_router(manifests_router)
     app.include_router(config_put_router)
@@ -99,10 +133,7 @@ def create_app(
     async def get_config() -> dict:
         """Return current runtime + boot config (read-only view).
 
-        Boot fields are exposed for visibility but PUT /api/config will accept
-        ONLY runtime fields; boot fields return HTTP 403 on mutation (v0.2 §7.1).
-
-        Reads live runtime config from mgr.runtime so PUT-mutations are reflected.
+        Reads live runtime from mgr.runtime so PUT-mutations are reflected.
         """
         live_runtime = mgr.runtime
         return {
@@ -125,5 +156,49 @@ def create_app(
             "queue": live_runtime.queue.model_dump(mode="json"),
             "pull": live_runtime.pull.model_dump(mode="json"),
         }
+
+    # Phase 5 §11: /ui static-file serving with SPA fallback + CSP.
+    # Only registered when the bundle is enabled AND the static dir exists,
+    # so tests that don't provision a ui_dist see no /ui route.
+    if boot.ui.enabled and boot.ui.static_path.exists():
+        ui_root = boot.ui.static_path.resolve()
+        index_html = ui_root / "index.html"
+
+        async def _serve(full_path: str) -> FileResponse:
+            if full_path:
+                candidate = (ui_root / full_path).resolve()
+                # Path-traversal guard: candidate MUST be under ui_root.
+                try:
+                    candidate.relative_to(ui_root)
+                except ValueError:
+                    candidate = None
+                if candidate is not None and candidate.is_file():
+                    headers = _ui_security_headers()
+                    if candidate.suffix.lower() in _HASHED_ASSET_EXTENSIONS:
+                        headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                    else:
+                        headers["Cache-Control"] = "no-cache, must-revalidate"
+                    return FileResponse(candidate, headers=headers)
+            # SPA fallback (anything not matching a real file → index.html).
+            if not index_html.is_file():
+                raise HTTPException(
+                    status_code=404,
+                    detail="UI bundle is enabled but index.html is missing.",
+                )
+            headers = _ui_security_headers()
+            headers["Cache-Control"] = "no-cache, must-revalidate"
+            return FileResponse(index_html, headers=headers)
+
+        @app.get("/ui", include_in_schema=False)
+        async def serve_ui_root() -> FileResponse:
+            return await _serve("")
+
+        @app.get("/ui/", include_in_schema=False)
+        async def serve_ui_root_slash() -> FileResponse:
+            return await _serve("")
+
+        @app.get("/ui/{full_path:path}", include_in_schema=False)
+        async def serve_ui(full_path: str) -> FileResponse:
+            return await _serve(full_path)
 
     return app

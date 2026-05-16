@@ -1,0 +1,12 @@
+# Vite build artifacts + npm
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+*.tsbuildinfo
+
+# Build sentinel + log (created by Docker build orchestration)
+build.log
+build.done
+build.fail
