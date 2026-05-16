@@ -434,10 +434,52 @@ class TurbohaulManager:
             self.grace.start(slot.thread_id, slot.model_tag)
             self._audit(slot, "grace_enter")
 
-            # Wait for grace window (or stop signal); follow-up rematch via queue
-            # is a Phase-3 enhancement and isn't wired here yet.
+            # Wait for grace window OR promote a matched staging slot via
+            # ACTIVE_MATCH (warm-slot reuse). Per v0.2 §6 FSM; this transition
+            # cascades same-(thread_id, model_tag) follow-up requests through
+            # the warm llama-server without re-spawn.
+            # Wired in v0.2.1 RC-CF78A6-ACTIVE-MATCH-WIRE (was Phase 3 W12 stub).
             deadline = time.monotonic() + self.runtime.queue.grace_seconds
             while time.monotonic() < deadline and not self._stop_event.is_set():
+                matched = await self.queue.find_matched_thread(
+                    slot.thread_id, slot.model_tag
+                )
+                if matched is not None:
+                    removed = await self.queue.remove(matched.slot_id)
+                    if removed is None:
+                        await asyncio.sleep(0.05)
+                        continue
+                    matched.port = handle.port
+                    matched.pid = handle.pid
+                    self._active_slot = matched
+                    transition(matched, SlotState.ACTIVE_MATCH)
+                    self._audit(matched, "active_match_promoted")
+                    transition(matched, SlotState.ACTIVE)
+                    matched.started_active_at = time.monotonic()
+                    try:
+                        result2 = await self._complete_fn(matched, handle)
+                        if (
+                            matched.completion_future is not None
+                            and not matched.completion_future.done()
+                        ):
+                            matched.completion_future.set_result(result2)
+                    except Exception as e:  # noqa: BLE001 -- per-slot isolation
+                        self._fail_completion_future(matched, e)
+                        log.exception(
+                            "active_match completion failed for slot %s",
+                            matched.slot_id,
+                        )
+                    transition(matched, SlotState.GRACE)
+                    self._audit(matched, "active_match_to_grace")
+                    if self.grace.restart_for_followup():
+                        deadline = time.monotonic() + self.runtime.queue.grace_seconds
+                        self._audit_event_only(
+                            matched.slot_id,
+                            "grace_extended_via_active_match",
+                            {"extension_count": self.grace.extension_count},
+                        )
+                    self._active_slot = slot  # anchor for teardown bookkeeping
+                    continue
                 await asyncio.sleep(0.05)
 
             # GRACE → POPPED

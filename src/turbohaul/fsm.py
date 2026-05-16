@@ -15,7 +15,15 @@ from turbohaul.slot import Slot, SlotState
 LEGAL_TRANSITIONS: dict[SlotState, set[SlotState]] = {
     SlotState.RECEIVED: {SlotState.ACCEPT_BUFFER, SlotState.STAGED},
     SlotState.ACCEPT_BUFFER: {SlotState.STAGED, SlotState.COLD},
-    SlotState.STAGED: {SlotState.LOADING, SlotState.COLD},
+    # STAGED → ACTIVE_MATCH added in v0.2.1 RC-CF78A6-FSM-STAGED-AM:
+    # a staged slot whose (thread_id, model_tag) matches the currently-active
+    # warm slot during the GRACE window fast-tracks straight to ACTIVE_MATCH
+    # (skipping LOADING) because the model is already in VRAM and the
+    # _active_handle is reused. Without this entry, the worker_loop's
+    # ACTIVE_MATCH promotion raises InvalidTransition and the slot vanishes
+    # from queue.remove() while its DB state stays STAGED forever — the
+    # alternating-pattern bug observed during RELAY's 10-burst at 22:13Z.
+    SlotState.STAGED: {SlotState.LOADING, SlotState.COLD, SlotState.ACTIVE_MATCH},
     SlotState.LOADING: {SlotState.ACTIVE, SlotState.LOADING_FAIL},
     # Retry from LOADING_FAIL → re-STAGED; on retry-exhaust → POPPED
     SlotState.LOADING_FAIL: {SlotState.STAGED, SlotState.POPPED},
