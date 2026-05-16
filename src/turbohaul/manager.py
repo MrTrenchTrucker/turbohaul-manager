@@ -13,7 +13,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from turbohaul.config import BootConfig, RuntimeConfig
-from turbohaul.fsm import transition
+from turbohaul.fsm import InvalidTransition, is_terminal, transition
+from turbohaul.manifest import flags_to_argv, read_manifest
 from turbohaul.queue import GraceTimer, IdleHotTimer, TurbohaulQueue
 from turbohaul.singleton import boot_orphan_reaper, detect_foreign_gpu_apps
 from turbohaul.slot import Slot, SlotState, derive_thread_id_prefix_hash
@@ -27,7 +28,11 @@ from turbohaul.state import (
 )
 from turbohaul.subprocess_mgr import (
     SidecarHandle,
+    drained_sigterm,
+    spawn_sidecar,
     verify_binary_sha256,
+    verify_vram_cleared,
+    wait_until_healthy,
 )
 
 
@@ -58,7 +63,17 @@ class TurbohaulManager:
     - Clean shutdown
     """
 
-    def __init__(self, boot: BootConfig, runtime: RuntimeConfig) -> None:
+    def __init__(
+        self,
+        boot: BootConfig,
+        runtime: RuntimeConfig,
+        *,
+        spawn_fn: Callable | None = None,
+        health_fn: Callable | None = None,
+        sigterm_fn: Callable | None = None,
+        vram_fn: Callable | None = None,
+        complete_fn: Callable | None = None,
+    ) -> None:
         self.boot = boot
         self.runtime = runtime
         self.queue = TurbohaulQueue(
@@ -75,6 +90,17 @@ class TurbohaulManager:
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        # Injection points (default = real subprocess_mgr; tests inject mocks)
+        self._spawn = spawn_fn or spawn_sidecar
+        self._wait_healthy = health_fn or wait_until_healthy
+        self._sigterm = sigterm_fn or drained_sigterm
+        self._vram_verify = vram_fn or verify_vram_cleared
+        # _complete_fn: Phase 3 will replace with httpx → llama-server /v1/chat/completions
+        self._complete_fn = complete_fn or self._default_complete
+
+    async def _default_complete(self, slot: Slot, handle: SidecarHandle) -> None:
+        """Placeholder for chat-completion forwarding. Phase 3 implements httpx proxy."""
+        await asyncio.sleep(0.001)
 
     # === Boot lifecycle =====================================================
 
@@ -233,36 +259,179 @@ class TurbohaulManager:
             },
         }
 
-    # === Worker loop (skeleton; full impl in Wave 6) =========================
+    # === Worker loop (full FSM-driven cycle) =================================
 
     async def worker_loop(self) -> None:
-        """Drive the FSM forever. Full implementation in Wave 6 alongside API layer.
+        """Drive the FSM forever: pop → spawn → active → complete → grace → pop → idle.
 
-        Skeleton just consumes the queue + records state transitions; actual
-        subprocess spawn + health-poll + chat-completion forwarding lands next wave.
+        Per v0.2 §6. Subprocess interactions are dependency-injected via ctor (spawn_fn,
+        health_fn, sigterm_fn, vram_fn, complete_fn). Default implementations call the
+        real subprocess_mgr functions. Tests inject mocks.
         """
-        log.info("worker_loop started (skeleton mode)")
+        log.info("worker_loop started")
         while not self._stop_event.is_set():
-            try:
-                slot = await self.queue.pop_next()
-            except Exception as e:
-                log.error("queue.pop_next failed: %s", e)
-                await asyncio.sleep(0.5)
-                continue
-
+            slot = await self.queue.pop_next()
             if slot is None:
-                # Empty queue; idle-tick
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.05)
                 continue
+            try:
+                await self._process_slot(slot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("slot %s processing failed", slot.slot_id)
+                await self._force_cold(slot, "worker-uncaught-exception")
+        log.info("worker_loop exited")
 
-            # Skeleton: just record + mark COLD (Wave 6 will run the full state machine)
-            log.info("popped slot %s model=%s (skeleton noop)", slot.slot_id, slot.model_tag)
+    async def _process_slot(self, slot: Slot) -> None:
+        """Drive one slot through STAGED → LOADING → ACTIVE → GRACE → POPPED."""
+        self._active_slot = slot
+
+        try:
+            # Build llama-server argv from manifest if available; tolerate missing
+            # manifest for testing convenience.
+            argv: list[str] = []
+            try:
+                manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
+                argv = flags_to_argv(manifest.llama_server_flags)
+                gguf_path = (
+                    self.boot.storage.blob_store_path
+                    / "sha256"
+                    / manifest.gguf_blob_sha256[:2]
+                    / manifest.gguf_blob_sha256
+                )
+            except FileNotFoundError:
+                gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
+
+            port = self.boot.runtime.default_port_base
+
+            # STAGED → LOADING
+            transition(slot, SlotState.LOADING)
+            self._audit(slot, "stage_to_loading")
+
+            handle = self._spawn(
+                self.boot.runtime.llama_server_binary,
+                gguf_path,
+                port,
+                slot.model_tag,
+                argv,
+            )
+            slot.port = handle.port
+            slot.pid = handle.pid
+            self._active_handle = handle
+
+            # LOADING → ACTIVE (or LOADING_FAIL → POPPED)
+            healthy = await self._wait_healthy(
+                port, self.runtime.queue.loading_health_timeout_s
+            )
+            if not healthy:
+                transition(slot, SlotState.LOADING_FAIL)
+                self._audit(slot, "loading_fail_health_timeout")
+                transition(slot, SlotState.POPPED)
+                await self._teardown(slot, "loading-fail-health-timeout")
+                return
+
+            transition(slot, SlotState.ACTIVE)
+            slot.started_active_at = time.monotonic()
+            self._audit(slot, "active")
+
+            # Completion (placeholder — Phase 3 implements httpx proxy)
+            await self._complete_fn(slot, handle)
+
+            # ACTIVE → GRACE
+            transition(slot, SlotState.GRACE)
+            slot.grace_started_at = time.monotonic()
+            self.grace.start(slot.thread_id, slot.model_tag)
+            self._audit(slot, "grace_enter")
+
+            # Wait for grace window (or stop signal); follow-up rematch via queue
+            # is a Phase-3 enhancement and isn't wired here yet.
+            deadline = time.monotonic() + self.runtime.queue.grace_seconds
+            while time.monotonic() < deadline and not self._stop_event.is_set():
+                await asyncio.sleep(0.05)
+
+            # GRACE → POPPED
+            transition(slot, SlotState.POPPED)
+            await self._teardown(slot, "grace-expired")
+            # IDLE_HOT applies to the model, not this slot - record event only
+            self.idle.start(slot.model_tag)
+            self._audit_event_only(slot.slot_id, "idle_hot_enter", {"model_tag": slot.model_tag})
+        finally:
+            self._active_slot = None
+            self._active_handle = None
+
+    async def _teardown(self, slot: Slot, reason: str) -> None:
+        """Drained SIGTERM the process group → VRAM verify → audit."""
+        if self._active_handle is not None:
+            ok, status = await self._sigterm(
+                self._active_handle,
+                drained_window_s=float(self.runtime.queue.drained_sigterm_window_active_s),
+                is_active=False,
+                cold_window_s=float(self.runtime.queue.drained_sigterm_window_cold_s),
+            )
+            # VRAM verify (default expected_drop 1024 MiB; future: read from manifest)
+            await self._vram_verify(expected_drop_mib=1024, timeout_s=30.0)
             conn = open_state_db(self.boot.storage.state_db_path)
             try:
-                mark_slot_ended(conn, slot.slot_id, "skeleton-mode-noop")
-                record_audit_event(conn, "skeleton_consume", {}, slot_id=slot.slot_id)
+                mark_slot_ended(conn, slot.slot_id, reason)
+                record_audit_event(
+                    conn,
+                    "teardown",
+                    {"reason": reason, "sigterm_status": status, "sigterm_ok": ok},
+                    slot_id=slot.slot_id,
+                )
             finally:
                 conn.close()
+
+    async def _force_cold(self, slot: Slot, reason: str) -> None:
+        """Mark a slot COLD when processing dies mid-flight."""
+        if not is_terminal(slot.state):
+            try:
+                # Best-effort - jump directly to a terminal state via legal path
+                if slot.state == SlotState.ACTIVE or slot.state == SlotState.GRACE:
+                    transition(slot, SlotState.POPPED)
+                if slot.state == SlotState.POPPED:
+                    transition(slot, SlotState.COLD)
+            except InvalidTransition:
+                slot.state = SlotState.COLD
+        conn = open_state_db(self.boot.storage.state_db_path)
+        try:
+            mark_slot_ended(conn, slot.slot_id, reason)
+        finally:
+            conn.close()
+
+    def _audit(self, slot: Slot, event_type: str) -> None:
+        """Audit: upsert current slot row + record event. Use for state changes."""
+        conn = open_state_db(self.boot.storage.state_db_path)
+        try:
+            upsert_slot(
+                conn,
+                {
+                    "slot_id": slot.slot_id,
+                    "model_tag": slot.model_tag,
+                    "thread_id": slot.thread_id,
+                    "state": slot.state.value,
+                    "port": slot.port,
+                    "pid": slot.pid,
+                    "extension_count": slot.extension_count,
+                    "client_meta": slot.client_meta,
+                },
+            )
+            record_audit_event(conn, event_type, {"state": slot.state.value}, slot_id=slot.slot_id)
+        finally:
+            conn.close()
+
+    def _audit_event_only(self, slot_id: str, event_type: str, payload: dict | None = None) -> None:
+        """Audit: record event ONLY, no slot row mutation.
+
+        Use after teardown when the slot is already COLD in DB and we don't want
+        to clobber that state.
+        """
+        conn = open_state_db(self.boot.storage.state_db_path)
+        try:
+            record_audit_event(conn, event_type, payload or {}, slot_id=slot_id)
+        finally:
+            conn.close()
 
     # === Shutdown ============================================================
 
