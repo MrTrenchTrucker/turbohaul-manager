@@ -22,7 +22,7 @@ import os
 import re
 import secrets
 import tempfile
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 
@@ -148,6 +148,78 @@ def write_stream_atomic(
         return computed, bytes_written
     finally:
         # Belt-and-suspenders cleanup of orphan tempfile if rename never happened
+        if tmp.exists():
+            with contextlib.suppress(FileNotFoundError, PermissionError):
+                os.unlink(tmp)
+
+
+async def write_stream_atomic_async(
+    blobs_root: Path,
+    chunks: AsyncIterator[bytes],
+    expected_sha256: str | None = None,
+    per_stream_max_bytes: int = 100 * 1024**3,
+) -> tuple[str, int]:
+    """Async variant for httpx.stream / aiter_bytes sources.
+
+    Same lifecycle as write_stream_atomic: incoming/<tmp> → fsync → hash verify →
+    atomic-rename → chmod 0o400 → fsync(parent dir).
+    """
+    ensure_blob_layout(blobs_root)
+    tmp = make_incoming_path(blobs_root)
+    h = hashlib.sha256()
+    bytes_written = 0
+
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                async for chunk in chunks:
+                    if not chunk:
+                        continue
+                    if bytes_written + len(chunk) > per_stream_max_bytes:
+                        raise BlobSizeExceeded(
+                            f"stream exceeded per_stream_max_bytes "
+                            f"({per_stream_max_bytes}); have {bytes_written + len(chunk)} bytes"
+                        )
+                    f.write(chunk)
+                    h.update(chunk)
+                    bytes_written += len(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+            raise
+
+        computed = h.hexdigest()
+        if expected_sha256 is not None:
+            if not SHA256_RE.match(expected_sha256):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
+                raise BlobError(
+                    f"expected_sha256 not valid hex: {expected_sha256[:32]}..."
+                )
+            if computed != expected_sha256:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
+                raise BlobHashMismatch(
+                    f"computed {computed[:16]}... != expected {expected_sha256[:16]}..."
+                )
+
+        final = _final_path(blobs_root, computed)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(tmp), str(final))
+
+        dir_fd = os.open(str(final.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+        os.chmod(str(final), 0o400)
+
+        return computed, bytes_written
+    finally:
         if tmp.exists():
             with contextlib.suppress(FileNotFoundError, PermissionError):
                 os.unlink(tmp)

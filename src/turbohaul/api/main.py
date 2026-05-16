@@ -15,6 +15,7 @@ from turbohaul.api.chat_completion import router as chat_completion_router
 from turbohaul.api.config_put import router as config_put_router
 from turbohaul.api.manifests import router as manifests_router
 from turbohaul.api.ollama import router as ollama_router
+from turbohaul.api.pull import router as pull_router
 from turbohaul.api.ws_state import router as ws_state_router
 from turbohaul.config import BootConfig, RuntimeConfig
 from turbohaul.manager import TurbohaulManager
@@ -69,6 +70,7 @@ def create_app(
     app.include_router(config_put_router)
     app.include_router(ws_state_router)
     app.include_router(chat_completion_router)
+    app.include_router(pull_router)
 
     @app.get("/health")
     async def health() -> dict:
