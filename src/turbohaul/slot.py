@@ -44,6 +44,10 @@ class Slot:
     created_at: float = 0.0  # monotonic time at creation
     started_active_at: float = 0.0  # monotonic when entered ACTIVE
     grace_started_at: float = 0.0  # monotonic when entered GRACE
+    # Optional asyncio.Future, set by submit(wait_for_completion=True) so caller can
+    # await the slot's completion response. worker_loop sets the result after
+    # completion_fn returns.
+    completion_future: Any = None
 
     @classmethod
     def new(

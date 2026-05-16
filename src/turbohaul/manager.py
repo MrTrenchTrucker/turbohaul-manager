@@ -11,6 +11,7 @@ import os
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from turbohaul.config import BootConfig, RuntimeConfig
 from turbohaul.fsm import InvalidTransition, is_terminal, transition
@@ -145,9 +146,42 @@ class TurbohaulManager:
         # _complete_fn: Phase 3 will replace with httpx → llama-server /v1/chat/completions
         self._complete_fn = complete_fn or self._default_complete
 
-    async def _default_complete(self, slot: Slot, handle: SidecarHandle) -> None:
-        """Placeholder for chat-completion forwarding. Phase 3 implements httpx proxy."""
+    async def _default_complete(self, slot: Slot, handle: SidecarHandle) -> dict | None:
+        """Default no-op completion (Phase 2). Phase 3 wires httpx proxy via DI."""
         await asyncio.sleep(0.001)
+        return None
+
+    async def submit_and_wait(
+        self,
+        model_tag: str,
+        prompt: str = "",
+        thread_id: str = "",
+        context: list[dict] | None = None,
+        client_meta: dict | None = None,
+        timeout_s: float = 600.0,
+    ) -> tuple[Slot, Any]:
+        """Submit + await the slot's completion. Returns (slot, completion_result)."""
+        slot = await self.submit(
+            model_tag=model_tag,
+            prompt=prompt,
+            thread_id=thread_id,
+            context=context,
+            client_meta=client_meta,
+            wait_for_completion=True,
+        )
+        try:
+            result = await asyncio.wait_for(slot.completion_future, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            raise
+        return slot, result
+
+    # === Error propagation on worker exceptions ==============================
+
+    def _fail_completion_future(self, slot: Slot, exc: BaseException) -> None:
+        """If a slot has a pending completion_future, mark it failed (don't hang caller)."""
+        fut = slot.completion_future
+        if fut is not None and not fut.done():
+            fut.set_exception(exc)
 
     # === Boot lifecycle =====================================================
 
@@ -204,6 +238,7 @@ class TurbohaulManager:
         thread_id: str = "",
         context: list[dict] | None = None,
         client_meta: dict | None = None,
+        wait_for_completion: bool = False,
     ) -> Slot:
         """Accept a fresh inference request.
 
@@ -222,6 +257,10 @@ class TurbohaulManager:
             context=context,
             client_meta=client_meta,
         )
+
+        # Attach a future BEFORE enqueue so worker_loop can resolve it on completion.
+        if wait_for_completion:
+            slot.completion_future = asyncio.get_event_loop().create_future()
 
         # Grace-window matched-thread shortcut
         if self.grace.matches(thread_id, model_tag):
@@ -325,8 +364,9 @@ class TurbohaulManager:
                 await self._process_slot(slot)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
                 log.exception("slot %s processing failed", slot.slot_id)
+                self._fail_completion_future(slot, e)
                 await self._force_cold(slot, "worker-uncaught-exception")
         log.info("worker_loop exited")
 
@@ -376,14 +416,17 @@ class TurbohaulManager:
                 self._audit(slot, "loading_fail_health_timeout")
                 transition(slot, SlotState.POPPED)
                 await self._teardown(slot, "loading-fail-health-timeout")
+                self._fail_completion_future(slot, RuntimeError("loading-fail-health-timeout"))
                 return
 
             transition(slot, SlotState.ACTIVE)
             slot.started_active_at = time.monotonic()
             self._audit(slot, "active")
 
-            # Completion (placeholder — Phase 3 implements httpx proxy)
-            await self._complete_fn(slot, handle)
+            # Completion (Phase 3 wires httpx forward; Phase 2 default is noop)
+            result = await self._complete_fn(slot, handle)
+            if slot.completion_future is not None and not slot.completion_future.done():
+                slot.completion_future.set_result(result)
 
             # ACTIVE → GRACE
             transition(slot, SlotState.GRACE)
