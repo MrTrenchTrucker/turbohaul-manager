@@ -31,6 +31,35 @@ def _default_http_client_factory(timeout_s: float = 600.0):
     return httpx.AsyncClient(timeout=timeout_s, follow_redirects=False)
 
 
+def _double_resolve_check(url: str) -> tuple[str, str]:
+    """Validate URL + resolve TWICE; raise if (host, ip) differs across calls.
+
+    HAUL S-1 fix (CRITICAL DNS rebind mitigation): the canonical fix is a
+    custom httpx.AsyncHTTPTransport that connects to the pre-resolved IP and
+    pins SNI to the original hostname — that's the v0.2.2 follow-on. This
+    interim fix catches the obvious rebind pattern where the attacker-DNS
+    returns a public IP at validate time and an internal IP at connect time:
+    we resolve back-to-back and refuse the connection if the two
+    resolutions diverge. Race window shrinks from "long enough for httpx to
+    do its own connect-time DNS" down to "two synchronous resolver calls
+    apart" — microseconds vs milliseconds. Defense-in-depth with the SSRF
+    guard's RFC1918/NAT64/IPv4-compat blocks (which catch internal-IP
+    rebinds even if they win the race).
+
+    HAUL S-3 fix (MED, multi-record blindspot): validate_pull_url checks the
+    first A record only. By running it twice, we also catch round-robin DNS
+    where validate sees one record and httpx would see another.
+    """
+    host1, ip1 = validate_pull_url(url)
+    host2, ip2 = validate_pull_url(url)
+    if host1 != host2 or ip1 != ip2:
+        raise UrlSafetyError(
+            f"DNS rebind class detected: validate#1 ({host1}->{ip1}) != "
+            f"validate#2 ({host2}->{ip2}). Refusing pull."
+        )
+    return host1, ip1
+
+
 async def _stream_chunks(client: httpx.AsyncClient, url: str, headers: dict):
     """Yield bytes from an HTTP GET stream."""
     async with client.stream("GET", url, headers=headers) as resp:
@@ -55,7 +84,7 @@ async def pull_url(payload: dict, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="`url` required")
 
     try:
-        host, _ = validate_pull_url(url)
+        host, _ = _double_resolve_check(url)
     except UrlSafetyError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -138,7 +167,7 @@ async def pull_hf(payload: dict, request: Request) -> dict:
     allowlist = mgr.runtime.pull.hf_host_allowlist
 
     try:
-        host, _ = validate_pull_url(url)
+        host, _ = _double_resolve_check(url)
     except UrlSafetyError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
