@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from turbohaul import __version__
+from turbohaul.api.config_put import router as config_put_router
 from turbohaul.api.manifests import router as manifests_router
 from turbohaul.api.ollama import router as ollama_router
 from turbohaul.config import BootConfig, RuntimeConfig
@@ -63,6 +64,7 @@ def create_app(
     app.state.manager = mgr  # for tests + future routes
     app.include_router(ollama_router)
     app.include_router(manifests_router)
+    app.include_router(config_put_router)
 
     @app.get("/health")
     async def health() -> dict:
@@ -89,9 +91,12 @@ def create_app(
     async def get_config() -> dict:
         """Return current runtime + boot config (read-only view).
 
-        Boot fields are exposed for visibility but PUT /api/config (Wave 7) will
-        accept ONLY runtime fields; boot fields return HTTP 403 on mutation.
+        Boot fields are exposed for visibility but PUT /api/config will accept
+        ONLY runtime fields; boot fields return HTTP 403 on mutation (v0.2 §7.1).
+
+        Reads live runtime config from mgr.runtime so PUT-mutations are reflected.
         """
+        live_runtime = mgr.runtime
         return {
             "server": boot.server.model_dump(mode="json"),
             "storage": {
@@ -109,8 +114,8 @@ def create_app(
                 "enabled": boot.ui.enabled,
                 "static_path": str(boot.ui.static_path),
             },
-            "queue": runtime.queue.model_dump(mode="json"),
-            "pull": runtime.pull.model_dump(mode="json"),
+            "queue": live_runtime.queue.model_dump(mode="json"),
+            "pull": live_runtime.pull.model_dump(mode="json"),
         }
 
     return app
