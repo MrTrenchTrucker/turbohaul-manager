@@ -217,12 +217,13 @@ def manifest_etag(manifests_root: Path, tag: str) -> str:
 def write_manifest_atomic(
     manifests_root: Path, manifest: Manifest, if_match: str | None = None
 ) -> Manifest:
-    """Atomic write with ETag/If-Match concurrency check (v0.2 §8.2).
+    """Atomic write with ETag/If-Match concurrency check (v0.2 §8.2 + HAUL M-1).
 
-    - First write (no existing manifest): writes as-is, revision preserved.
-    - Subsequent writes with if_match: revision must match current; on success
-      revision is incremented in the written file.
-    - Without if_match: writes silently overwrite (caller's responsibility).
+    - First write (no existing manifest): writes as-is, revision preserved;
+      if_match must be None on create (else 412).
+    - Subsequent writes: if_match REQUIRED. Mismatch -> ConcurrencyError.
+      Missing -> ConcurrencyError too (HAUL M-1 fix: previously this
+      silently overwrote, opening a lost-update class).
     - POSIX-atomic: tempfile-in-same-dir + fsync(file) + rename + fsync(dir).
     """
     target = _safe_manifest_path(manifests_root, manifest.model_tag)
@@ -230,12 +231,19 @@ def write_manifest_atomic(
 
     if target.exists():
         existing = read_manifest(manifests_root, manifest.model_tag)
-        if if_match is not None:
-            actual = f'"{existing.revision}"'
-            if if_match != actual:
-                raise ConcurrencyError(
-                    f"If-Match {if_match!r} does not match current ETag {actual!r}"
-                )
+        if if_match is None:
+            # HAUL M-1 fix: refuse update without If-Match. Previously a
+            # caller could omit the header and silently overwrite the
+            # concurrent write of another caller. Lost-update class.
+            raise ConcurrencyError(
+                "If-Match header required for manifest update "
+                f"(current ETag is \"{existing.revision}\")"
+            )
+        actual = f'"{existing.revision}"'
+        if if_match != actual:
+            raise ConcurrencyError(
+                f"If-Match {if_match!r} does not match current ETag {actual!r}"
+            )
         # Increment revision on update
         manifest = manifest.model_copy(update={"revision": existing.revision + 1})
 

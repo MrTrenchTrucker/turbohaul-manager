@@ -619,7 +619,7 @@ class TurbohaulManager:
             self._active_handle = None
 
     async def _teardown(self, slot: Slot, reason: str) -> None:
-        """Drained SIGTERM the process group → VRAM verify → audit."""
+        """Drained SIGTERM the process group → VRAM verify → orphan reap → audit."""
         if self._active_handle is not None:
             ok, status = await self._sigterm(
                 self._active_handle,
@@ -629,13 +629,34 @@ class TurbohaulManager:
             )
             # VRAM verify (default expected_drop 1024 MiB; future: read from manifest)
             await self._vram_verify(expected_drop_mib=1024, timeout_s=30.0)
+            # HAUL P-2 fix: scan for grandchild orphans left behind by
+            # Tom's Fork setsid-detach (killpg never reached them) and
+            # reap before the next slot needs the port + VRAM. ~50ms
+            # /proc walk; cheap to run on every teardown.
+            orphan_reaped = 0
+            try:
+                orphan_reap_result = boot_orphan_reaper(
+                    port_base=self.boot.runtime.default_port_base,
+                    known_pids=set(),  # single-slot mode; multi-slot
+                                       # Wave-6 will pass live sidecar pids
+                )
+                orphan_reaped = orphan_reap_result.get("reaped", 0)
+            except Exception:
+                log.exception(
+                    "post-teardown orphan reap failed (best-effort)"
+                )
             conn = open_state_db(self.boot.storage.state_db_path)
             try:
                 mark_slot_ended(conn, slot.slot_id, reason)
                 record_audit_event(
                     conn,
                     "teardown",
-                    {"reason": reason, "sigterm_status": status, "sigterm_ok": ok},
+                    {
+                        "reason": reason,
+                        "sigterm_status": status,
+                        "sigterm_ok": ok,
+                        "post_teardown_orphans_reaped": orphan_reaped,
+                    },
                     slot_id=slot.slot_id,
                 )
             finally:

@@ -144,13 +144,12 @@ class TestAtomicWriteAndRead:
         with pytest.raises(ConcurrencyError, match="If-Match"):
             write_manifest_atomic(tmp_path, make_manifest(display_name="Stale"), if_match='"99"')
 
-    def test_no_if_match_overwrites(self, tmp_path):
-        # Without if_match, second write still increments revision (lost-update tolerated only
-        # if caller chose to skip If-Match — explicit opt-out)
+    def test_no_if_match_on_update_raises(self, tmp_path):
+        """HAUL M-1: PUT without If-Match on existing manifest must raise."""
         m = make_manifest()
         write_manifest_atomic(tmp_path, m)
-        out2 = write_manifest_atomic(tmp_path, make_manifest(display_name="No-ETag-Write"))
-        assert out2.revision == 2
+        with pytest.raises(ConcurrencyError):
+            write_manifest_atomic(tmp_path, make_manifest(display_name="No-ETag"))
 
     def test_file_mode_is_0o600(self, tmp_path):
         m = make_manifest()

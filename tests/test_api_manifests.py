@@ -88,6 +88,17 @@ class TestPutManifest:
         )
         assert r2.status_code == 412
 
+    def test_update_without_if_match_412(self, app_blank):
+        """HAUL M-1: PUT without If-Match on existing manifest -> 412."""
+        app, client = app_blank
+        r1 = client.put("/api/manifests/my-model", json=_valid_payload("my-model"))
+        assert r1.status_code == 200
+        r2 = client.put(
+            "/api/manifests/my-model",
+            json={**_valid_payload("my-model"), "display_name": "NoEtag"},
+        )
+        assert r2.status_code == 412
+
     def test_reject_denied_flag_400(self, app_blank):
         app, client = app_blank
         payload = _valid_payload("my-model")
