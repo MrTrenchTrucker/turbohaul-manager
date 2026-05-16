@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from turbohaul import __version__
 from turbohaul.api.chat_completion import router as chat_completion_router
 from turbohaul.api.config_put import router as config_put_router
+from turbohaul.api.import_ import router as import_router
 from turbohaul.api.manifests import router as manifests_router
 from turbohaul.api.ollama import router as ollama_router
 from turbohaul.api.pull import router as pull_router
@@ -71,6 +72,7 @@ def create_app(
     app.include_router(ws_state_router)
     app.include_router(chat_completion_router)
     app.include_router(pull_router)
+    app.include_router(import_router)
 
     @app.get("/health")
     async def health() -> dict:
