@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from turbohaul import __version__
+from turbohaul.api.ollama import router as ollama_router
 from turbohaul.config import BootConfig, RuntimeConfig
 from turbohaul.manager import TurbohaulManager
 
@@ -59,6 +60,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.manager = mgr  # for tests + future routes
+    app.include_router(ollama_router)
 
     @app.get("/health")
     async def health() -> dict:
