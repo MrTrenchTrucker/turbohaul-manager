@@ -250,3 +250,138 @@ class TestWorkerLoopFullCycle:
         await asyncio.sleep(0.1)
         await mgr.shutdown()
         assert mgr._worker_task.done() or mgr._worker_task.cancelled()
+
+
+@pytest.mark.asyncio
+class TestIdleHotWire:
+    """GRIP H-4: idle-hot warm-hold + model-swap + expiry (Cmdr #15709)."""
+
+    async def test_grace_expiry_holds_warm_idle_when_idle_seconds_gt0(self, tmp_path):
+        """After grace expires WITHOUT match, _idle_handle is held + sigterm NOT called yet."""
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=120
+        )
+        spawn_call_count = [0]
+        sigterm_calls = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            spawn_call_count[0] += 1
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(port, timeout_s, **kwargs):
+            return True
+
+        async def fake_sigterm(handle, **kwargs):
+            sigterm_calls.append(handle.model_tag)
+            return True, "sigterm-clean"
+
+        async def fake_vram(*a, **kw):
+            return True, None
+
+        async def fake_complete(slot, handle):
+            return {"ok": True}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            complete_fn=fake_complete,
+        )
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        try:
+            await mgr.submit_and_wait("gpt-x", "prompt-1", thread_id="t1")
+            # Wait for grace expiry to enter idle-hold
+            await asyncio.sleep(0.4)
+        finally:
+            await mgr.shutdown()
+
+        assert spawn_call_count[0] == 1
+        # The sidecar SHOULD have been torn down on shutdown (not before)
+        assert sigterm_calls == ["gpt-x"]
+
+    async def test_warm_inherit_same_model_skips_spawn(self, tmp_path):
+        """Second request for SAME model_tag inherits the warm handle."""
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=120
+        )
+        spawn_call_count = [0]
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            spawn_call_count[0] += 1
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(port, timeout_s, **kwargs):
+            return True
+
+        async def fake_sigterm(handle, **kwargs):
+            return True, "sigterm-clean"
+
+        async def fake_vram(*a, **kw):
+            return True, None
+
+        async def fake_complete(slot, handle):
+            return {"ok": True}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            complete_fn=fake_complete,
+        )
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        try:
+            await mgr.submit_and_wait("gpt-x", "prompt-1", thread_id="t1")
+            await asyncio.sleep(0.1)  # let grace expire + idle hold
+            await mgr.submit_and_wait("gpt-x", "prompt-2", thread_id="t2")
+        finally:
+            await mgr.shutdown()
+
+        # Only ONE spawn call (second slot inherited warm handle)
+        assert spawn_call_count[0] == 1
+
+    async def test_different_model_tears_down_idle_then_spawns(self, tmp_path):
+        """Second request for DIFFERENT model_tag tears down idle holder first."""
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=120
+        )
+        spawn_calls = []
+        sigterm_calls = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            spawn_calls.append(model_tag)
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(port, timeout_s, **kwargs):
+            return True
+
+        async def fake_sigterm(handle, **kwargs):
+            sigterm_calls.append(handle.model_tag)
+            return True, "sigterm-clean"
+
+        async def fake_vram(*a, **kw):
+            return True, None
+
+        async def fake_complete(slot, handle):
+            return {"ok": True}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            complete_fn=fake_complete,
+        )
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        try:
+            await mgr.submit_and_wait("gpt-x", "prompt-1", thread_id="t1")
+            await asyncio.sleep(0.1)  # idle-hold gpt-x
+            await mgr.submit_and_wait("gpt-y", "prompt-2", thread_id="t2")
+        finally:
+            await mgr.shutdown()
+
+        # Two spawn calls (gpt-x then gpt-y)
+        assert spawn_calls == ["gpt-x", "gpt-y"]
+        # gpt-x sigterm fired (model swap teardown)
+        assert "gpt-x" in sigterm_calls
+        # gpt-y also sigterm at shutdown
+        assert sigterm_calls.count("gpt-y") >= 1
+

@@ -135,6 +135,14 @@ class TurbohaulManager:
         self.idle = IdleHotTimer(idle_seconds=runtime.queue.idle_hot_load_seconds)
         self._active_handle: SidecarHandle | None = None
         self._active_slot: Slot | None = None
+        # GRIP H-4 wire: manager-level idle holder (model warm post-grace).
+        # When grace expires without a thread match, the sidecar is NOT
+        # torn down -- it migrates here and stays alive for idle_seconds.
+        # Next slot of same model_tag inherits the handle; different
+        # model_tag tears it down first.
+        self._idle_handle: SidecarHandle | None = None
+        self._idle_model_tag: str | None = None
+        self._idle_expires_at: float | None = None
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         # GRIP M-2 fix: removed unused self._lock = asyncio.Lock(). It had
@@ -364,7 +372,21 @@ class TurbohaulManager:
             }
 
         idle_info: dict | None = None
-        if not self.idle.expired():
+        # GRIP H-4 wire: /status idle snapshot reflects the manager-level
+        # _idle_* holder (which IS the warm sidecar), not the legacy
+        # IdleHotTimer (which only tracks the model name).
+        if (
+            self._idle_handle is not None
+            and self._idle_expires_at is not None
+            and time.monotonic() < self._idle_expires_at
+        ):
+            idle_info = {
+                "remaining_s": int(self._idle_expires_at - time.monotonic()),
+                "model_tag": self._idle_model_tag,
+            }
+        elif not self.idle.expired():
+            # Backward compat: when idle_seconds=0 (test mode) the warm
+            # holder is not used and self.idle still tracks "last model".
             idle_info = {
                 "remaining_s": int(self.idle.remaining_s()),
                 "model_tag": self.idle.model_tag,
@@ -398,6 +420,18 @@ class TurbohaulManager:
         while not self._stop_event.is_set():
             slot = await self.queue.pop_next()
             if slot is None:
+                # GRIP H-4 wire: check idle holder expiry on idle ticks.
+                if (
+                    self._idle_handle is not None
+                    and self._idle_expires_at is not None
+                    and time.monotonic() >= self._idle_expires_at
+                ):
+                    try:
+                        await self._teardown_idle_holder("idle_expired")
+                    except Exception:
+                        log.exception(
+                            "idle expiry teardown failed (best-effort)"
+                        )
                 await asyncio.sleep(0.05)
                 continue
             try:
@@ -449,22 +483,48 @@ class TurbohaulManager:
             transition(slot, SlotState.LOADING)
             self._audit(slot, "stage_to_loading")
 
-            handle = self._spawn(
-                self.boot.runtime.llama_server_binary,
-                gguf_path,
-                port,
-                slot.model_tag,
-                argv,
-                binary_fd=self._binary_fd,
+            # GRIP H-4 wire: warm-inherit path. If the previous slot left
+            # a warm sidecar holding the same model_tag and the idle
+            # window has not expired, reuse the handle and skip spawn +
+            # health-wait (sidecar is already healthy by construction).
+            warm_inherit = (
+                self._idle_handle is not None
+                and self._idle_model_tag == slot.model_tag
+                and self._idle_expires_at is not None
+                and time.monotonic() < self._idle_expires_at
             )
-            slot.port = handle.port
-            slot.pid = handle.pid
-            self._active_handle = handle
-
-            # LOADING → ACTIVE (or LOADING_FAIL → POPPED)
-            healthy = await self._wait_healthy(
-                port, self.runtime.queue.loading_health_timeout_s
-            )
+            if warm_inherit:
+                handle = self._idle_handle
+                self._idle_handle = None
+                self._idle_model_tag = None
+                self._idle_expires_at = None
+                slot.port = handle.port
+                slot.pid = handle.pid
+                self._active_handle = handle
+                self._audit(slot, "idle_hot_inherit")
+                # Skip spawn + health wait; jump straight to LOADING -> ACTIVE.
+                healthy = True
+            else:
+                # Different model OR no idle holder. If a stale holder
+                # exists for a different model, tear it down before
+                # spawning new -- immediate switch (Cmdr #15709 intent).
+                if self._idle_handle is not None:
+                    await self._teardown_idle_holder("model_swap")
+                handle = self._spawn(
+                    self.boot.runtime.llama_server_binary,
+                    gguf_path,
+                    port,
+                    slot.model_tag,
+                    argv,
+                    binary_fd=self._binary_fd,
+                )
+                slot.port = handle.port
+                slot.pid = handle.pid
+                self._active_handle = handle
+                # LOADING → ACTIVE (or LOADING_FAIL → POPPED)
+                healthy = await self._wait_healthy(
+                    port, self.runtime.queue.loading_health_timeout_s
+                )
             if not healthy:
                 transition(slot, SlotState.LOADING_FAIL)
                 self._audit(slot, "loading_fail_health_timeout")
@@ -608,12 +668,47 @@ class TurbohaulManager:
                     continue
                 await asyncio.sleep(0.05)
 
-            # GRACE → POPPED
+            # GRACE → POPPED (slot lifecycle ends here)
             transition(slot, SlotState.POPPED)
-            await self._teardown(slot, "grace-expired")
-            # IDLE_HOT applies to the model, not this slot - record event only
-            self.idle.start(slot.model_tag)
-            self._audit_event_only(slot.slot_id, "idle_hot_enter", {"model_tag": slot.model_tag})
+            # GRIP H-4 wire: hold the sidecar in idle for follow-up reuse
+            # by any same-model_tag request inside idle_hot_load_seconds.
+            # When idle_seconds == 0 (test default), this is equivalent to
+            # immediate teardown -- preserves "grace-expired" reason on the
+            # mark_slot_ended audit (backward-compat with existing tests).
+            idle_seconds = self.runtime.queue.idle_hot_load_seconds
+            if idle_seconds > 0 and self._active_handle is not None:
+                # Hand off the active handle to the manager-level idle holder.
+                self._idle_handle = self._active_handle
+                self._idle_model_tag = slot.model_tag
+                self._idle_expires_at = time.monotonic() + idle_seconds
+                self._audit_event_only(
+                    slot.slot_id,
+                    "idle_hot_enter",
+                    {
+                        "model_tag": slot.model_tag,
+                        "idle_seconds": idle_seconds,
+                    },
+                )
+                # Mark the slot ended at the state.sqlite layer -- the slot
+                # is done; only the model stays warm. Audit reason names the
+                # warm-hold so post-hoc audits can see the difference vs.
+                # plain grace-expired teardown.
+                _ih_conn = open_state_db(self.boot.storage.state_db_path)
+                try:
+                    mark_slot_ended(
+                        _ih_conn, slot.slot_id, "grace-expired-held-idle"
+                    )
+                finally:
+                    _ih_conn.close()
+            else:
+                # idle disabled (idle_seconds=0) or no handle -- immediate teardown.
+                await self._teardown(slot, "grace-expired")
+                self.idle.start(slot.model_tag)
+                self._audit_event_only(
+                    slot.slot_id,
+                    "idle_hot_enter",
+                    {"model_tag": slot.model_tag},
+                )
         finally:
             self._active_slot = None
             self._active_handle = None
@@ -661,6 +756,56 @@ class TurbohaulManager:
                 )
             finally:
                 conn.close()
+
+    async def _teardown_idle_holder(self, reason: str) -> None:
+        """GRIP H-4 wire: tear down the manager-level idle handle.
+
+        Called when:
+        - a slot for a DIFFERENT model_tag arrives (immediate switch path), or
+        - the idle timer expires in the worker_loop, or
+        - shutdown.
+        """
+        if self._idle_handle is None:
+            return
+        held = self._idle_handle
+        model_tag = self._idle_model_tag
+        self._idle_handle = None
+        self._idle_model_tag = None
+        self._idle_expires_at = None
+        ok, status = await self._sigterm(
+            held,
+            drained_window_s=float(
+                self.runtime.queue.drained_sigterm_window_active_s
+            ),
+            is_active=False,
+            cold_window_s=float(
+                self.runtime.queue.drained_sigterm_window_cold_s
+            ),
+        )
+        await self._vram_verify(expected_drop_mib=1024, timeout_s=30.0)
+        try:
+            boot_orphan_reaper(
+                port_base=self.boot.runtime.default_port_base,
+                known_pids=set(),
+            )
+        except Exception:
+            log.exception(
+                "idle-holder orphan reap failed (best-effort)"
+            )
+        _ih_conn = open_state_db(self.boot.storage.state_db_path)
+        try:
+            record_audit_event(
+                _ih_conn,
+                "teardown_idle_holder",
+                {
+                    "reason": reason,
+                    "model_tag": model_tag,
+                    "sigterm_status": status,
+                    "sigterm_ok": ok,
+                },
+            )
+        finally:
+            _ih_conn.close()
 
     async def _force_cold(self, slot: Slot, reason: str) -> None:
         """Mark a slot COLD when processing dies mid-flight.
@@ -760,6 +905,15 @@ class TurbohaulManager:
             except asyncio.CancelledError:
                 pass
         await self.queue.close()
+        # GRIP H-4 wire: tear down any idle holder so VRAM is released
+        # and llama-server child is reaped on graceful shutdown.
+        if self._idle_handle is not None:
+            try:
+                await self._teardown_idle_holder("shutdown")
+            except Exception:
+                log.exception(
+                    "idle teardown during shutdown failed (best-effort)"
+                )
         # HAUL P-4: release the TOCTOU-pinned binary fd on shutdown
         if self._binary_fd is not None:
             with contextlib.suppress(OSError):
