@@ -82,12 +82,40 @@ class TurbohaulQueue:
             self._staging.appendleft(slot)
 
     async def find_matched_thread(self, thread_id: str, model_tag: str) -> Slot | None:
-        """Locate a staged slot with same (thread_id, model_tag) — for grace-window rematch."""
+        """Locate a staged slot with same (thread_id, model_tag) for grace-window rematch.
+
+        Kept for read-only callers (introspection); the production fast path now uses
+        ``pop_matched_thread`` which atomically pops in one lock acquire (GRIP H-3 fix).
+        """
         if not thread_id:
             return None
         async with self._lock:
             for slot in self._staging:
                 if slot.thread_id == thread_id and slot.model_tag == model_tag:
+                    return slot
+        return None
+
+    async def pop_matched_thread(
+        self, thread_id: str, model_tag: str
+    ) -> Slot | None:
+        """GRIP H-3 fix: atomic find + remove under one lock acquire.
+
+        The legacy find_matched_thread + remove(slot_id) pattern released the
+        queue lock between the two operations, opening a re-entry window for
+        submit() / enqueue_head() to mutate the staging order. The remove call
+        also returned None if anybody else had removed the matched slot in the
+        interim, forcing the caller to retry. Pop semantics close both gaps:
+        one lock, no retry, no vanish race.
+        """
+        if not thread_id:
+            return None
+        async with self._lock:
+            for i, slot in enumerate(self._staging):
+                if (
+                    slot.thread_id == thread_id
+                    and slot.model_tag == model_tag
+                ):
+                    del self._staging[i]
                     return slot
         return None
 

@@ -491,14 +491,11 @@ class TurbohaulManager:
             # Wired in v0.2.1 RC-CF78A6-ACTIVE-MATCH-WIRE (was Phase 3 W12 stub).
             deadline = time.monotonic() + self.runtime.queue.grace_seconds
             while time.monotonic() < deadline and not self._stop_event.is_set():
-                matched = await self.queue.find_matched_thread(
+                # GRIP H-3 fix: atomic find + remove in one lock acquire
+                matched = await self.queue.pop_matched_thread(
                     slot.thread_id, slot.model_tag
                 )
                 if matched is not None:
-                    removed = await self.queue.remove(matched.slot_id)
-                    if removed is None:
-                        await asyncio.sleep(0.05)
-                        continue
                     matched.port = handle.port
                     matched.pid = handle.pid
                     self._active_slot = matched
