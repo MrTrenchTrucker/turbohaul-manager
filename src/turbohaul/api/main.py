@@ -11,7 +11,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from turbohaul import __version__
-from turbohaul.api.chat_completion import router as chat_completion_router
+from turbohaul.api.chat_completion import (
+    make_llama_server_complete_fn,
+    router as chat_completion_router,
+)
 from turbohaul.api.config_put import router as config_put_router
 from turbohaul.api.import_ import router as import_router
 from turbohaul.api.manifests import router as manifests_router
@@ -70,7 +73,11 @@ def create_app(
 
     auto_start_worker / auto_boot_reconcile let tests skip lifecycle side effects.
     """
-    mgr = TurbohaulManager(boot, runtime)
+    mgr = TurbohaulManager(
+        boot,
+        runtime,
+        complete_fn=make_llama_server_complete_fn(),
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

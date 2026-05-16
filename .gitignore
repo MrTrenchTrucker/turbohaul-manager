@@ -60,3 +60,4 @@ ui_dist/
 # Local config overrides
 turbohaul.local.yaml
 docker_build.*
+cuda_build.*
