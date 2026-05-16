@@ -1,5 +1,6 @@
 import { Routes, Route, Link, useLocation } from 'react-router-dom';
 import type { ReactNode } from 'react';
+import Dashboard from './components/Dashboard';
 
 function Layout({ children }: { children: ReactNode }) {
   const loc = useLocation();
@@ -40,7 +41,7 @@ function Stub({ name }: { name: string }) {
     <div className="text-slate-400">
       <div className="text-xl font-semibold text-slate-300">{name}</div>
       <div className="mt-2 text-sm">
-        Wave 17-20 populates this view (data-bound to /status + /api/tags + /ws/state).
+        Wave 18-20 populates this view (data-bound to /api/tags + /api/manifests + WS).
       </div>
     </div>
   );
@@ -50,7 +51,7 @@ export default function App() {
   return (
     <Layout>
       <Routes>
-        <Route path="/" element={<Stub name="Dashboard" />} />
+        <Route path="/" element={<Dashboard />} />
         <Route path="/queue" element={<Stub name="Queue" />} />
         <Route path="/blob" element={<Stub name="Blob" />} />
         <Route path="/config" element={<Stub name="Config" />} />

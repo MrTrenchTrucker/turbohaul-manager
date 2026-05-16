@@ -10,11 +10,45 @@ export type SlotState =
   | 'IDLE_HOT'
   | 'LOADING_FAIL';
 
+export interface ActiveInfo {
+  slot_id: string;
+  model_tag: string;
+  state: SlotState;
+  thread_id_prefix: string;
+  pid: number;
+  port: number;
+}
+
+export interface GraceInfo {
+  remaining_s: number;
+  extension_count: number;
+  max_extensions: number;
+  thread_id_prefix: string;
+  model_tag: string;
+}
+
+export interface IdleHotInfo {
+  remaining_s: number;
+  model_tag: string;
+}
+
+export interface QueueInfo {
+  acceptance_buffer_depth: number;
+  staging_queue_depth: number;
+  staging_queue_max: number;
+}
+
+export interface ParallelSlots {
+  used: number;
+  max: number;
+}
+
 export interface StatusSnapshot {
-  active: { tag: string | null; port: number | null; state: SlotState | null };
-  grace: { tag: string | null; deadline_ms: number | null };
-  queue: { depth: number; head_tag: string | null };
-  idle_hot: { tag: string | null; expires_ms: number | null };
+  queue: QueueInfo;
+  active: ActiveInfo | null;
+  grace: GraceInfo | null;
+  idle_hot: IdleHotInfo | null;
+  parallel_slots: ParallelSlots;
 }
 
 export interface ModelTag {
