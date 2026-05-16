@@ -39,6 +39,51 @@ from turbohaul.subprocess_mgr import (
 log = logging.getLogger(__name__)
 
 
+class EventBus:
+    """Pub-sub for state-level events broadcast to /ws/state subscribers.
+
+    Per v0.2 §11.1 redaction policy: callers are responsible for emitting only
+    safe events. This bus enforces a denylist (prompt/response/stderr/context)
+    on publish as defense-in-depth — even if a caller accidentally includes one
+    of those keys, it gets stripped before fan-out.
+    """
+
+    REDACTED_KEYS: set[str] = {
+        "prompt",
+        "response",
+        "context",
+        "stderr",
+        "stdout",
+        "messages",
+    }
+
+    def __init__(self) -> None:
+        self._subscribers: set[asyncio.Queue] = set()
+
+    def subscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.add(q)
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subscribers)
+
+    def publish_nowait(self, event: dict) -> None:
+        """Publish an event. Sensitive keys are stripped (denylist).
+
+        Each subscriber gets a copy. Full subscriber queues drop on back-pressure
+        rather than block the publisher (worker_loop must stay responsive).
+        """
+        safe_event = {k: v for k, v in event.items() if k not in self.REDACTED_KEYS}
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(safe_event)
+            except asyncio.QueueFull:
+                log.warning("event_bus subscriber queue full — dropping event")
+
+
 def _pid_is_alive(pid: int, kill_fn: Callable[[int, int], None] | None = None) -> bool:
     """Defensive check: is pid currently alive on this host?"""
     fn = kill_fn or os.kill
@@ -90,6 +135,8 @@ class TurbohaulManager:
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        # Event bus for /ws/state subscribers (v0.2 §11.1 redacted)
+        self.event_bus = EventBus()
         # Injection points (default = real subprocess_mgr; tests inject mocks)
         self._spawn = spawn_fn or spawn_sidecar
         self._wait_healthy = health_fn or wait_until_healthy
@@ -401,7 +448,7 @@ class TurbohaulManager:
             conn.close()
 
     def _audit(self, slot: Slot, event_type: str) -> None:
-        """Audit: upsert current slot row + record event. Use for state changes."""
+        """Audit: upsert current slot row + record event + publish to event bus."""
         conn = open_state_db(self.boot.storage.state_db_path)
         try:
             upsert_slot(
@@ -420,6 +467,17 @@ class TurbohaulManager:
             record_audit_event(conn, event_type, {"state": slot.state.value}, slot_id=slot.slot_id)
         finally:
             conn.close()
+        # Publish redacted event to WS subscribers (v0.2 §11.1)
+        self.event_bus.publish_nowait(
+            {
+                "event": event_type,
+                "slot_id": slot.slot_id,
+                "model_tag": slot.model_tag,
+                "state": slot.state.value,
+                # Redaction: only first 8 chars of thread_id exposed
+                "thread_id_prefix": (slot.thread_id or "")[:8],
+            }
+        )
 
     def _audit_event_only(self, slot_id: str, event_type: str, payload: dict | None = None) -> None:
         """Audit: record event ONLY, no slot row mutation.
