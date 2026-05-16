@@ -18,6 +18,7 @@ from turbohaul.config import BootConfig, RuntimeConfig
 from turbohaul.fsm import LEGAL_TRANSITIONS, InvalidTransition, is_terminal, transition
 from turbohaul.manifest import flags_to_argv, read_manifest
 from turbohaul.queue import GraceTimer, IdleHotTimer, TurbohaulQueue
+from turbohaul.safety import all_safety_gates
 from turbohaul.singleton import boot_orphan_reaper, detect_foreign_gpu_apps
 from turbohaul.slot import Slot, SlotState, derive_thread_id_prefix_hash
 from turbohaul.state import (
@@ -510,6 +511,66 @@ class TurbohaulManager:
                 # spawning new -- immediate switch (Cmdr #15709 intent).
                 if self._idle_handle is not None:
                     await self._teardown_idle_holder("model_swap")
+                # Cmdr #15653 safety guardrails: pre-spawn host checks
+                # (VRAM headroom + RAM + CPU load + IO wait). Refuse here
+                # rather than spawning into an OOM / IO-stuck host.
+                if self.runtime.queue.safety_enabled:
+                    manifest_vram = 0
+                    try:
+                        m_for_vram = read_manifest(
+                            self.boot.storage.manifests_path,
+                            slot.model_tag,
+                        )
+                        manifest_vram = m_for_vram.expected_vram_bytes or 0
+                    except FileNotFoundError:
+                        manifest_vram = 0
+                    gates = all_safety_gates(
+                        min_free_ram_mib=self.runtime.queue.safety_min_free_ram_mib,
+                        min_free_vram_mib=self.runtime.queue.safety_min_free_vram_mib,
+                        max_load_per_core=self.runtime.queue.safety_max_load_per_core,
+                        max_iowait_percent=self.runtime.queue.safety_max_iowait_percent,
+                        manifest_expected_vram_bytes=manifest_vram,
+                        iowait_sample_window_s=self.runtime.queue.safety_iowait_sample_window_s,
+                    )
+                    failed = [g for g in gates if not g.ok]
+                    if failed:
+                        # Build a single error message + emit audit detail.
+                        detail = "; ".join(
+                            f"{g.name}: {g.detail}" for g in failed
+                        )
+                        log.warning(
+                            "safety gates refused spawn for slot %s: %s",
+                            slot.slot_id, detail,
+                        )
+                        transition(slot, SlotState.LOADING_FAIL)
+                        self._audit(slot, "safety_gate_refused")
+                        self._audit_event_only(
+                            slot.slot_id,
+                            "safety_gate_detail",
+                            {"failed": [
+                                {"name": g.name, "detail": g.detail}
+                                for g in failed
+                            ]},
+                        )
+                        transition(slot, SlotState.POPPED)
+                        # No sidecar spawned; _teardown is a no-op + audit-only.
+                        # Just mark slot ended + fail caller future.
+                        _sg_conn = open_state_db(
+                            self.boot.storage.state_db_path
+                        )
+                        try:
+                            mark_slot_ended(
+                                _sg_conn, slot.slot_id, "safety_gate_refused",
+                            )
+                        finally:
+                            _sg_conn.close()
+                        self._fail_completion_future(
+                            slot,
+                            RuntimeError(
+                                f"safety gates refused spawn: {detail}",
+                            ),
+                        )
+                        return
                 handle = self._spawn(
                     self.boot.runtime.llama_server_binary,
                     gguf_path,

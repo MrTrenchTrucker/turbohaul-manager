@@ -73,6 +73,13 @@ class QueueConfig(BaseModel):
     acceptance_buffer_max: int = Field(default=10000, ge=1)
     grace_seconds: int = Field(default=30, ge=0, le=3600)
     idle_hot_load_seconds: int = Field(default=120, ge=0, le=86400)
+    # Cmdr #15653 safety guardrails -- mirror Ollama pre-spawn safety posture
+    safety_enabled: bool = True
+    safety_min_free_ram_mib: int = Field(default=1024, ge=0)
+    safety_min_free_vram_mib: int = Field(default=512, ge=0)
+    safety_max_load_per_core: float = Field(default=0.9, ge=0.0)
+    safety_max_iowait_percent: float = Field(default=30.0, ge=0.0, le=100.0)
+    safety_iowait_sample_window_s: float = Field(default=0.4, ge=0.05, le=5.0)
     max_grace_extensions: int = Field(default=5, ge=0, le=1000)
     loading_health_timeout_s: int = Field(default=600, ge=10, le=7200)
     drained_sigterm_window_active_s: int = Field(default=15, ge=1, le=300)
