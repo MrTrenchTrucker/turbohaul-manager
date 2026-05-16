@@ -1,0 +1,380 @@
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 2.32kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/node:20-alpine
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/python:3.11-slim
+#3 DONE 0.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 582B done
+#4 DONE 0.0s
+
+#5 [frontend-build 1/6] FROM docker.io/library/node:20-alpine
+#5 CACHED
+
+#6 [runtime  1/10] FROM docker.io/library/python:3.11-slim
+#6 CACHED
+
+#7 [frontend-build 2/6] WORKDIR /work
+#7 DONE 0.0s
+
+#8 [internal] load build context
+#8 transferring context: 470.00kB done
+#8 DONE 0.0s
+
+#9 [frontend-build 3/6] COPY src/frontend/package.json src/frontend/package-lock.json ./
+#9 DONE 0.0s
+
+#10 [frontend-build 4/6] RUN npm ci --no-audit --no-fund
+#10 ...
+
+#11 [runtime  2/10] RUN apt-get update  && apt-get install -y --no-install-recommends ca-certificates curl procps  && rm -rf /var/lib/apt/lists/*
+#11 0.534 Get:1 http://deb.debian.org/debian trixie InRelease [140 kB]
+#11 1.031 Get:2 http://deb.debian.org/debian trixie-updates InRelease [47.3 kB]
+#11 1.072 Get:3 http://deb.debian.org/debian-security trixie-security InRelease [43.4 kB]
+#11 1.483 Get:4 http://deb.debian.org/debian trixie/main amd64 Packages [9671 kB]
+#11 6.960 Get:5 http://deb.debian.org/debian trixie-updates/main amd64 Packages [5412 B]
+#11 6.996 Get:6 http://deb.debian.org/debian-security trixie-security/main amd64 Packages [163 kB]
+#11 7.367 Fetched 10.1 MB in 7s (1431 kB/s)
+#11 7.367 Reading package lists...
+#11 7.684 Reading package lists...
+#11 7.950 Building dependency tree...
+#11 8.023 Reading state information...
+#11 8.089 ca-certificates is already the newest version (20250419).
+#11 8.089 The following additional packages will be installed:
+#11 8.089   libbrotli1 libcom-err2 libcurl4t64 libgnutls30t64 libgssapi-krb5-2 libidn2-0
+#11 8.089   libk5crypto3 libkeyutils1 libkrb5-3 libkrb5support0 libldap2 libnghttp2-14
+#11 8.090   libnghttp3-9 libp11-kit0 libproc2-0 libpsl5t64 librtmp1 libsasl2-2
+#11 8.090   libsasl2-modules-db libssh2-1t64 libtasn1-6 libunistring5
+#11 8.090 Suggested packages:
+#11 8.090   gnutls-bin krb5-doc krb5-user
+#11 8.090 Recommended packages:
+#11 8.090   bash-completion krb5-locales libldap-common publicsuffix libsasl2-modules
+#11 8.090   psmisc linux-sysctl-defaults
+#11 8.171 The following NEW packages will be installed:
+#11 8.172   curl libbrotli1 libcom-err2 libcurl4t64 libgnutls30t64 libgssapi-krb5-2
+#11 8.172   libidn2-0 libk5crypto3 libkeyutils1 libkrb5-3 libkrb5support0 libldap2
+#11 8.172   libnghttp2-14 libnghttp3-9 libp11-kit0 libproc2-0 libpsl5t64 librtmp1
+#11 8.172   libsasl2-2 libsasl2-modules-db libssh2-1t64 libtasn1-6 libunistring5 procps
+#11 8.284 0 upgraded, 24 newly installed, 0 to remove and 12 not upgraded.
+#11 8.284 Need to get 5832 kB of archives.
+#11 8.284 After this operation, 17.4 MB of additional disk space will be used.
+#11 8.284 Get:1 http://deb.debian.org/debian trixie/main amd64 libproc2-0 amd64 2:4.0.4-9 [65.6 kB]
+#11 8.363 Get:2 http://deb.debian.org/debian trixie/main amd64 procps amd64 2:4.0.4-9 [882 kB]
+#11 8.569 Get:3 http://deb.debian.org/debian trixie/main amd64 libbrotli1 amd64 1.1.0-2+b7 [307 kB]
+#11 8.638 Get:4 http://deb.debian.org/debian trixie/main amd64 libkrb5support0 amd64 1.21.3-5 [33.0 kB]
+#11 8.650 Get:5 http://deb.debian.org/debian trixie/main amd64 libcom-err2 amd64 1.47.2-3+b11 [25.0 kB]
+#11 8.650 Get:6 http://deb.debian.org/debian trixie/main amd64 libk5crypto3 amd64 1.21.3-5 [81.5 kB]
+#11 8.656 Get:7 http://deb.debian.org/debian trixie/main amd64 libkeyutils1 amd64 1.6.3-6 [9456 B]
+#11 8.656 Get:8 http://deb.debian.org/debian trixie/main amd64 libkrb5-3 amd64 1.21.3-5 [326 kB]
+#11 8.719 Get:9 http://deb.debian.org/debian trixie/main amd64 libgssapi-krb5-2 amd64 1.21.3-5 [138 kB]
+#11 8.743 Get:10 http://deb.debian.org/debian trixie/main amd64 libunistring5 amd64 1.3-2 [477 kB]
+#11 8.818 Get:11 http://deb.debian.org/debian trixie/main amd64 libidn2-0 amd64 2.3.8-2 [109 kB]
+#11 8.829 Get:12 http://deb.debian.org/debian trixie/main amd64 libsasl2-modules-db amd64 2.1.28+dfsg1-9 [19.8 kB]
+#11 8.832 Get:13 http://deb.debian.org/debian trixie/main amd64 libsasl2-2 amd64 2.1.28+dfsg1-9 [57.5 kB]
+#11 8.841 Get:14 http://deb.debian.org/debian trixie/main amd64 libldap2 amd64 2.6.10+dfsg-1 [194 kB]
+#11 8.881 Get:15 http://deb.debian.org/debian-security trixie-security/main amd64 libnghttp2-14 amd64 1.64.0-1.1+deb13u1 [76.2 kB]
+#11 8.884 Get:16 http://deb.debian.org/debian trixie/main amd64 libnghttp3-9 amd64 1.8.0-1 [67.7 kB]
+#11 8.899 Get:17 http://deb.debian.org/debian trixie/main amd64 libpsl5t64 amd64 0.21.2-1.1+b1 [57.2 kB]
+#11 8.905 Get:18 http://deb.debian.org/debian trixie/main amd64 libp11-kit0 amd64 0.25.5-3 [425 kB]
+#11 8.971 Get:19 http://deb.debian.org/debian trixie/main amd64 libtasn1-6 amd64 4.20.0-2 [49.9 kB]
+#11 8.985 Get:20 http://deb.debian.org/debian trixie/main amd64 libgnutls30t64 amd64 3.8.9-3+deb13u3 [1467 kB]
+#11 9.208 Get:21 http://deb.debian.org/debian trixie/main amd64 librtmp1 amd64 2.4+20151223.gitfa8646d.1-2+b5 [58.8 kB]
+#11 9.216 Get:22 http://deb.debian.org/debian trixie/main amd64 libssh2-1t64 amd64 1.11.1-1 [245 kB]
+#11 9.248 Get:23 http://deb.debian.org/debian trixie/main amd64 libcurl4t64 amd64 8.14.1-2+deb13u3 [391 kB]
+#11 9.308 Get:24 http://deb.debian.org/debian trixie/main amd64 curl amd64 8.14.1-2+deb13u3 [270 kB]
+#11 9.452 debconf: unable to initialize frontend: Dialog
+#11 9.452 debconf: (TERM is not set, so the dialog frontend is not usable.)
+#11 9.452 debconf: falling back to frontend: Readline
+#11 9.452 debconf: unable to initialize frontend: Readline
+#11 9.452 debconf: (Can't locate Term/ReadLine.pm in @INC (you may need to install the Term::ReadLine module) (@INC entries checked: /etc/perl /usr/local/lib/x86_64-linux-gnu/perl/5.40.1 /usr/local/share/perl/5.40.1 /usr/lib/x86_64-linux-gnu/perl5/5.40 /usr/share/perl5 /usr/lib/x86_64-linux-gnu/perl-base /usr/lib/x86_64-linux-gnu/perl/5.40 /usr/share/perl/5.40 /usr/local/lib/site_perl) at /usr/share/perl5/Debconf/FrontEnd/Readline.pm line 8, <STDIN> line 24.)
+#11 9.452 debconf: falling back to frontend: Teletype
+#11 9.454 debconf: unable to initialize frontend: Teletype
+#11 9.454 debconf: (This frontend requires a controlling tty.)
+#11 9.454 debconf: falling back to frontend: Noninteractive
+#11 9.698 Fetched 5832 kB in 1s (4957 kB/s)
+#11 9.717 Selecting previously unselected package libproc2-0:amd64.
+#11 9.717 (Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 5645 files and directories currently installed.)
+#11 9.727 Preparing to unpack .../00-libproc2-0_2%3a4.0.4-9_amd64.deb ...
+#11 9.728 Unpacking libproc2-0:amd64 (2:4.0.4-9) ...
+#11 9.739 Selecting previously unselected package procps.
+#11 9.739 Preparing to unpack .../01-procps_2%3a4.0.4-9_amd64.deb ...
+#11 9.742 Unpacking procps (2:4.0.4-9) ...
+#11 9.767 Selecting previously unselected package libbrotli1:amd64.
+#11 9.768 Preparing to unpack .../02-libbrotli1_1.1.0-2+b7_amd64.deb ...
+#11 9.768 Unpacking libbrotli1:amd64 (1.1.0-2+b7) ...
+#11 9.784 Selecting previously unselected package libkrb5support0:amd64.
+#11 9.785 Preparing to unpack .../03-libkrb5support0_1.21.3-5_amd64.deb ...
+#11 9.786 Unpacking libkrb5support0:amd64 (1.21.3-5) ...
+#11 9.794 Selecting previously unselected package libcom-err2:amd64.
+#11 9.795 Preparing to unpack .../04-libcom-err2_1.47.2-3+b11_amd64.deb ...
+#11 9.795 Unpacking libcom-err2:amd64 (1.47.2-3+b11) ...
+#11 9.803 Selecting previously unselected package libk5crypto3:amd64.
+#11 9.803 Preparing to unpack .../05-libk5crypto3_1.21.3-5_amd64.deb ...
+#11 9.804 Unpacking libk5crypto3:amd64 (1.21.3-5) ...
+#11 9.814 Selecting previously unselected package libkeyutils1:amd64.
+#11 9.814 Preparing to unpack .../06-libkeyutils1_1.6.3-6_amd64.deb ...
+#11 9.815 Unpacking libkeyutils1:amd64 (1.6.3-6) ...
+#11 9.822 Selecting previously unselected package libkrb5-3:amd64.
+#11 9.822 Preparing to unpack .../07-libkrb5-3_1.21.3-5_amd64.deb ...
+#11 9.823 Unpacking libkrb5-3:amd64 (1.21.3-5) ...
+#11 9.839 Selecting previously unselected package libgssapi-krb5-2:amd64.
+#11 9.839 Preparing to unpack .../08-libgssapi-krb5-2_1.21.3-5_amd64.deb ...
+#11 9.840 Unpacking libgssapi-krb5-2:amd64 (1.21.3-5) ...
+#11 9.851 Selecting previously unselected package libunistring5:amd64.
+#11 9.852 Preparing to unpack .../09-libunistring5_1.3-2_amd64.deb ...
+#11 9.852 Unpacking libunistring5:amd64 (1.3-2) ...
+#11 9.872 Selecting previously unselected package libidn2-0:amd64.
+#11 9.873 Preparing to unpack .../10-libidn2-0_2.3.8-2_amd64.deb ...
+#11 9.873 Unpacking libidn2-0:amd64 (2.3.8-2) ...
+#11 9.883 Selecting previously unselected package libsasl2-modules-db:amd64.
+#11 9.883 Preparing to unpack .../11-libsasl2-modules-db_2.1.28+dfsg1-9_amd64.deb ...
+#11 9.884 Unpacking libsasl2-modules-db:amd64 (2.1.28+dfsg1-9) ...
+#11 9.891 Selecting previously unselected package libsasl2-2:amd64.
+#11 9.891 Preparing to unpack .../12-libsasl2-2_2.1.28+dfsg1-9_amd64.deb ...
+#11 9.892 Unpacking libsasl2-2:amd64 (2.1.28+dfsg1-9) ...
+#11 9.900 Selecting previously unselected package libldap2:amd64.
+#11 9.900 Preparing to unpack .../13-libldap2_2.6.10+dfsg-1_amd64.deb ...
+#11 9.901 Unpacking libldap2:amd64 (2.6.10+dfsg-1) ...
+#11 9.913 Selecting previously unselected package libnghttp2-14:amd64.
+#11 9.913 Preparing to unpack .../14-libnghttp2-14_1.64.0-1.1+deb13u1_amd64.deb ...
+#11 9.913 Unpacking libnghttp2-14:amd64 (1.64.0-1.1+deb13u1) ...
+#11 9.922 Selecting previously unselected package libnghttp3-9:amd64.
+#11 9.923 Preparing to unpack .../15-libnghttp3-9_1.8.0-1_amd64.deb ...
+#11 9.923 Unpacking libnghttp3-9:amd64 (1.8.0-1) ...
+#11 9.932 Selecting previously unselected package libpsl5t64:amd64.
+#11 9.932 Preparing to unpack .../16-libpsl5t64_0.21.2-1.1+b1_amd64.deb ...
+#11 9.933 Unpacking libpsl5t64:amd64 (0.21.2-1.1+b1) ...
+#11 9.942 Selecting previously unselected package libp11-kit0:amd64.
+#11 9.942 Preparing to unpack .../17-libp11-kit0_0.25.5-3_amd64.deb ...
+#11 9.942 Unpacking libp11-kit0:amd64 (0.25.5-3) ...
+#11 9.959 Selecting previously unselected package libtasn1-6:amd64.
+#11 9.959 Preparing to unpack .../18-libtasn1-6_4.20.0-2_amd64.deb ...
+#11 9.959 Unpacking libtasn1-6:amd64 (4.20.0-2) ...
+#11 9.968 Selecting previously unselected package libgnutls30t64:amd64.
+#11 9.969 Preparing to unpack .../19-libgnutls30t64_3.8.9-3+deb13u3_amd64.deb ...
+#11 9.969 Unpacking libgnutls30t64:amd64 (3.8.9-3+deb13u3) ...
+#11 9.998 Selecting previously unselected package librtmp1:amd64.
+#11 9.998 Preparing to unpack .../20-librtmp1_2.4+20151223.gitfa8646d.1-2+b5_amd64.deb ...
+#11 9.999 Unpacking librtmp1:amd64 (2.4+20151223.gitfa8646d.1-2+b5) ...
+#11 10.01 Selecting previously unselected package libssh2-1t64:amd64.
+#11 10.01 Preparing to unpack .../21-libssh2-1t64_1.11.1-1_amd64.deb ...
+#11 10.01 Unpacking libssh2-1t64:amd64 (1.11.1-1) ...
+#11 10.02 Selecting previously unselected package libcurl4t64:amd64.
+#11 10.02 Preparing to unpack .../22-libcurl4t64_8.14.1-2+deb13u3_amd64.deb ...
+#11 10.02 Unpacking libcurl4t64:amd64 (8.14.1-2+deb13u3) ...
+#11 10.04 Selecting previously unselected package curl.
+#11 10.04 Preparing to unpack .../23-curl_8.14.1-2+deb13u3_amd64.deb ...
+#11 10.04 Unpacking curl (8.14.1-2+deb13u3) ...
+#11 10.06 Setting up libkeyutils1:amd64 (1.6.3-6) ...
+#11 10.06 Setting up libbrotli1:amd64 (1.1.0-2+b7) ...
+#11 10.06 Setting up libnghttp2-14:amd64 (1.64.0-1.1+deb13u1) ...
+#11 10.06 Setting up libcom-err2:amd64 (1.47.2-3+b11) ...
+#11 10.06 Setting up libkrb5support0:amd64 (1.21.3-5) ...
+#11 10.07 Setting up libsasl2-modules-db:amd64 (2.1.28+dfsg1-9) ...
+#11 10.07 Setting up libp11-kit0:amd64 (0.25.5-3) ...
+#11 10.07 Setting up libproc2-0:amd64 (2:4.0.4-9) ...
+#11 10.07 Setting up libunistring5:amd64 (1.3-2) ...
+#11 10.07 Setting up libk5crypto3:amd64 (1.21.3-5) ...
+#11 10.07 Setting up libsasl2-2:amd64 (2.1.28+dfsg1-9) ...
+#11 10.07 Setting up libnghttp3-9:amd64 (1.8.0-1) ...
+#11 10.08 Setting up procps (2:4.0.4-9) ...
+#11 10.09 Setting up libtasn1-6:amd64 (4.20.0-2) ...
+#11 10.09 Setting up libkrb5-3:amd64 (1.21.3-5) ...
+#11 10.09 Setting up libssh2-1t64:amd64 (1.11.1-1) ...
+#11 10.09 Setting up libldap2:amd64 (2.6.10+dfsg-1) ...
+#11 10.09 Setting up libidn2-0:amd64 (2.3.8-2) ...
+#11 10.09 Setting up libgssapi-krb5-2:amd64 (1.21.3-5) ...
+#11 10.09 Setting up libgnutls30t64:amd64 (3.8.9-3+deb13u3) ...
+#11 10.10 Setting up libpsl5t64:amd64 (0.21.2-1.1+b1) ...
+#11 10.10 Setting up librtmp1:amd64 (2.4+20151223.gitfa8646d.1-2+b5) ...
+#11 10.10 Setting up libcurl4t64:amd64 (8.14.1-2+deb13u3) ...
+#11 10.10 Setting up curl (8.14.1-2+deb13u3) ...
+#11 10.10 Processing triggers for libc-bin (2.41-12+deb13u2) ...
+#11 DONE 10.1s
+
+#10 [frontend-build 4/6] RUN npm ci --no-audit --no-fund
+#10 ...
+
+#12 [runtime  3/10] WORKDIR /app
+#12 DONE 0.0s
+
+#13 [runtime  4/10] COPY pyproject.toml README.md ./
+#13 DONE 0.0s
+
+#14 [runtime  5/10] COPY src/turbohaul/ ./src/turbohaul/
+#14 DONE 0.0s
+
+#15 [runtime  6/10] RUN pip install --no-cache-dir .
+#15 1.075 Processing /app
+#15 1.076   Installing build dependencies: started
+#15 2.897   Installing build dependencies: finished with status 'done'
+#15 2.897   Getting requirements to build wheel: started
+#15 2.998   Getting requirements to build wheel: finished with status 'done'
+#15 2.999   Preparing metadata (pyproject.toml): started
+#15 3.082   Preparing metadata (pyproject.toml): finished with status 'done'
+#15 3.317 Collecting fastapi>=0.115.0 (from turbohaul-manager==0.0.1)
+#15 3.461   Downloading fastapi-0.136.1-py3-none-any.whl.metadata (28 kB)
+#15 3.527 Collecting uvicorn>=0.32.0 (from uvicorn[standard]>=0.32.0->turbohaul-manager==0.0.1)
+#15 3.569   Downloading uvicorn-0.47.0-py3-none-any.whl.metadata (6.7 kB)
+#15 3.703 Collecting pydantic>=2.9.0 (from turbohaul-manager==0.0.1)
+#15 3.744   Downloading pydantic-2.13.4-py3-none-any.whl.metadata (109 kB)
+#15 3.785      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 109.4/109.4 kB 2.5 MB/s eta 0:00:00
+#15 3.830 Collecting pydantic-settings>=2.6.0 (from turbohaul-manager==0.0.1)
+#15 3.865   Downloading pydantic_settings-2.14.1-py3-none-any.whl.metadata (3.4 kB)
+#15 3.922 Collecting pyyaml>=6.0.2 (from turbohaul-manager==0.0.1)
+#15 3.965   Downloading pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.4 kB)
+#15 4.009 Collecting aiosqlite>=0.20.0 (from turbohaul-manager==0.0.1)
+#15 4.051   Downloading aiosqlite-0.22.1-py3-none-any.whl.metadata (4.3 kB)
+#15 4.094 Collecting httpx>=0.27.0 (from turbohaul-manager==0.0.1)
+#15 4.134   Downloading httpx-0.28.1-py3-none-any.whl.metadata (7.1 kB)
+#15 4.216 Collecting websockets>=13.0 (from turbohaul-manager==0.0.1)
+#15 4.251   Downloading websockets-16.0-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl.metadata (6.8 kB)
+#15 4.315 Collecting structlog>=24.4.0 (from turbohaul-manager==0.0.1)
+#15 4.361   Downloading structlog-25.5.0-py3-none-any.whl.metadata (9.5 kB)
+#15 4.434 Collecting starlette>=0.46.0 (from fastapi>=0.115.0->turbohaul-manager==0.0.1)
+#15 4.473   Downloading starlette-1.0.0-py3-none-any.whl.metadata (6.3 kB)
+#15 4.530 Collecting typing-extensions>=4.8.0 (from fastapi>=0.115.0->turbohaul-manager==0.0.1)
+#15 4.562   Downloading typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
+#15 4.610 Collecting typing-inspection>=0.4.2 (from fastapi>=0.115.0->turbohaul-manager==0.0.1)
+#15 4.649   Downloading typing_inspection-0.4.2-py3-none-any.whl.metadata (2.6 kB)
+#15 4.688 Collecting annotated-doc>=0.0.2 (from fastapi>=0.115.0->turbohaul-manager==0.0.1)
+#15 4.726   Downloading annotated_doc-0.0.4-py3-none-any.whl.metadata (6.6 kB)
+#15 4.773 Collecting anyio (from httpx>=0.27.0->turbohaul-manager==0.0.1)
+#15 4.815   Downloading anyio-4.13.0-py3-none-any.whl.metadata (4.5 kB)
+#15 4.856 Collecting certifi (from httpx>=0.27.0->turbohaul-manager==0.0.1)
+#15 4.888   Downloading certifi-2026.4.22-py3-none-any.whl.metadata (2.5 kB)
+#15 4.933 Collecting httpcore==1.* (from httpx>=0.27.0->turbohaul-manager==0.0.1)
+#15 4.969   Downloading httpcore-1.0.9-py3-none-any.whl.metadata (21 kB)
+#15 5.010 Collecting idna (from httpx>=0.27.0->turbohaul-manager==0.0.1)
+#15 5.045   Downloading idna-3.15-py3-none-any.whl.metadata (7.7 kB)
+#15 5.085 Collecting h11>=0.16 (from httpcore==1.*->httpx>=0.27.0->turbohaul-manager==0.0.1)
+#15 5.125   Downloading h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+#15 5.172 Collecting annotated-types>=0.6.0 (from pydantic>=2.9.0->turbohaul-manager==0.0.1)
+#15 5.207   Downloading annotated_types-0.7.0-py3-none-any.whl.metadata (15 kB)
+#15 5.759 Collecting pydantic-core==2.46.4 (from pydantic>=2.9.0->turbohaul-manager==0.0.1)
+#15 5.819   Downloading pydantic_core-2.46.4-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.6 kB)
+#15 5.870 Collecting python-dotenv>=0.21.0 (from pydantic-settings>=2.6.0->turbohaul-manager==0.0.1)
+#15 5.905   Downloading python_dotenv-1.2.2-py3-none-any.whl.metadata (27 kB)
+#15 5.958 Collecting click>=7.0 (from uvicorn>=0.32.0->uvicorn[standard]>=0.32.0->turbohaul-manager==0.0.1)
+#15 6.001   Downloading click-8.3.3-py3-none-any.whl.metadata (2.6 kB)
+#15 6.077 Collecting httptools>=0.6.3 (from uvicorn[standard]>=0.32.0->turbohaul-manager==0.0.1)
+#15 6.129   Downloading httptools-0.7.1-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl.metadata (3.5 kB)
+#15 6.203 Collecting uvloop>=0.15.1 (from uvicorn[standard]>=0.32.0->turbohaul-manager==0.0.1)
+#15 6.247   Downloading uvloop-0.22.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (4.9 kB)
+#15 6.326 Collecting watchfiles>=0.20 (from uvicorn[standard]>=0.32.0->turbohaul-manager==0.0.1)
+#15 6.371   Downloading watchfiles-1.1.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (4.9 kB)
+#15 6.448 Downloading aiosqlite-0.22.1-py3-none-any.whl (17 kB)
+#15 6.517 Downloading fastapi-0.136.1-py3-none-any.whl (117 kB)
+#15 6.532    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 117.7/117.7 kB 8.3 MB/s eta 0:00:00
+#15 6.573 Downloading httpx-0.28.1-py3-none-any.whl (73 kB)
+#15 6.579    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 73.5/73.5 kB 15.1 MB/s eta 0:00:00
+#15 6.612 Downloading httpcore-1.0.9-py3-none-any.whl (78 kB)
+#15 6.620    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 78.8/78.8 kB 15.9 MB/s eta 0:00:00
+#15 6.659 Downloading pydantic-2.13.4-py3-none-any.whl (472 kB)
+#15 6.705    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 472.3/472.3 kB 10.6 MB/s eta 0:00:00
+#15 6.739 Downloading pydantic_core-2.46.4-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (2.1 MB)
+#15 6.812    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 29.1 MB/s eta 0:00:00
+#15 6.849 Downloading pydantic_settings-2.14.1-py3-none-any.whl (60 kB)
+#15 6.851    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 61.0/61.0 kB 51.7 MB/s eta 0:00:00
+#15 6.885 Downloading pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (806 kB)
+#15 6.948    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 806.6/806.6 kB 13.0 MB/s eta 0:00:00
+#15 6.994 Downloading structlog-25.5.0-py3-none-any.whl (72 kB)
+#15 6.995    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 72.5/72.5 kB 675.4 MB/s eta 0:00:00
+#15 7.029 Downloading uvicorn-0.47.0-py3-none-any.whl (71 kB)
+#15 7.031    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 71.3/71.3 kB 47.8 MB/s eta 0:00:00
+#15 7.071 Downloading websockets-16.0-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (184 kB)
+#15 7.085    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 184.6/184.6 kB 13.9 MB/s eta 0:00:00
+#15 7.119 Downloading annotated_doc-0.0.4-py3-none-any.whl (5.3 kB)
+#15 7.153 Downloading annotated_types-0.7.0-py3-none-any.whl (13 kB)
+#15 7.189 Downloading click-8.3.3-py3-none-any.whl (110 kB)
+#15 7.191    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 110.5/110.5 kB 80.0 MB/s eta 0:00:00
+#15 7.228 Downloading h11-0.16.0-py3-none-any.whl (37 kB)
+#15 7.274 Downloading httptools-0.7.1-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (456 kB)
+#15 7.290    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 456.6/456.6 kB 31.2 MB/s eta 0:00:00
+#15 7.329 Downloading python_dotenv-1.2.2-py3-none-any.whl (22 kB)
+#15 7.365 Downloading starlette-1.0.0-py3-none-any.whl (72 kB)
+#15 7.377    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 72.7/72.7 kB 5.7 MB/s eta 0:00:00
+#15 7.419 Downloading anyio-4.13.0-py3-none-any.whl (114 kB)
+#15 7.441    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 114.4/114.4 kB 10.5 MB/s eta 0:00:00
+#15 7.475 Downloading idna-3.15-py3-none-any.whl (72 kB)
+#15 7.489    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 72.3/72.3 kB 4.6 MB/s eta 0:00:00
+#15 7.525 Downloading typing_extensions-4.15.0-py3-none-any.whl (44 kB)
+#15 7.535    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 44.6/44.6 kB 4.4 MB/s eta 0:00:00
+#15 7.568 Downloading typing_inspection-0.4.2-py3-none-any.whl (14 kB)
+#15 7.605 Downloading uvloop-0.22.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (3.8 MB)
+#15 7.773    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.8/3.8 MB 22.6 MB/s eta 0:00:00
+#15 7.829 Downloading watchfiles-1.1.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (456 kB)
+#15 7.861    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 456.1/456.1 kB 18.5 MB/s eta 0:00:00
+#15 7.898 Downloading certifi-2026.4.22-py3-none-any.whl (135 kB)
+#15 7.909    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 135.7/135.7 kB 12.6 MB/s eta 0:00:00
+#15 7.920 Building wheels for collected packages: turbohaul-manager
+#15 7.921   Building wheel for turbohaul-manager (pyproject.toml): started
+#15 8.013   Building wheel for turbohaul-manager (pyproject.toml): finished with status 'done'
+#15 8.014   Created wheel for turbohaul-manager: filename=turbohaul_manager-0.0.1-py3-none-any.whl size=48309 sha256=a7a4aa809f5bae9aa7d7ea545fb7754b3db64b922804339aca3fa0329b354791
+#15 8.014   Stored in directory: /tmp/pip-ephem-wheel-cache-n_wstml7/wheels/57/0f/98/bb57b2b57b95807699b822a35c022f139d38a02c27922f27ce
+#15 8.015 Successfully built turbohaul-manager
+#15 8.069 Installing collected packages: websockets, uvloop, typing-extensions, structlog, pyyaml, python-dotenv, idna, httptools, h11, click, certifi, annotated-types, annotated-doc, aiosqlite, uvicorn, typing-inspection, pydantic-core, httpcore, anyio, watchfiles, starlette, pydantic, httpx, pydantic-settings, fastapi, turbohaul-manager
+#15 8.790 Successfully installed aiosqlite-0.22.1 annotated-doc-0.0.4 annotated-types-0.7.0 anyio-4.13.0 certifi-2026.4.22 click-8.3.3 fastapi-0.136.1 h11-0.16.0 httpcore-1.0.9 httptools-0.7.1 httpx-0.28.1 idna-3.15 pydantic-2.13.4 pydantic-core-2.46.4 pydantic-settings-2.14.1 python-dotenv-1.2.2 pyyaml-6.0.3 starlette-1.0.0 structlog-25.5.0 turbohaul-manager-0.0.1 typing-extensions-4.15.0 typing-inspection-0.4.2 uvicorn-0.47.0 uvloop-0.22.1 watchfiles-1.1.1 websockets-16.0
+#15 8.790 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+#15 8.962 
+#15 8.962 [notice] A new release of pip is available: 24.0 -> 26.1.1
+#15 8.962 [notice] To update, run: pip install --upgrade pip
+#15 DONE 9.4s
+
+#10 [frontend-build 4/6] RUN npm ci --no-audit --no-fund
+#10 354.2 
+#10 354.2 added 138 packages in 6m
+#10 354.2 npm notice
+#10 354.2 npm notice New major version of npm available! 10.8.2 -> 11.14.1
+#10 354.2 npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.14.1
+#10 354.2 npm notice To update run: npm install -g npm@11.14.1
+#10 354.2 npm notice
+#10 DONE 354.2s
+
+#16 [frontend-build 5/6] COPY src/frontend/. ./
+#16 DONE 0.0s
+
+#17 [frontend-build 6/6] RUN npm run typecheck && npm run build
+#17 0.354 
+#17 0.354 > turbohaul-frontend@0.2.0 typecheck
+#17 0.354 > tsc --noEmit
+#17 0.354 
+#17 1.104 
+#17 1.104 > turbohaul-frontend@0.2.0 build
+#17 1.104 > vite build
+#17 1.104 
+#17 1.205 vite v5.4.21 building for production...
+#17 1.231 transforming...
+#17 1.819 ✓ 43 modules transformed.
+#17 1.908 rendering chunks...
+#17 1.959 computing gzip size...
+#17 1.964 dist/index.html                   0.44 kB │ gzip:  0.30 kB
+#17 1.964 dist/assets/index-C537uQIv.css   11.60 kB │ gzip:  2.90 kB
+#17 1.964 dist/assets/index-DMyAtLur.js   185.65 kB │ gzip: 58.70 kB │ map: 763.55 kB
+#17 1.964 ✓ built in 745ms
+#17 DONE 2.0s
+
+#18 [runtime  7/10] COPY --from=frontend-build /work/dist /opt/turbohaul/ui_dist
+#18 DONE 0.0s
+
+#19 [runtime  8/10] RUN mkdir -p /var/lib/turbohaul /etc/turbohaul /opt/turbohaul/bin  && chmod 700 /var/lib/turbohaul
+#19 DONE 0.3s
+
+#20 [runtime  9/10] COPY docker/turbohaul.default.yaml /etc/turbohaul/turbohaul.yaml
+#20 DONE 0.0s
+
+#21 [runtime 10/10] COPY THIRD_PARTY_LICENSES.md /usr/share/doc/turbohaul/THIRD_PARTY_LICENSES.md
+#21 DONE 0.0s
+
+#22 exporting to image
+#22 exporting layers
+#22 exporting layers 0.2s done
+#22 writing image sha256:6bc344164bcd669c206c440885430a9ef2fcc7b0393e9697219686848d85ed74 done
+#22 naming to docker.io/library/turbohaul-manager:v0.2 done
+#22 DONE 0.2s

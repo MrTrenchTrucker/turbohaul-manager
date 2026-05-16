@@ -1,0 +1,38 @@
+# Build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend build artifacts
+src/frontend/node_modules/
+src/frontend/dist/
+src/frontend/build.log
+src/frontend/build.done
+src/frontend/build.fail
+src/frontend/*.tsbuildinfo
+
+# State files (never bake into image)
+*.sqlite
+*.sqlite-journal
+*.gguf
+var/
+
+# VCS + editor
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project meta + tests (kept for image — but `tests/` is large; comment to include)
+tests/
+ARCHITECTURE.md
+TODO.md
+docs/
