@@ -142,11 +142,18 @@ class TurbohaulQueue:
             "acceptance_buffer_max": self.acceptance_max,
         }
 
-    async def close(self) -> None:
+    async def close(self) -> list[Slot]:
+        """NEMO V2 2.1 fix: return the cleared slots so manager.shutdown can
+        fail their pending completion_futures. Previously close() silently
+        clobbered _staging + _accept_buf -- every awaiting caller hung until
+        the submit_and_wait timeout (default 600s) fired or never returned.
+        """
         async with self._lock:
             self._closed = True
+            cleared: list[Slot] = list(self._staging) + list(self._accept_buf)
             self._accept_buf.clear()
             self._staging.clear()
+            return cleared
 
 
 class GraceTimer:

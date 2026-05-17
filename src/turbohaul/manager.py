@@ -1008,7 +1008,17 @@ class TurbohaulManager:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-        await self.queue.close()
+        # NEMO V2 2.1 fix: close() now returns the slots it cleared; fail
+        # their completion_futures so callers get a clean CancelledError
+        # instead of hanging until submit_and_wait timeout.
+        cleared_slots = await self.queue.close()
+        for cleared in cleared_slots:
+            self._fail_completion_future(
+                cleared,
+                asyncio.CancelledError(
+                    "manager shutdown -- slot was never processed"
+                ),
+            )
         # GRIP H-4 wire: tear down any idle holder so VRAM is released
         # and llama-server child is reaped on graceful shutdown.
         if self._idle_handle is not None:

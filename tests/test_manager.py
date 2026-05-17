@@ -255,3 +255,56 @@ class TestWorkerLoopSkeleton:
         assert row is not None
         assert row["state"] == "COLD"
         conn.close()
+
+
+import pytest
+from turbohaul.manager import TurbohaulManager
+from turbohaul.config import BootConfig, ServerConfig, StorageConfig, RuntimePathsConfig, UIConfig, RuntimeConfig, QueueConfig, PullConfig
+
+
+@pytest.mark.asyncio
+class TestShutdownFailsPending:
+    """NEMO V2 2.1: shutdown must fail pending completion_futures."""
+
+    async def test_shutdown_fails_staged_slot_completion_futures(self, tmp_path):
+        storage_root = tmp_path / "state"
+        storage_root.mkdir()
+        (storage_root / "blobs").mkdir()
+        (storage_root / "manifests").mkdir()
+        (storage_root / "import-staging").mkdir()
+        boot = BootConfig(
+            server=ServerConfig(),
+            storage=StorageConfig(
+                blob_store_path=storage_root / "blobs",
+                manifests_path=storage_root / "manifests",
+                import_allowed_root=storage_root / "import-staging",
+                state_db_path=storage_root / "state.sqlite",
+            ),
+            runtime=RuntimePathsConfig(
+                llama_server_binary=tmp_path / "fake_llama_server",
+                default_port_base=59700,
+            ),
+            ui=UIConfig(static_path=tmp_path / "ui_dist"),
+        )
+        runtime = RuntimeConfig(
+            queue=QueueConfig(grace_seconds=0, idle_hot_load_seconds=0),
+            pull=PullConfig(),
+        )
+        mgr = TurbohaulManager(boot, runtime)
+        # Submit a slot via submit_and_wait WITHOUT starting worker_loop.
+        # The slot sits in staging with an unresolved completion_future.
+        # Wrap in a task so we can await shutdown concurrently.
+        caller_task = asyncio.create_task(
+            mgr.submit_and_wait("anymodel", "hi")
+        )
+        # Give the submit_and_wait task time to register the future
+        await asyncio.sleep(0.05)
+        assert not caller_task.done(), (
+            "caller_task should be blocked on completion_future before shutdown"
+        )
+        # Shutdown should fail the pending future, not let the caller hang.
+        await mgr.shutdown()
+        # Caller now completes (with exception)
+        with pytest.raises((asyncio.CancelledError, RuntimeError)):
+            await asyncio.wait_for(caller_task, timeout=2.0)
+

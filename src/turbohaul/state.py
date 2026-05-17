@@ -67,13 +67,22 @@ def utcnow_iso() -> str:
 
 
 def open_state_db(state_db_path: Path) -> sqlite3.Connection:
-    """Open + initialize state.sqlite. Idempotent."""
+    """Open + initialize state.sqlite. Idempotent.
+
+    NEMO V2 4.1 fix: PRAGMA busy_timeout = 5000 so transient SQLITE_BUSY
+    on concurrent open_state_db calls retry-wait up to 5s instead of
+    failing the request with HTTP 500. GitNexus confirms 8 direct callers
+    (boot_reconcile + submit + _process_slot + _teardown + _force_cold +
+    _audit + _audit_event_only + state_db_session) so contention IS real
+    on burst traffic + concurrent audit writes.
+    """
     state_db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(state_db_path), isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")  # NEMO V2 4.1
     for stmt in _SCHEMA:
         conn.execute(stmt)
     cur = conn.execute(
