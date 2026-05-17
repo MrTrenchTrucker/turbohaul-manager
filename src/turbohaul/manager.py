@@ -854,14 +854,57 @@ class TurbohaulManager:
                         continue
                     matched.started_active_at = time.monotonic()
                     completed_ok = True
+                    # Round 8 fix: streaming-path warm-reuse. When a streaming submit lands on an
+                    # already-active matched slot, the HTTP route owns the upstream connection via
+                    # stream_handle. Worker MUST NOT call _complete_fn (would open a 2nd sidecar
+                    # connection and violate Failure Predictor #16's single-slot invariant). Hand
+                    # off via stream_ready_event and block on stream_done_event until route drains.
+                    # Prior bug: this branch unconditionally called _complete_fn → matched slot's
+                    # stream_ready_event was never set → route's SLOT_READY_TIMEOUT_S fired at 600s
+                    # every turn ≥ 2 of a Hermes multi-tool-call agent loop.
+                    matched_is_streaming = bool(
+                        isinstance(matched.client_meta, dict)
+                        and matched.client_meta.get("stream", False)
+                    )
                     try:
-                        result2 = await self._complete_fn(matched, handle)
-                        if (
-                            matched.completion_future is not None
-                            and not matched.completion_future.done()
-                        ):
-                            matched.completion_future.set_result(result2)
+                        if matched_is_streaming:
+                            assert (
+                                matched.stream_ready_event is not None
+                                and matched.stream_done_event is not None
+                            ), (
+                                f"streaming slot {matched.slot_id} missing events at ACTIVE_MATCH promotion"
+                            )
+                            matched.stream_handle = handle
+                            matched.stream_ready_event.set()
+                            try:
+                                await asyncio.wait_for(
+                                    matched.stream_done_event.wait(),
+                                    timeout=3600.0,
+                                )
+                            except asyncio.TimeoutError:
+                                log.warning(
+                                    "active_match streaming slot %s exceeded 3600s waiting for stream_done_event",
+                                    matched.slot_id,
+                                )
+                            if matched.completion_future is not None and not matched.completion_future.done():
+                                matched.completion_future.set_result({"_streamed": True})
+                        else:
+                            result2 = await self._complete_fn(matched, handle)
+                            if (
+                                matched.completion_future is not None
+                                and not matched.completion_future.done()
+                            ):
+                                matched.completion_future.set_result(result2)
                     except asyncio.CancelledError:
+                        # Round 8 MOD-5: cooperatively unwind route's blocking httpx call
+                        # by signaling stream_done before terminal-park (avoids zombie
+                        # route + dead slot drift).
+                        if (
+                            matched_is_streaming
+                            and matched.stream_done_event is not None
+                            and not matched.stream_done_event.is_set()
+                        ):
+                            matched.stream_done_event.set()
                         # AM-2 fix (HAUL DAG): cancellation mid-ACTIVE_MATCH
                         # must terminal-park the matched slot so it does not
                         # rot as a zombie ACTIVE row in state.sqlite, then
