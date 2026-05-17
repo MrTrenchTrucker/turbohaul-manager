@@ -207,6 +207,14 @@ _STREAM_FORWARDED_KNOBS = (
     "mirostat", "mirostat_lr", "mirostat_ent",
     # Wave 2.2: max-output alias
     "n_predict",
+    # Wave 4b-light: tool-call pass-through (minimal — full capability
+    # advertisement + size-cap + per-model gating deferred to Wave 4a/4b-proper
+    # per advisor's 5-hazard analysis; this is "forward the field to a model
+    # that supports tool_calls natively, e.g. Qwen3.6-27b-dense"). llama-server
+    # mirrors OpenAI's schema, so structured values (list/dict/string) just
+    # pass through unchanged.
+    "tools", "tool_choice", "parallel_tool_calls",
+    "function_call", "functions",
 )
 
 

@@ -333,6 +333,45 @@ class TestStreamPayloadBuilder:
         assert payload["reasoning_budget"] == 1000
         assert payload["thinking_budget_tokens"] == 500
 
+    def test_build_payload_forwards_tool_call_fields(self):
+        """Wave 4b-light: tools / tool_choice / parallel_tool_calls / function_call /
+        functions must be passed through to llama-server when present. Structured
+        values (list of tool defs, dict tool_choice, etc.) are forwarded as-is.
+        """
+        from turbohaul.api.chat_completion import _build_stream_payload
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+        tool_choice_obj = {"type": "function", "function": {"name": "get_weather"}}
+        payload = _build_stream_payload(
+            client_meta={
+                "tools": tools,
+                "tool_choice": tool_choice_obj,
+                "parallel_tool_calls": False,
+            },
+            model="qwen3.6-27b-dense",
+            messages=[{"role": "user", "content": "what's the weather?"}],
+        )
+        assert payload["tools"] == tools
+        assert payload["tool_choice"] == tool_choice_obj
+        assert payload["parallel_tool_calls"] is False
+        # Enum form of tool_choice also passes through.
+        payload2 = _build_stream_payload(
+            client_meta={"tool_choice": "auto"}, model="m", messages=[]
+        )
+        assert payload2["tool_choice"] == "auto"
+
 
 class TestStreamErrorFrame:
     """Synthetic OpenAI-compat error-frame helper."""
