@@ -1,3 +1,5 @@
+![Turbohaul-Manager — cyberpunk CONTAK rig hauling inference traffic](docs/banner.png)
+
 # Turbohaul-Manager
 
 Ollama-shape inference manager using [Tom's TurboQuant](https://github.com/TheTom/llama-cpp-turboquant) fork of llama.cpp.
