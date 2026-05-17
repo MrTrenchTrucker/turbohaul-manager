@@ -294,8 +294,22 @@ def make_llama_server_complete_fn(
             "messages": messages,
             "stream": False,  # streaming SSE is a follow-on polish wave
         }
-        # Pass-through tuning knobs if present
-        for k in ("temperature", "top_p", "top_k", "max_tokens", "min_p"):
+        # Pass-through tuning knobs if present.
+        # Wave 2.2: extended the forwarded list to include reasoning-budget knobs
+        # (Hermes-class clients control thinking depth per-request) + Ollama-parity
+        # sampling knobs (presence/frequency/seed/repeat_penalty + mirostat trio).
+        for k in (
+            # Core OpenAI-compat
+            "temperature", "top_p", "top_k", "max_tokens", "min_p",
+            # Wave 2.2: Hermes preserved-thinking controls
+            "thinking_budget_tokens", "reasoning_budget", "reasoning",
+            # Wave 2.2: Ollama-parity samplers (clients sending these get them honored)
+            "presence_penalty", "frequency_penalty", "repeat_penalty",
+            "repeat_last_n", "typical_p", "seed",
+            "mirostat", "mirostat_lr", "mirostat_ent",
+            # Wave 2.2: alias for max output budget (some clients send n_predict)
+            "n_predict",
+        ):
             v = client_meta.get(k)
             if v is not None:
                 payload[k] = v
