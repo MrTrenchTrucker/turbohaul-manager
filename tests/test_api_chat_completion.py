@@ -591,3 +591,102 @@ class TestSseHeartbeat:
             f"unexpected heartbeat in fast-path body: {body_bytes!r}"
         )
         assert b"[DONE]" in body_bytes
+
+
+# ============================================================================
+# Wave 4b.5 — keep_alive parser + client_meta plumbing (advisor MSG 23 Option E)
+# ============================================================================
+
+
+class TestParseKeepAlive:
+    """parse_keep_alive returns int|None per Ollama-style input.
+
+    Single-layer clamp: this helper normalises types only; clamping to
+    KEEP_ALIVE_MAX_S lives in TurbohaulManager (one source of truth).
+    """
+
+    def test_none_returns_none(self):
+        from turbohaul.api.chat_completion import parse_keep_alive
+        assert parse_keep_alive(None) is None
+
+    def test_int_passthrough(self):
+        from turbohaul.api.chat_completion import parse_keep_alive
+        assert parse_keep_alive(60) == 60
+        assert parse_keep_alive(0) == 0
+        assert parse_keep_alive(-1) == -1
+        assert parse_keep_alive(10000) == 10000  # caller clamps
+
+    def test_float_truncates_to_int(self):
+        from turbohaul.api.chat_completion import parse_keep_alive
+        assert parse_keep_alive(60.7) == 60
+        assert parse_keep_alive(-1.0) == -1
+
+    def test_string_int_forms(self):
+        from turbohaul.api.chat_completion import parse_keep_alive
+        assert parse_keep_alive("0") == 0
+        assert parse_keep_alive("-1") == -1
+        assert parse_keep_alive("60") == 60
+        assert parse_keep_alive(" 60 ") == 60  # strip
+        assert parse_keep_alive("") is None
+
+    def test_string_ollama_suffix_forms(self):
+        from turbohaul.api.chat_completion import parse_keep_alive
+        assert parse_keep_alive("30s") == 30
+        assert parse_keep_alive("5m") == 300
+        assert parse_keep_alive("2h") == 7200
+        # Case-insensitive
+        assert parse_keep_alive("5M") == 300
+
+    def test_string_invalid_returns_none(self):
+        from turbohaul.api.chat_completion import parse_keep_alive
+        assert parse_keep_alive("abc") is None
+        assert parse_keep_alive("1x") is None  # unknown unit
+        assert parse_keep_alive("m") is None  # no digit
+        # Day/week suffixes intentionally NOT supported (over-engineering
+        # per RBSRS Simplicity Advocate; Ollama itself documents s/m/h only).
+        assert parse_keep_alive("1d") is None
+
+    def test_bool_false_means_zero(self):
+        """Ollama keep_alive: false → unload immediately (matches `0`).
+
+        RBSRS Failure Predictor HIGH-3 catch — without this, real Ollama
+        clients sending {"keep_alive": false} would silently fall through
+        to default 300s instead of the immediate teardown they asked for.
+        """
+        from turbohaul.api.chat_completion import parse_keep_alive
+        assert parse_keep_alive(False) == 0
+
+    def test_bool_true_means_use_default(self):
+        """Ollama keep_alive: true → "on", let server pick default."""
+        from turbohaul.api.chat_completion import parse_keep_alive
+        assert parse_keep_alive(True) is None
+
+
+class TestKeepAliveClientMetaPlumbing:
+    """RBSRS Failure Predictor CRIT-2 regression: streaming path must propagate
+    keep_alive_s into client_meta (it's Turbohaul-internal, NOT forwarded to
+    llama-server). Hermes-class agents run streaming-only — this is THE fix.
+    """
+
+    def test_keep_alive_NOT_in_stream_payload(self):
+        """keep_alive_s is Turbohaul-internal — it must NOT leak to llama-server.
+
+        The streaming payload helper consumes _STREAM_FORWARDED_KNOBS, which
+        does NOT include keep_alive_s (or keep_alive). Verifying this prevents
+        accidental future regressions where someone adds it to the knob tuple.
+        """
+        from turbohaul.api.chat_completion import (
+            _STREAM_FORWARDED_KNOBS,
+            _build_stream_payload,
+        )
+        assert "keep_alive" not in _STREAM_FORWARDED_KNOBS
+        assert "keep_alive_s" not in _STREAM_FORWARDED_KNOBS
+        payload = _build_stream_payload(
+            client_meta={"keep_alive_s": 600, "temperature": 0.5},
+            model="m",
+            messages=[],
+        )
+        assert "keep_alive" not in payload
+        assert "keep_alive_s" not in payload
+        # Sanity: forwarded knobs still flow.
+        assert payload["temperature"] == 0.5

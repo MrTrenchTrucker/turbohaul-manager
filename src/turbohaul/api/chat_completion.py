@@ -29,9 +29,54 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from turbohaul.config import KEEP_ALIVE_MAX_S  # re-exported for tests + manager
+
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# === Wave 4b.5: Ollama-style keep_alive parser ==============================
+
+_KEEP_ALIVE_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_keep_alive(value: Any) -> int | None:
+    """Parse Ollama-style ``keep_alive`` field. Returns int seconds or None.
+
+    Semantics (matches Ollama upstream):
+      - ``None`` / unparseable → caller uses default ``idle_hot_load_seconds``
+      - ``0`` (int/float/str ``"0"``/bool ``False``) → unload immediately
+      - ``-1`` → pin (caller treats as :data:`KEEP_ALIVE_MAX_S`)
+      - positive int seconds → clamped to ``[0, KEEP_ALIVE_MAX_S]`` by caller
+      - Ollama-suffix strings ``"30s"``/``"5m"``/``"2h"`` → equivalent int seconds
+      - bool ``True`` → ``None`` (Ollama "on" means "use server default")
+
+    Single-layer clamp: this helper only normalises types; clamping to
+    ``KEEP_ALIVE_MAX_S`` lives in :class:`TurbohaulManager` so there's one
+    source of truth (RBSRS Simplicity Advocate MOD-3).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 0 if value is False else None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        if (
+            len(s) >= 2
+            and s[-1].lower() in _KEEP_ALIVE_UNITS
+            and s[:-1].lstrip("-").isdigit()
+        ):
+            return int(s[:-1]) * _KEEP_ALIVE_UNITS[s[-1].lower()]
+    return None
 
 
 # === Wave 3.1 SSE tuning constants (module-level for monkeypatch-in-tests) ===
@@ -140,6 +185,8 @@ async def openai_chat_completions(payload: dict, request: Request):
         "top_p": payload.get("top_p"),
         "stream": False,
         "max_tokens": payload.get("max_tokens"),
+        # Wave 4b.5: Ollama-style keep_alive → IDLE_HOT extension hint (advisor Option E)
+        "keep_alive_s": parse_keep_alive(payload.get("keep_alive")),
     }
 
     try:
@@ -278,6 +325,10 @@ async def _openai_chat_completions_stream(
         "temperature": payload.get("temperature"),
         "top_p": payload.get("top_p"),
         "max_tokens": payload.get("max_tokens"),
+        # Wave 4b.5: Ollama-style keep_alive → IDLE_HOT extension hint (advisor Option E).
+        # Streaming path is Hermes-class agents' primary entry; this fix is the
+        # whole point of the wave — RBSRS Failure Predictor CRIT-2 catch.
+        "keep_alive_s": parse_keep_alive(payload.get("keep_alive")),
         # All forwardable knobs carried for the streaming payload helper.
         **{k: payload.get(k) for k in _STREAM_FORWARDED_KNOBS if payload.get(k) is not None},
     }
@@ -451,12 +502,17 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="`model` + `messages` required")
     prompt = " ".join(m.get("content", "") for m in messages if isinstance(m, dict))
     thread_id = payload.get("thread_id") or ""
+    # Wave 4b.5: Ollama accepts keep_alive at top level OR nested under options.
+    ka_raw = payload.get("keep_alive")
+    if ka_raw is None and isinstance(payload.get("options"), dict):
+        ka_raw = payload["options"].get("keep_alive")
     client_meta = {
         "kind": "ollama-chat",
         "messages": messages,
         "model": model,
         "stream": bool(payload.get("stream", False)),
         "options": payload.get("options"),
+        "keep_alive_s": parse_keep_alive(ka_raw),
     }
     try:
         slot, result = await mgr.submit_and_wait(

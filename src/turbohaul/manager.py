@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from turbohaul.config import BootConfig, RuntimeConfig
+from turbohaul.config import KEEP_ALIVE_MAX_S, BootConfig, RuntimeConfig
 from turbohaul.fsm import LEGAL_TRANSITIONS, InvalidTransition, is_terminal, transition
 from turbohaul.manifest import flags_to_argv, read_manifest
 from turbohaul.queue import GraceTimer, IdleHotTimer, TurbohaulQueue
@@ -144,6 +144,15 @@ class TurbohaulManager:
         self._idle_handle: SidecarHandle | None = None
         self._idle_model_tag: str | None = None
         self._idle_expires_at: float | None = None
+        # Wave 4b.5: latest request's keep_alive intent across the ACTIVE_MATCH
+        # chain on a single warm slot. Reset per anchor (_process_slot entry);
+        # captured on ACTIVE for the anchor and on each ACTIVE_MATCH promotion
+        # of a matched follow-up; consumed (cleared) at grace→idle entry. The
+        # "latest request wins" rule mirrors Ollama keep_alive semantics
+        # (timer resets on request receipt, not on response completion).
+        # Without this, stale keep_alive from request N leaks into IDLE_HOT
+        # window computed after request N+M — RBSRS Failure Predictor CRIT-1.
+        self._latest_keep_alive_s: int | None = None
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         # GRIP M-2 fix: removed unused self._lock = asyncio.Lock(). It had
@@ -532,6 +541,11 @@ class TurbohaulManager:
     async def _process_slot(self, slot: Slot) -> None:
         """Drive one slot through STAGED → LOADING → ACTIVE → GRACE → POPPED."""
         self._active_slot = slot
+        # Wave 4b.5: clear cross-slot keep_alive leakage. A previous slot's
+        # ACTIVE_MATCH chain may have left a value here even though that
+        # slot's grace→idle consumed it; defensive reset keeps the invariant
+        # "value reflects this anchor cycle only" honest.
+        self._latest_keep_alive_s = None
 
         try:
             # Build llama-server argv from manifest if available; tolerate missing
@@ -732,6 +746,8 @@ class TurbohaulManager:
             transition(slot, SlotState.ACTIVE)
             slot.started_active_at = time.monotonic()
             self._audit(slot, "active")
+            # Wave 4b.5: capture anchor's keep_alive intent for grace→idle decision.
+            self._latest_keep_alive_s = (slot.client_meta or {}).get("keep_alive_s")
 
             # Wave 3 (Cmdr 2026-05-17 16:48Z): branch on streaming mode.
             #
@@ -818,6 +834,12 @@ class TurbohaulManager:
                         transition(matched, SlotState.ACTIVE_MATCH)
                         self._audit(matched, "active_match_promoted")
                         transition(matched, SlotState.ACTIVE)
+                        # Wave 4b.5: each matched-follow-up's keep_alive overrides
+                        # the anchor's for the next grace→idle calculation. Mirrors
+                        # Ollama "timer resets on request receipt" rule.
+                        self._latest_keep_alive_s = (
+                            matched.client_meta or {}
+                        ).get("keep_alive_s")
                     except InvalidTransition as drift_err:
                         log.warning(
                             "active_match state drift: slot %s in %s — terminal-park; %s",
@@ -921,7 +943,33 @@ class TurbohaulManager:
             # When idle_seconds == 0 (test default), this is equivalent to
             # immediate teardown -- preserves "grace-expired" reason on the
             # mark_slot_ended audit (backward-compat with existing tests).
-            idle_seconds = self.runtime.queue.idle_hot_load_seconds
+            #
+            # Wave 4b.5 (advisor MSG 23 Option E + Cmdr "fully automatic" 20:25Z):
+            # honor the latest request's keep_alive intent as IDLE_HOT extension.
+            # `_latest_keep_alive_s` was set on the anchor's ACTIVE and refreshed
+            # on each ACTIVE_MATCH promotion — so it reflects the most recent
+            # request that touched the warm slot (Ollama timer-resets-on-receipt
+            # semantics). After consumption it's cleared so a stale value can't
+            # leak into the next anchor cycle.
+            keep_alive_s = self._latest_keep_alive_s
+            default_idle = self.runtime.queue.idle_hot_load_seconds
+            if keep_alive_s is None:
+                idle_seconds = default_idle
+            elif keep_alive_s < 0:
+                # Ollama -1 = "pin until VRAM pressure"; we cap at KEEP_ALIVE_MAX_S
+                # (advisor spec — never indefinite on single-GPU).
+                idle_seconds = KEEP_ALIVE_MAX_S
+            else:
+                # 0 falls through this expression cleanly → idle disabled.
+                idle_seconds = min(keep_alive_s, KEEP_ALIVE_MAX_S)
+            ka_clamped = (
+                keep_alive_s is not None
+                and keep_alive_s >= 0
+                and keep_alive_s > KEEP_ALIVE_MAX_S
+            )
+            # Consumed — clear before any further decisions so the next anchor
+            # starts cleanly (defense-in-depth on top of _process_slot reset).
+            self._latest_keep_alive_s = None
             if idle_seconds > 0 and self._active_handle is not None:
                 # Hand off the active handle to the manager-level idle holder.
                 self._idle_handle = self._active_handle
@@ -933,6 +981,10 @@ class TurbohaulManager:
                     {
                         "model_tag": slot.model_tag,
                         "idle_seconds": idle_seconds,
+                        # Wave 4b.5 audit (advisor HIGH-5): visibility into when
+                        # client keep_alive overrode the default + when the cap fired.
+                        "keep_alive_requested": keep_alive_s,
+                        "keep_alive_clamped": ka_clamped,
                     },
                 )
                 # Mark the slot ended at the state.sqlite layer -- the slot

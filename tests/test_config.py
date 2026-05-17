@@ -4,6 +4,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from turbohaul.config import (
+    KEEP_ALIVE_MAX_S,
     BootConfig,
     PullConfig,
     QueueConfig,
@@ -49,10 +50,18 @@ class TestQueueConfig:
     def test_v0_2_conservative_defaults(self):
         q = QueueConfig()
         assert q.grace_seconds == 30
-        assert q.idle_hot_load_seconds == 120
+        # Wave 4b.5: bumped 120 → 300 default (advisor MSG 23 Option E).
+        # Covers OpenAI-SDK clients that can't send keep_alive natively
+        # (Ollama Issue #11458) and need a longer warm window for tool loops.
+        assert q.idle_hot_load_seconds == 300
         assert q.max_grace_extensions == 5
         assert q.drained_sigterm_window_active_s == 15
         assert q.drained_sigterm_window_cold_s == 5
+
+    def test_wave_4b5_keep_alive_max_constant(self):
+        # Wave 4b.5: module-level constant (not a Field — operational policy
+        # per RBSRS Simplicity Advocate verdict, not per-deployment knob).
+        assert KEEP_ALIVE_MAX_S == 1800
 
     def test_reject_unknown_field(self):
         with pytest.raises(ValidationError):

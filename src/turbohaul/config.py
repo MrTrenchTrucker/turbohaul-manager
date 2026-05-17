@@ -13,6 +13,12 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+# Wave 4b.5: maximum honored client `keep_alive` value (advisor MSG 23 cap).
+# Module constant, not a QueueConfig field — operational policy, not per-deployment
+# knob (RBSRS Simplicity Advocate verdict). Bump here if hardware fleet shifts.
+KEEP_ALIVE_MAX_S = 1800
+
+
 class ServerConfig(BaseModel):
     """Boot-only: server bind config."""
 
@@ -72,7 +78,11 @@ class QueueConfig(BaseModel):
     staging_queue_depth: int = Field(default=100, ge=1, le=10000)
     acceptance_buffer_max: int = Field(default=10000, ge=1)
     grace_seconds: int = Field(default=30, ge=0, le=3600)
-    idle_hot_load_seconds: int = Field(default=120, ge=0, le=86400)
+    # Wave 4b.5 (advisor MSG 23 Option E): default bumped 120 → 300 so multi-turn
+    # agents (Hermes / OpenAI-SDK class) with PC-side tool-exec / reflection gaps
+    # in the 2-5min range keep their slot warm without needing to send keep_alive.
+    # OpenAI-SDK clients can't send keep_alive natively (Ollama Issue #11458).
+    idle_hot_load_seconds: int = Field(default=300, ge=0, le=86400)
     # Cmdr #15653 safety guardrails -- mirror Ollama pre-spawn safety posture
     safety_enabled: bool = True
     safety_min_free_ram_mib: int = Field(default=1024, ge=0)
