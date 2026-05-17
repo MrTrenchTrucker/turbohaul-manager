@@ -48,6 +48,17 @@ class Slot:
     # await the slot's completion response. worker_loop sets the result after
     # completion_fn returns.
     completion_future: Any = None
+    # Wave 3 SSE streaming pass-through (Cmdr 2026-05-17 16:48Z directive):
+    # When client sends stream:true, the route uses submit_for_streaming() instead
+    # of submit_and_wait(). The slot stays ACTIVE for the full stream lifetime —
+    # worker_loop sets stream_ready_event after llama-server health-200 (handle
+    # stored on stream_handle), the route opens its own httpx.stream() to the
+    # sidecar, yields SSE chunks, and signals stream_done_event when the gen
+    # exhausts (or on client disconnect / error). Only then does worker_loop
+    # advance ACTIVE → GRACE.
+    stream_ready_event: Any = None  # asyncio.Event, set by worker_loop on ACTIVE
+    stream_done_event: Any = None   # asyncio.Event, set by route on stream close
+    stream_handle: Any = None       # SidecarHandle assigned when ACTIVE
 
     @classmethod
     def new(

@@ -191,6 +191,53 @@ class TurbohaulManager:
             raise
         return slot, result
 
+    async def submit_for_streaming(
+        self,
+        model_tag: str,
+        prompt: str = "",
+        thread_id: str = "",
+        context: list[dict] | None = None,
+        client_meta: dict | None = None,
+    ) -> Slot:
+        """Wave 3 SSE streaming pass-through (Cmdr 2026-05-17 16:48Z).
+
+        Submit a request that will be consumed by an SSE-streaming route. Unlike
+        submit_and_wait, this returns the slot immediately (without awaiting
+        the completion_future). The slot has two pre-armed asyncio.Events:
+
+          - ``slot.stream_ready_event``: worker_loop sets this once the slot
+            reaches ACTIVE and the SidecarHandle is stored on
+            ``slot.stream_handle``. The route awaits this before opening its
+            own httpx.stream() to the sidecar's port.
+          - ``slot.stream_done_event``: the route sets this when the stream
+            closes (normal exhaustion, client disconnect, or error). Only then
+            does worker_loop advance the slot ACTIVE → GRACE.
+
+        client_meta MUST include ``"stream": True`` for worker_loop to
+        recognise the streaming path. Existing non-streaming callers are
+        unaffected.
+
+        Per Failure Predictor (#16) verdict on this design: keeping the slot
+        ACTIVE for the full stream lifetime prevents ACTIVE_MATCH from
+        promoting a second submission against the same sidecar (single-slot
+        invariant preserved).
+        """
+        slot = await self.submit(
+            model_tag=model_tag,
+            prompt=prompt,
+            thread_id=thread_id,
+            context=context,
+            client_meta=client_meta,
+            wait_for_completion=True,  # still attach future so error paths surface
+        )
+        # Pre-arm the streaming coordination events. worker_loop will check for
+        # client_meta["stream"] == True and use these instead of calling
+        # self._complete_fn.
+        slot.stream_ready_event = asyncio.Event()
+        slot.stream_done_event = asyncio.Event()
+        slot.stream_handle = None
+        return slot
+
     # === Error propagation on worker exceptions ==============================
 
     def _fail_completion_future(self, slot: Slot, exc: BaseException) -> None:
@@ -686,10 +733,60 @@ class TurbohaulManager:
             slot.started_active_at = time.monotonic()
             self._audit(slot, "active")
 
-            # Completion (Phase 3 wires httpx forward; Phase 2 default is noop)
-            result = await self._complete_fn(slot, handle)
-            if slot.completion_future is not None and not slot.completion_future.done():
-                slot.completion_future.set_result(result)
+            # Wave 3 (Cmdr 2026-05-17 16:48Z): branch on streaming mode.
+            #
+            # Non-streaming (existing): await self._complete_fn(slot, handle) to
+            # post chat-completion, set completion_future, advance to GRACE.
+            #
+            # Streaming: client_meta["stream"] is True AND submit_for_streaming()
+            # pre-armed slot.stream_ready_event + slot.stream_done_event. We
+            # SKIP _complete_fn (the route owns the httpx streaming connection).
+            # Instead: hand the SidecarHandle to the route via slot.stream_handle,
+            # signal stream_ready_event so the route can open its httpx.stream(),
+            # then BLOCK here on stream_done_event until the route reports the
+            # stream has finished (normal close, client disconnect, or error).
+            # Slot stays in ACTIVE the entire time so ACTIVE_MATCH cannot promote
+            # a second submission against the same sidecar (Failure Predictor #16
+            # critical catch — single-slot invariant preserved).
+            is_streaming = (
+                isinstance(slot.client_meta, dict)
+                and bool(slot.client_meta.get("stream", False))
+                and slot.stream_ready_event is not None
+                and slot.stream_done_event is not None
+            )
+            if is_streaming:
+                # Hand the sidecar handle to the route, signal ready.
+                slot.stream_handle = handle
+                slot.stream_ready_event.set()
+                # Wait for the route to finish streaming. Stream timeout is
+                # bounded — same default as non-streaming complete_fn — but
+                # very long in practice (1h+ for slow-thinking models on big
+                # context). If the route never signals, worker_loop unblocks
+                # via timeout and proceeds to GRACE (slot already drained).
+                try:
+                    await asyncio.wait_for(
+                        slot.stream_done_event.wait(),
+                        timeout=3600.0,  # 1 hour cap; routes typically signal in seconds
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "streaming slot %s exceeded 3600s waiting for stream_done_event; "
+                        "advancing to GRACE anyway",
+                        slot.slot_id,
+                    )
+                # Resolve the completion_future so any caller awaiting the
+                # slot (e.g. tests or programmatic await) is unblocked.
+                if (
+                    slot.completion_future is not None
+                    and not slot.completion_future.done()
+                ):
+                    slot.completion_future.set_result({"_streamed": True})
+            else:
+                # Non-streaming path (existing behaviour, unchanged).
+                # Completion (Phase 3 wires httpx forward; Phase 2 default is noop)
+                result = await self._complete_fn(slot, handle)
+                if slot.completion_future is not None and not slot.completion_future.done():
+                    slot.completion_future.set_result(result)
 
             # ACTIVE → GRACE
             transition(slot, SlotState.GRACE)

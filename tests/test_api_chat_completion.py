@@ -287,3 +287,170 @@ class TestOllamaChat:
         assert body["model"] == "test-model"
         assert body["done"] is True
         assert body["message"]["content"] == "echo: hello"
+
+
+# ============================================================================
+# Wave 3 — SSE streaming pass-through tests (Cmdr 2026-05-17 16:48Z directive)
+# ============================================================================
+
+
+class TestStreamPayloadBuilder:
+    """Pure unit tests for _build_stream_payload + _stream_error_frame."""
+
+    def test_build_payload_includes_stream_true(self):
+        from turbohaul.api.chat_completion import _build_stream_payload
+        payload = _build_stream_payload(
+            client_meta={"max_tokens": 100, "temperature": 0.7},
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert payload["stream"] is True
+        assert payload["model"] == "test"
+        assert payload["messages"] == [{"role": "user", "content": "hi"}]
+        assert payload["max_tokens"] == 100
+        assert payload["temperature"] == 0.7
+
+    def test_build_payload_omits_unset_knobs(self):
+        from turbohaul.api.chat_completion import _build_stream_payload
+        payload = _build_stream_payload(
+            client_meta={"temperature": 0.5},
+            model="m",
+            messages=[],
+        )
+        # Only explicitly-set knobs should appear
+        assert "temperature" in payload
+        assert "max_tokens" not in payload
+        assert "top_p" not in payload
+        assert "reasoning_budget" not in payload
+
+    def test_build_payload_forwards_reasoning_budget(self):
+        from turbohaul.api.chat_completion import _build_stream_payload
+        payload = _build_stream_payload(
+            client_meta={"reasoning_budget": 1000, "thinking_budget_tokens": 500},
+            model="m",
+            messages=[],
+        )
+        assert payload["reasoning_budget"] == 1000
+        assert payload["thinking_budget_tokens"] == 500
+
+
+class TestStreamErrorFrame:
+    """Synthetic OpenAI-compat error-frame helper."""
+
+    def test_error_frame_shape(self):
+        import json as _json
+        from turbohaul.api.chat_completion import _stream_error_frame
+        b = _stream_error_frame("test_error", "test message")
+        assert b.startswith(b"data: ")
+        assert b.endswith(b"\n\n")
+        parsed = _json.loads(b[6:-2].decode())
+        assert parsed["error"]["type"] == "test_error"
+        assert parsed["error"]["message"] == "test message"
+
+    def test_error_frame_extras_included(self):
+        import json as _json
+        from turbohaul.api.chat_completion import _stream_error_frame
+        b = _stream_error_frame("upstream_sidecar_error", "boom", upstream_status=503)
+        parsed = _json.loads(b[6:-2].decode())
+        assert parsed["error"]["upstream_status"] == 503
+        assert parsed["error"]["type"] == "upstream_sidecar_error"
+
+
+@pytest.mark.asyncio
+async def test_submit_for_streaming_returns_slot_with_armed_events(app_completion_autostart):
+    """manager.submit_for_streaming pre-arms the streaming coordination events."""
+    app, _client = app_completion_autostart
+    mgr = app.state.manager
+
+    slot = await mgr.submit_for_streaming(
+        model_tag="test-model",
+        prompt="hi",
+        thread_id="thr-stream-events-1",
+        client_meta={
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+            "model": "test-model",
+        },
+    )
+
+    assert slot.stream_ready_event is not None
+    assert isinstance(slot.stream_ready_event, asyncio.Event)
+    assert slot.stream_done_event is not None
+    assert isinstance(slot.stream_done_event, asyncio.Event)
+    assert slot.stream_handle is None  # set later when worker reaches ACTIVE
+    assert slot.client_meta.get("stream") is True
+    assert slot.completion_future is not None
+
+
+class TestOpenaiStreaming:
+    """End-to-end SSE route tests via FastAPI TestClient."""
+
+    def test_stream_returns_text_event_stream_content_type(self, app_completion_autostart):
+        """stream:true → text/event-stream response with SSE headers.
+
+        The route attempts to httpx.stream to the (fake) sidecar port, fails
+        with ConnectError, and emits a synthetic SSE error frame + [DONE].
+        We don't need a real sidecar — we just verify the route shape:
+        response = 200 OK, content-type = text/event-stream, headers set,
+        body contains error frame + [DONE] markers.
+        """
+        app, client = app_completion_autostart
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "say hi"}],
+                "stream": True,
+            },
+        ) as r:
+            assert r.status_code == 200
+            ct = r.headers.get("content-type", "")
+            assert "text/event-stream" in ct, f"unexpected content-type: {ct}"
+            assert r.headers.get("cache-control") == "no-cache"
+            assert r.headers.get("x-accel-buffering") == "no"
+
+            body_bytes = b""
+            for chunk in r.iter_bytes():
+                body_bytes += chunk
+
+            # Even with a dead upstream, we should see synthetic error frame + [DONE]
+            assert b"data: " in body_bytes, f"no SSE data: prefix in body: {body_bytes!r}"
+            assert b"[DONE]" in body_bytes, f"no [DONE] terminator in body: {body_bytes!r}"
+            # The error frame should mention sidecar / upstream
+            assert b'"error"' in body_bytes, f"no error key in body: {body_bytes!r}"
+
+    def test_stream_400_missing_model(self, app_completion_autostart):
+        """Validation errors still surface as HTTP 400 (pre-stream)."""
+        app, client = app_completion_autostart
+        r = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert r.status_code == 400
+
+    def test_stream_400_missing_messages(self, app_completion_autostart):
+        """Validation errors still surface as HTTP 400 (pre-stream)."""
+        app, client = app_completion_autostart
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "m", "stream": True},
+        )
+        assert r.status_code == 400
+
+    def test_non_stream_path_unchanged(self, app_completion_autostart):
+        """Regression: stream:false (default) still routes through complete_fn."""
+        app, client = app_completion_autostart
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                # stream omitted = False
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["choices"][0]["message"]["content"] == "echo: hello"
+        # Non-stream response is JSON, not SSE
+        assert "text/event-stream" not in r.headers.get("content-type", "")
