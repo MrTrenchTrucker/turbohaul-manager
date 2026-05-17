@@ -45,3 +45,7 @@ Compatible with Ollama-shape clients:
 ## License
 
 MIT (see LICENSE). All third-party deps audited MIT-compatible (see THIRD_PARTY_NOTICES.md).
+
+## Contributors
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md). MrTrench (founder) shipped v0.2.1.
