@@ -4,7 +4,7 @@
 
 Ollama-shape inference manager using [Tom's TurboQuant](https://github.com/TheTom/llama-cpp-turboquant) fork of llama.cpp.
 
-FIFO queue + grace + IDLE_HOT hot-hold + model swap on RTX PRO 4000 Blackwell.
+FIFO queue + grace + IDLE_HOT hot-hold + model swap on Nvidia RTX GPU's including Blackwell.
 
 ## What it does
 
