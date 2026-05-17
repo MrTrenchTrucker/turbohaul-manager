@@ -5,6 +5,7 @@ import type {
   IdleHotInfo,
   LoadingInfo,
   QueueInfo,
+  StatusSnapshot,
 } from '../api';
 import { useStatus } from '../hooks/useStatus';
 
@@ -44,7 +45,7 @@ function ActiveCard({ active }: { active: ActiveInfo | null }) {
   if (!active) {
     return (
       <Card title="Active sidecar" tone="idle">
-        <div className="text-slate-500 text-sm italic">— no active model —</div>
+        <div className="text-slate-500 text-sm italic">— no in-flight request —</div>
       </Card>
     );
   }
@@ -139,6 +140,52 @@ function LoadingCard({ loading }: { loading: LoadingInfo | null }) {
   );
 }
 
+function LoadedBanner({ data }: { data: StatusSnapshot }) {
+  // Single at-a-glance line for "what's currently in VRAM". The cards
+  // below give per-lifecycle detail; this banner avoids the user reading
+  // empty Active/Loading cards as "no model loaded" during GRACE/IDLE_HOT.
+  const tag =
+    data.active?.model_tag ??
+    data.loading?.model_tag ??
+    data.grace?.model_tag ??
+    data.idle_hot?.model_tag ??
+    null;
+
+  if (!tag) {
+    return (
+      <div className="rounded-lg border border-slate-800 bg-slate-950 px-4 py-3 text-sm text-slate-500">
+        <span className="text-xs uppercase tracking-wide text-slate-600 mr-2">Loaded model</span>
+        <span className="italic">— none —</span>
+      </div>
+    );
+  }
+
+  let stateLabel = '';
+  let tone = 'border-emerald-700';
+  if (data.active) {
+    stateLabel = data.active.state;
+  } else if (data.loading) {
+    stateLabel = `${data.loading.state} · ${data.loading.elapsed_s.toFixed(1)}s`;
+    tone = 'border-amber-600';
+  } else if (data.grace) {
+    stateLabel = `GRACE · ${data.grace.remaining_s}s remaining`;
+    tone = 'border-amber-700';
+  } else if (data.idle_hot) {
+    stateLabel = `IDLE_HOT · ${data.idle_hot.remaining_s}s remaining`;
+    tone = 'border-emerald-700';
+  }
+
+  return (
+    <div className={`rounded-lg border-2 ${tone} bg-slate-950 px-4 py-3`}>
+      <div className="text-xs uppercase tracking-wide text-slate-500">Loaded model</div>
+      <div className="flex items-baseline gap-4 mt-1 flex-wrap">
+        <span className="text-2xl font-bold text-emerald-300 font-mono">{tag}</span>
+        <span className="text-sm font-mono text-slate-300">{stateLabel}</span>
+      </div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const { data, error, lastUpdate } = useStatus();
 
@@ -156,6 +203,7 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-4">
+      <LoadedBanner data={data} />
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
         <ActiveCard active={data.active} />
         <LoadingCard loading={data.loading} />
