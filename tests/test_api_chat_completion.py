@@ -454,3 +454,101 @@ class TestOpenaiStreaming:
         assert body["choices"][0]["message"]["content"] == "echo: hello"
         # Non-stream response is JSON, not SSE
         assert "text/event-stream" not in r.headers.get("content-type", "")
+
+
+# ============================================================================
+# Wave 3.1 — SSE heartbeat tests (correctness gap: long cold-load disconnect)
+# ============================================================================
+
+
+class TestSseHeartbeat:
+    """Wave 3.1: while slot.stream_ready_event hasn't fired, the route must
+    emit `: keep-alive\\n\\n` SSE comments so clients with 30-60s read-timeouts
+    don't disconnect during cold-load.
+    """
+
+    def test_heartbeat_constants_at_module_level(self):
+        """Constants must be patchable from tests (module-level not local)."""
+        from turbohaul.api import chat_completion as cc
+        assert hasattr(cc, "HEARTBEAT_INTERVAL_S")
+        assert hasattr(cc, "SLOT_READY_TIMEOUT_S")
+        assert hasattr(cc, "STREAM_TIMEOUT_S")
+        assert cc.HEARTBEAT_INTERVAL_S > 0
+        assert cc.HEARTBEAT_INTERVAL_S < cc.SLOT_READY_TIMEOUT_S
+
+    def test_heartbeat_emitted_during_slow_cold_load(
+        self, app_completion_autostart, monkeypatch
+    ):
+        """When _wait_healthy takes longer than HEARTBEAT_INTERVAL_S, the SSE
+        body should contain at least one `: keep-alive\\n\\n` comment before
+        the upstream-error frame fires (the fake sidecar port has no listener,
+        so the route emits an error frame once stream_ready_event fires).
+        """
+        from turbohaul.api import chat_completion as cc
+        app, client = app_completion_autostart
+
+        # Shrink heartbeat cadence so the test is fast (4 heartbeats in 0.4s).
+        monkeypatch.setattr(cc, "HEARTBEAT_INTERVAL_S", 0.05)
+
+        # Replace _wait_healthy with a version that sleeps 0.4s (8× heartbeat)
+        # so the slot stays in LOADING long enough to fire multiple heartbeats.
+        async def slow_health(*args, **kwargs):
+            await asyncio.sleep(0.4)
+            return True
+
+        mgr = app.state.manager
+        mgr._wait_healthy = slow_health
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            assert r.status_code == 200
+            ct = r.headers.get("content-type", "")
+            assert "text/event-stream" in ct, f"unexpected content-type: {ct}"
+            body_bytes = b""
+            for chunk in r.iter_bytes():
+                body_bytes += chunk
+
+        # CORE ASSERTION: heartbeat comment present in body
+        assert b": keep-alive\n\n" in body_bytes, (
+            f"no heartbeat comment in SSE body: {body_bytes!r}"
+        )
+        # Stream still terminates with [DONE] after the error frame
+        assert b"[DONE]" in body_bytes
+
+    def test_no_heartbeat_when_ready_event_fires_immediately(
+        self, app_completion_autostart
+    ):
+        """Regression: when the slot reaches ACTIVE within HEARTBEAT_INTERVAL_S
+        (the normal warm/IDLE_HOT case), no heartbeat comments are emitted —
+        body goes straight to upstream error/data + [DONE].
+
+        With the default HEARTBEAT_INTERVAL_S=12s and the autostart fixture's
+        instant _wait_healthy, the slot fires stream_ready_event well before
+        any heartbeat tick. We just assert no `: keep-alive\\n\\n` appears.
+        """
+        app, client = app_completion_autostart
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            assert r.status_code == 200
+            body_bytes = b""
+            for chunk in r.iter_bytes():
+                body_bytes += chunk
+
+        assert b": keep-alive\n\n" not in body_bytes, (
+            f"unexpected heartbeat in fast-path body: {body_bytes!r}"
+        )
+        assert b"[DONE]" in body_bytes

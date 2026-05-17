@@ -34,6 +34,24 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
+# === Wave 3.1 SSE tuning constants (module-level for monkeypatch-in-tests) ===
+
+# How long to wait for the slot to actually reach ACTIVE before we give up.
+# Cold-load of a 27B GGUF can take 30-60s; pre-stream wait should be much
+# longer than that since the route is held open.
+SLOT_READY_TIMEOUT_S = 600.0
+# httpx.stream timeout for the actual sidecar connection — keep generous for
+# slow-thinking models on large contexts.
+STREAM_TIMEOUT_S = 3600.0
+# Wave 3.1: emit `: keep-alive\n\n` SSE comments at this cadence while waiting
+# for `slot.stream_ready_event` to fire. Many clients set 30-60s read-timeouts
+# on streaming responses; without intermittent bytes the client disconnects
+# during cold-load (a 27B GGUF takes 30-60s to load). SSE comments are RFC
+# 8895 / EventSource-compliant; clients silently consume them and the
+# connection stays warm.
+HEARTBEAT_INTERVAL_S = 12.0
+
+
 # === Wave 1.5-D typed upstream errors ===
 
 class SidecarUnavailableError(RuntimeError):
@@ -289,29 +307,34 @@ async def _openai_chat_completions_stream(
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=f"sidecar failed: {e}") from e
 
-    # How long to wait for the slot to actually reach ACTIVE before we give up.
-    # Cold-load of a 27B GGUF can take 30-60s; pre-stream wait should be much
-    # longer than that since the route is held open.
-    SLOT_READY_TIMEOUT_S = 600.0
-    # httpx.stream timeout for the actual sidecar connection — keep generous
-    # for slow-thinking models on large contexts.
-    STREAM_TIMEOUT_S = 3600.0
-
     async def stream_gen():
         try:
             # Wait for worker_loop to bring slot to ACTIVE + assign handle.
-            try:
-                await asyncio.wait_for(
-                    slot.stream_ready_event.wait(),
-                    timeout=SLOT_READY_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                yield _stream_error_frame(
-                    "slot_ready_timeout",
-                    f"Slot did not reach ACTIVE within {SLOT_READY_TIMEOUT_S}s",
-                )
-                yield b"data: [DONE]\n\n"
-                return
+            # Wave 3.1: emit `: keep-alive\n\n` SSE comments every
+            # HEARTBEAT_INTERVAL_S so clients with 30-60s read-timeouts don't
+            # disconnect during cold-load. asyncio.shield prevents the
+            # heartbeat wait_for from cancelling the underlying ready_task.
+            ready_task = asyncio.create_task(slot.stream_ready_event.wait())
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + SLOT_READY_TIMEOUT_S
+            while not ready_task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    ready_task.cancel()
+                    yield _stream_error_frame(
+                        "slot_ready_timeout",
+                        f"Slot did not reach ACTIVE within {SLOT_READY_TIMEOUT_S}s",
+                    )
+                    yield b"data: [DONE]\n\n"
+                    return
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(ready_task),
+                        timeout=min(HEARTBEAT_INTERVAL_S, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    if not ready_task.done():
+                        yield b": keep-alive\n\n"
 
             handle = slot.stream_handle
             if handle is None:
