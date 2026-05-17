@@ -3,6 +3,18 @@
 Per v0.2 ARCHITECTURE.md §8 + §8.1 + §8.2.
 Addresses Security #58 F1 (CRIT - flag injection RCE), F2 (CRIT - tag path traversal),
 Brainstormer F4 (lost-update), Failure Predictor M4 (atomic-write).
+
+Wave 2 DAG synthesis 2026-05-17 (RBSRS specialists #4 + #58 + #13):
+- SAFE_LLAMA_FLAGS expanded from 30 → ~80 (Ollama parity + Hermes reasoning_budget
+  + Tom's Fork fit-target + RoPE/YaRN + sampling completeness + server toggles
+  + KV cache controls + debug knobs).
+- DENIED_FLAGS expanded +22 (Tom's Fork path-bearing/RCE: model_url, hf_repo*,
+  api_key_file, ssl_*, path, media_path, tools, control_vector*, lookup_cache_*).
+- Suffix-pattern forward-defense guard rejects future Tom's Fork pulls.
+- Numeric bounds via SAFE_LLAMA_FLAG_BOUNDS prevent DoS-by-extreme.
+- flash_attn type fixed: int → bool|str-enum (on/off/auto).
+- chat_template hardened: must match built-in enum OR be plain non-Jinja string
+  (closes F3 SSTI gap per Security Reviewer).
 """
 import contextlib
 import os
@@ -16,51 +28,273 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # === Closed allowlist of safe llama-server flags (v0.2 §8.1, Security F1) ===
-# Each entry is (key, expected_python_type). To add a new flag here requires a code
-# change + review; yaml cannot smuggle it in. This is the explicit gate.
-SAFE_LLAMA_FLAGS: dict[str, type] = {
-    # Performance + memory layout
+# Each entry is (key, expected_python_type | tuple of types). To add a new
+# flag here requires a code change + review; yaml cannot smuggle it in.
+# Special-cased types: "flash_attn" accepts bool OR str-enum (handled below).
+SAFE_LLAMA_FLAGS: dict[str, Any] = {
+    # === Performance + memory layout ===
     "ctx_size": int,
-    "n_gpu_layers": int,
-    "cache_type_k": str,
-    "cache_type_v": str,
-    "flash_attn": int,
+    "n_gpu_layers": (int, str),  # accept "all" / "auto"
     "threads": int,
+    "threads_batch": int,
+    "threads_http": int,
     "parallel": int,
-    "mlock": bool,
-    "no_context_shift": bool,
-    "cache_reuse": int,
-    "slot_prompt_similarity": float,
-    "no_perf": bool,
-    "sleep_idle_seconds": int,
     "batch_size": int,
     "ubatch_size": int,
     "n_predict": int,
-    # Sampling
+    "keep": int,
+    "flash_attn": (bool, str),  # tri-state on/off/auto (post llama.cpp PR ~17000)
+    "mlock": bool,
+    "no_mmap": bool,
+    "numa": str,  # enum: none/distribute/isolate/numactl
+    "swa_full": bool,
+    "no_perf": bool,
+    "sleep_idle_seconds": int,
+    "cache_reuse": int,
+    "no_context_shift": bool,
+    "slot_prompt_similarity": float,
+    "warmup": bool,
+    "check_tensors": bool,
+    "repack": bool,
+    "op_offload": bool,
+    "no_host": bool,
+    "direct_io": bool,
+    "cont_batching": bool,
+    # === KV-cache ===
+    "cache_type_k": str,  # enum: f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1
+    "cache_type_v": str,
+    "kv_offload": bool,
+    "kv_unified": bool,
+    "cache_idle_slots": bool,
+    "cache_prompt": bool,
+    "cache_ram": int,
+    "ctx_checkpoints": int,
+    "checkpoint_every_n_tokens": int,
+    # === Context / RoPE / YaRN ===
+    "rope_scaling": str,  # enum: none/linear/yarn
+    "rope_scale": float,
+    "rope_freq_base": float,
+    "rope_freq_scale": float,
+    "yarn_orig_ctx": int,
+    "yarn_ext_factor": float,
+    "yarn_attn_factor": float,
+    "yarn_beta_slow": float,
+    "yarn_beta_fast": float,
+    # === MoE / multi-GPU ===
+    "cpu_moe": bool,            # -cmoe (all MoE on CPU)
+    "n_cpu_moe": int,           # -ncmoe N (count of MoE layers on CPU)
+    "split_mode": str,          # enum: none/layer/row/tensor
+    "main_gpu": int,
+    # NOTE: tensor_split intentionally NOT added — CSV-string with shell-meta risk;
+    # defer until validator can parse "N,N,N" safely (Wave 3 work).
+    "fit": str,                 # enum on/off (Tom's Fork auto-mem-fit)
+    "fit_ctx": int,
+    # NOTE: fit_target also CSV-string; defer.
+    # === Sampling — full set ===
     "temp": float,
     "top_k": int,
     "top_p": float,
     "min_p": float,
+    "typical_p": float,         # Ollama parity
+    "top_n_sigma": float,
     "repeat_penalty": float,
     "repeat_last_n": int,
+    "presence_penalty": float,  # Ollama parity
+    "frequency_penalty": float, # Ollama parity
     "seed": int,
-    # Chat template (value names, NOT paths)
-    "chat_template": str,
+    "mirostat": int,            # Ollama parity — 0/1/2
+    "mirostat_lr": float,
+    "mirostat_ent": float,
+    "xtc_probability": float,
+    "xtc_threshold": float,
+    "dynatemp_range": float,
+    "dynatemp_exp": float,
+    "dry_multiplier": float,
+    "dry_base": float,
+    "dry_allowed_length": int,
+    "dry_penalty_last_n": int,
+    "adaptive_target": float,
+    "adaptive_decay": float,
+    "ignore_eos": bool,
+    # === Chat / template (value names + bounded strings only) ===
+    "chat_template": str,       # gated: built-in enum OR plain non-Jinja string
     "jinja": bool,
-    "reasoning_format": str,
-    # MoE — cpu_moe is -cmoe (all MoE on CPU bool); n_cpu_moe is -ncmoe N (count of layers)
-    "cpu_moe": bool,
-    "n_cpu_moe": int,
-    # Misc safe flags
+    "skip_chat_parsing": bool,
+    "special": bool,
+    "spm_infill": bool,
+    # === Reasoning — Hermes preserved-thinking ===
+    "reasoning_format": str,    # enum: none/deepseek/deepseek-legacy/auto
+    "reasoning": str,           # enum: on/off/auto
+    "reasoning_budget": int,    # -1/0/N — Hermes preserved-thinking knob
+    # === Server toggles ===
+    "metrics": bool,
+    "slots": bool,
+    "props": bool,
+    "embeddings": bool,
+    "reranking": bool,
+    "pooling": str,             # enum: none/mean/cls/last/rank
+    "offline": bool,
+    # === Debug ===
     "verbose": bool,
     "log_disable": bool,
+    "log_colors": str,          # enum: on/off/auto
+    "log_prefix": bool,
+    "log_timestamps": bool,
+    "log_verbosity": int,
 }
 
 
-# === Explicit denylist of path-bearing flags (Security F1 CRITICAL) ===
-# Any of these in llama_server_flags would allow file read/write injection via
-# llama-server. We REJECT them at schema validation, not warn.
+# === Numeric bounds (DoS prevention per Security Reviewer) ===
+# (min, max) inclusive; None = unbounded on that side.
+SAFE_LLAMA_FLAG_BOUNDS: dict[str, tuple[Any, Any]] = {
+    "ctx_size": (1, 2_000_000),
+    "n_gpu_layers": (-1, 999),
+    "n_predict": (-1, 1_000_000),
+    "threads": (-1, 256),
+    "threads_batch": (-1, 256),
+    "threads_http": (-1, 256),
+    "parallel": (1, 256),
+    "batch_size": (1, 65536),
+    "ubatch_size": (1, 65536),
+    "keep": (-1, 65536),
+    "sleep_idle_seconds": (-1, 86400),
+    "cache_reuse": (0, 65536),
+    "n_cpu_moe": (0, 256),
+    "main_gpu": (0, 16),
+    "fit_ctx": (1, 2_000_000),
+    "cache_ram": (0, 256 * 1024),  # MiB
+    "ctx_checkpoints": (0, 1024),
+    "checkpoint_every_n_tokens": (1, 1_000_000),
+    "yarn_orig_ctx": (0, 2_000_000),
+    "temp": (0.0, 10.0),
+    "top_k": (0, 10000),
+    "top_p": (0.0, 1.0),
+    "min_p": (0.0, 1.0),
+    "typical_p": (0.0, 1.0),
+    "top_n_sigma": (-1.0, 100.0),
+    "repeat_penalty": (0.0, 10.0),
+    "repeat_last_n": (-1, 65536),
+    "presence_penalty": (-10.0, 10.0),
+    "frequency_penalty": (-10.0, 10.0),
+    "seed": (-1, 2**63 - 1),
+    "mirostat": (0, 2),
+    "mirostat_lr": (0.0, 1.0),
+    "mirostat_ent": (0.0, 100.0),
+    "xtc_probability": (0.0, 1.0),
+    "xtc_threshold": (0.0, 1.0),
+    "dynatemp_range": (0.0, 10.0),
+    "dynatemp_exp": (0.0, 10.0),
+    "dry_multiplier": (0.0, 10.0),
+    "dry_base": (1.0, 10.0),
+    "dry_allowed_length": (0, 65536),
+    "dry_penalty_last_n": (-1, 65536),
+    "adaptive_target": (-1.0, 100.0),
+    "adaptive_decay": (0.0, 1.0),
+    "slot_prompt_similarity": (0.0, 1.0),
+    "rope_scale": (0.0, 1000.0),
+    "rope_freq_base": (0.0, 10_000_000.0),
+    "rope_freq_scale": (0.0, 100.0),
+    "yarn_ext_factor": (-1.0, 100.0),
+    "yarn_attn_factor": (-1.0, 100.0),
+    "yarn_beta_slow": (-1.0, 100.0),
+    "yarn_beta_fast": (-1.0, 100.0),
+    "reasoning_budget": (-1, 1_000_000),
+    "log_verbosity": (0, 4),
+}
+
+
+# === String enum bounds (closes F3 chat_template Jinja injection per Security Reviewer) ===
+# Only fixed enum values allowed for these string flags. chat_template special-cased
+# below (accepts enum OR plain non-Jinja string).
+SAFE_LLAMA_FLAG_STRING_ENUMS: dict[str, set[str]] = {
+    "numa": {"none", "distribute", "isolate", "numactl"},
+    "cache_type_k": {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"},
+    "cache_type_v": {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"},
+    "rope_scaling": {"none", "linear", "yarn"},
+    "split_mode": {"none", "layer", "row", "tensor"},
+    "fit": {"on", "off"},
+    "reasoning_format": {"none", "deepseek", "deepseek-legacy", "auto"},
+    "reasoning": {"on", "off", "auto"},
+    "pooling": {"none", "mean", "cls", "last", "rank"},
+    "log_colors": {"on", "off", "auto"},
+}
+
+# flash_attn — special-case tri-state. Accepts bool (legacy) OR str enum.
+_FLASH_ATTN_STR_VALUES: set[str] = {"on", "off", "auto", "enabled", "disabled"}
+
+# n_gpu_layers — accept int OR str "all"/"auto"
+_N_GPU_LAYERS_STR_VALUES: set[str] = {"all", "auto"}
+
+# Built-in chat_template names (subset of llama.cpp's bundled templates;
+# extracted from `llama-server --help` and tools/server/CHAT_TEMPLATES.md).
+# Accept these OR plain non-Jinja string. Reject anything containing
+# `{%` or `{{` (Jinja constructs that could SSTI-inject via filesystem
+# reads in non-sandboxed Jinja envs).
+SAFE_CHAT_TEMPLATE_NAMES: set[str] = {
+    "chatml", "llama2", "llama3", "llama3.1", "llama3.2", "llama3.3",
+    "gemma", "gemma2", "gemma3", "gemma4",
+    "mistral", "mistral-v1", "mistral-v3", "mistral-v3-tekken", "mistral-v7",
+    "phi3", "phi4",
+    "deepseek", "deepseek2", "deepseek-r1",
+    "qwen", "qwen2", "qwen2.5", "qwen3", "qwen3.5", "qwen3.6",
+    "command-r", "command-r-plus",
+    "vicuna", "alpaca", "zephyr", "chatglm3", "chatglm4",
+    "openchat", "orion", "yi", "monarch", "smollm", "minicpm",
+    "exaone3", "rwkv-world", "granite", "qwen3-thinking", "qwq",
+    "default",
+}
+
+# Suffix-pattern forward-defense (Security Reviewer recommendation).
+# Any flag whose name matches one of these regexes is REJECTED unless
+# explicitly listed below in SUFFIX_GUARD_ALLOWLIST_EXCEPTIONS. Catches
+# future Tom's Fork pulls that ship path-bearing or credential flags
+# we haven't yet seen.
+_SUFFIX_GUARD_PATTERNS: list[re.Pattern] = [
+    re.compile(r".*_file$"),
+    re.compile(r".*_path$"),
+    re.compile(r".*_dir$"),
+    re.compile(r".*_url$"),
+    re.compile(r".*_repo$"),
+    re.compile(r".*_key$"),
+    re.compile(r"^hf_"),
+    re.compile(r"^lora"),
+    re.compile(r"^control_vector"),
+    re.compile(r"^lookup_cache_"),
+    re.compile(r"^ssl_"),
+    re.compile(r"^api_key"),
+    re.compile(r"^slot_save_"),
+    re.compile(r"^webui_"),
+    re.compile(r"^docker_"),
+]
+
+# Exceptions to suffix-guard — flags that LOOK path-bearing by name but
+# are actually safe value-only (none right now, but reserved for future).
+_SUFFIX_GUARD_EXCEPTIONS: set[str] = set()
+
+
+def _suffix_guard_check(key: str) -> None:
+    """Forward-defense: reject any key matching path/cred/URL suffix patterns.
+
+    This catches NEW flags that slip into SAFE_LLAMA_FLAGS via a code-review
+    miss. Raises ManifestValidationError on match.
+    """
+    if key in _SUFFIX_GUARD_EXCEPTIONS:
+        return
+    for p in _SUFFIX_GUARD_PATTERNS:
+        if p.match(key):
+            raise ManifestValidationError(
+                f"llama_server_flags.{key} is rejected by suffix-pattern "
+                f"forward-defense guard (matches {p.pattern!r}). If this "
+                "flag is genuinely safe value-only, add to "
+                "_SUFFIX_GUARD_EXCEPTIONS with an audit trail."
+            )
+
+
+# === Explicit denylist of path-bearing flags (Security F1 CRITICAL) + Wave 2 expansion ===
+# Any of these in llama_server_flags would allow file read/write injection,
+# credential exfil, SSRF, or direct RCE via llama-server's tool-call interface.
 DENIED_FLAGS: set[str] = {
+    # Pre-Wave-2 (original 20)
     "mmproj",
     "lora",
     "lora_base",
@@ -81,6 +315,39 @@ DENIED_FLAGS: set[str] = {
     "rpc",
     "host",
     "port",
+    # Wave 2 +22 (Security Reviewer 2026-05-17 — Tom's Fork ships these, were unguarded)
+    "model_draft",            # -md — arbitrary GGUF path
+    "model_url",              # SSRF + RCE — network fetch by attacker URL
+    "model_url_draft",
+    "hf_repo",                # SSRF + arbitrary download via HF
+    "hf_repo_draft",
+    "hf_file",
+    "hf_repo_v",              # vocoder variant
+    "hf_file_v",
+    "docker_repo",            # docker-hub fetch primitive
+    "api_key",                # credential injection
+    "api_key_file",           # path read
+    "ssl_key_file",           # path read (PEM exfil)
+    "ssl_cert_file",
+    "lookup_cache_static",    # -lcs — arbitrary read/write
+    "lookup_cache_dynamic",   # -lcd
+    "model_vocoder",          # -mv — arbitrary file read
+    "webui_config_file",      # arbitrary JSON read
+    "webui_mcp_proxy",        # CORS bypass / SSRF (per Tom's Fork README)
+    "path",                   # CRITICAL — sets static-files dir for HTTP serve, /etc exfil
+    "media_path",             # CRITICAL — same exfil class
+    "models_dir",             # path read + arbitrary model load
+    "models_preset",          # arbitrary INI read
+    "control_vector",         # path read
+    "control_vector_scaled",
+    "tools",                  # DIRECT RCE — enables exec_shell_command / write_file / edit_file via server API
+    "grammar",                # inline BNF — deferred (needs grammar-parser pre-validator)
+    "tensor_split",           # CSV-string with shell-meta risk — deferred to Wave 3
+    "samplers",               # semi-colon list — deferred (validator needed)
+    "dry_sequence_breaker",   # str list — deferred
+    "chat_template_kwargs",   # JSON-str — deferred (recursive scalar validator needed)
+    "reasoning_budget_message", # str injected mid-stream — deferred (length-cap + ctrl-char strip needed)
+    "fit_target",             # CSV "MiB,MiB" — deferred to Wave 3
 }
 
 
@@ -112,6 +379,130 @@ class PromptTemplate(BaseModel):
 
     system_default: str = ""
     stop_tokens: list[str] = Field(default_factory=list)
+
+
+def _check_jinja_injection(value: str) -> None:
+    """Reject Jinja2 constructs in chat_template body (Security F3)."""
+    if "{%" in value or "{{" in value:
+        raise ManifestValidationError(
+            "chat_template contains Jinja constructs ({% or {{). Reject — "
+            "non-sandboxed Jinja could SSTI. Use a built-in template name "
+            f"from SAFE_CHAT_TEMPLATE_NAMES ({len(SAFE_CHAT_TEMPLATE_NAMES)} "
+            "options) or DENIED_FLAGS.chat_template_file for custom Jinja."
+        )
+
+
+def _validate_flag_value(key: str, value: Any) -> None:
+    """Validate a single flag value against allowlist + bounds + enum constraints."""
+    expected = SAFE_LLAMA_FLAGS[key]
+
+    # Special-case: flash_attn (bool OR str enum)
+    if key == "flash_attn":
+        if isinstance(value, bool):
+            return
+        if isinstance(value, str) and value.lower() in _FLASH_ATTN_STR_VALUES:
+            return
+        raise ManifestValidationError(
+            f"llama_server_flags.flash_attn expects bool or str in "
+            f"{sorted(_FLASH_ATTN_STR_VALUES)}, got {type(value).__name__}: {value!r}"
+        )
+
+    # Special-case: n_gpu_layers (int OR "all"/"auto")
+    if key == "n_gpu_layers":
+        if isinstance(value, bool):
+            raise ManifestValidationError(
+                f"llama_server_flags.n_gpu_layers expects int or str, got bool"
+            )
+        if isinstance(value, int):
+            lo, hi = SAFE_LLAMA_FLAG_BOUNDS.get(key, (None, None))
+            if lo is not None and value < lo:
+                raise ManifestValidationError(f"n_gpu_layers {value} < min {lo}")
+            if hi is not None and value > hi:
+                raise ManifestValidationError(f"n_gpu_layers {value} > max {hi}")
+            return
+        if isinstance(value, str) and value.lower() in _N_GPU_LAYERS_STR_VALUES:
+            return
+        raise ManifestValidationError(
+            f"n_gpu_layers expects int or str in {sorted(_N_GPU_LAYERS_STR_VALUES)}, got {value!r}"
+        )
+
+    # Special-case: chat_template (enum OR plain non-Jinja string)
+    if key == "chat_template":
+        if not isinstance(value, str):
+            raise ManifestValidationError(
+                f"chat_template expects str, got {type(value).__name__}"
+            )
+        _check_jinja_injection(value)
+        # Accept if in built-in enum, OR plain string short enough not to be a template body
+        if value in SAFE_CHAT_TEMPLATE_NAMES:
+            return
+        if len(value) > 256:
+            raise ManifestValidationError(
+                f"chat_template value too long ({len(value)} chars; max 256 for "
+                "non-built-in names). Use a built-in name or chat_template_file."
+            )
+        # Plain identifier-shaped string — accept (loose to allow custom names
+        # that aren't yet in SAFE_CHAT_TEMPLATE_NAMES but are clearly not Jinja)
+        if not re.match(r"^[A-Za-z0-9_.\-]+$", value):
+            raise ManifestValidationError(
+                f"chat_template value {value!r} has invalid chars; must be "
+                "alphanumeric + . _ - only (or use built-in enum name)"
+            )
+        return
+
+    # General string-enum validation
+    if key in SAFE_LLAMA_FLAG_STRING_ENUMS:
+        if not isinstance(value, str):
+            raise ManifestValidationError(
+                f"llama_server_flags.{key} expects str enum, got {type(value).__name__}"
+            )
+        if value not in SAFE_LLAMA_FLAG_STRING_ENUMS[key]:
+            raise ManifestValidationError(
+                f"llama_server_flags.{key}={value!r} not in allowed enum "
+                f"{sorted(SAFE_LLAMA_FLAG_STRING_ENUMS[key])}"
+            )
+        return
+
+    # Tuple-type spec (e.g., (int, str))
+    if isinstance(expected, tuple):
+        if not isinstance(value, expected):
+            raise ManifestValidationError(
+                f"llama_server_flags.{key} expects one of "
+                f"{[t.__name__ for t in expected]}, got {type(value).__name__}"
+            )
+    else:
+        # bool is a subclass of int; reject int→bool coercion explicitly
+        if expected is bool:
+            if not isinstance(value, bool):
+                raise ManifestValidationError(
+                    f"llama_server_flags.{key} expects bool, got {type(value).__name__}"
+                )
+        elif expected is int and isinstance(value, bool):
+            # Wave 1.6: reject bool-for-int coerce
+            raise ManifestValidationError(
+                f"llama_server_flags.{key} expects int, got bool (Python "
+                "bool-is-int coerce explicitly rejected per Wave 1.6)"
+            )
+        elif expected is float and isinstance(value, int) and not isinstance(value, bool):
+            pass  # int → float promotion OK
+        elif not isinstance(value, expected):
+            raise ManifestValidationError(
+                f"llama_server_flags.{key} expects {expected.__name__}, "
+                f"got {type(value).__name__}"
+            )
+
+    # Numeric bounds (DoS prevention)
+    if key in SAFE_LLAMA_FLAG_BOUNDS:
+        lo, hi = SAFE_LLAMA_FLAG_BOUNDS[key]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if lo is not None and value < lo:
+                raise ManifestValidationError(
+                    f"llama_server_flags.{key}={value} below min {lo}"
+                )
+            if hi is not None and value > hi:
+                raise ManifestValidationError(
+                    f"llama_server_flags.{key}={value} above max {hi}"
+                )
 
 
 class Manifest(BaseModel):
@@ -152,28 +543,18 @@ class Manifest(BaseModel):
             if key in DENIED_FLAGS:
                 raise ManifestValidationError(
                     f"llama_server_flags.{key} is explicitly denied "
-                    f"(Security #58 F1 path-traversal class). See v0.2 §8.1."
+                    f"(Security #58 F1 path-traversal/RCE class). See v0.2 §8.1."
                 )
+            # Suffix-pattern forward-defense (Wave 2): catches future Tom's Fork
+            # pulls that ship path-bearing flags before they reach DENIED_FLAGS.
+            _suffix_guard_check(key)
             if key not in SAFE_LLAMA_FLAGS:
                 raise ManifestValidationError(
                     f"llama_server_flags.{key} is not in the closed allowlist. "
-                    "See v0.2 §8.1 - unknown flags REJECTED (not silently warned)."
+                    f"See v0.2 §8.1 - unknown flags REJECTED. "
+                    f"Allowlist currently has {len(SAFE_LLAMA_FLAGS)} entries."
                 )
-            expected = SAFE_LLAMA_FLAGS[key]
-            # bool is a subclass of int; reject int→bool coercion explicitly
-            if expected is bool:
-                if not isinstance(value, bool):
-                    raise ManifestValidationError(
-                        f"llama_server_flags.{key} expects bool, got {type(value).__name__}"
-                    )
-            elif expected is float and isinstance(value, int) and not isinstance(value, bool):
-                # int → float promotion is fine
-                continue
-            elif not isinstance(value, expected):
-                raise ManifestValidationError(
-                    f"llama_server_flags.{key} expects {expected.__name__}, "
-                    f"got {type(value).__name__}"
-                )
+            _validate_flag_value(key, value)
         return v
 
 
@@ -311,6 +692,11 @@ def flags_to_argv(flags: dict[str, Any]) -> list[str]:
     Boolean True → `--<flag>` (no value).
     Boolean False → flag OMITTED (not `--<flag> false`).
     Other types → `--<flag> <value>`.
+
+    Wave 2 additions:
+    - flash_attn bool True → "--flash-attn on" (Tom's Fork tri-state)
+    - flash_attn bool False → "--flash-attn off"
+    - flash_attn str → "--flash-attn <value>"
     """
     argv: list[str] = []
     for key, value in flags.items():
@@ -319,6 +705,13 @@ def flags_to_argv(flags: dict[str, Any]) -> list[str]:
                 f"flag {key} blocked at argv-build (allowlist enforcement)"
             )
         cli_key = "--" + key.replace("_", "-")
+        # Special-case: flash_attn tri-state CLI
+        if key == "flash_attn":
+            if isinstance(value, bool):
+                argv.extend([cli_key, "on" if value else "off"])
+            else:
+                argv.extend([cli_key, str(value).lower()])
+            continue
         if isinstance(value, bool):
             if value:
                 argv.append(cli_key)

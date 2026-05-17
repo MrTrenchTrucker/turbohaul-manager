@@ -6,6 +6,7 @@ import Blob from './components/Blob';
 import Config from './components/Config';
 import Logs from './components/Logs';
 import Settings from './components/Settings';
+import Models from './components/Models';
 
 function Layout({ children }: { children: ReactNode }) {
   const loc = useLocation();
@@ -28,6 +29,7 @@ function Layout({ children }: { children: ReactNode }) {
           <h1 className="text-lg font-bold tracking-tight">Turbohaul Manager</h1>
           <nav className="flex gap-2">
             {tab('/', 'Dashboard')}
+            {tab('/models', 'Models')}
             {tab('/queue', 'Queue')}
             {tab('/blob', 'Blob')}
             {tab('/config', 'Config')}
@@ -46,6 +48,7 @@ export default function App() {
     <Layout>
       <Routes>
         <Route path="/" element={<Dashboard />} />
+        <Route path="/models" element={<Models />} />
         <Route path="/queue" element={<Queue />} />
         <Route path="/blob" element={<Blob />} />
         <Route path="/config" element={<Config />} />

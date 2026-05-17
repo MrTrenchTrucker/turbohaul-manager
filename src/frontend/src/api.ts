@@ -67,6 +67,14 @@ export interface ModelTag {
   size: number;
   digest: string;
   modified_at?: string;
+  details?: {
+    format?: string;
+    context_length?: number;
+    expected_vram_bytes?: number;
+    display_name?: string;
+    description?: string;
+  };
+  revision?: number;
 }
 
 export interface VersionInfo {
@@ -75,6 +83,35 @@ export interface VersionInfo {
   backend_sha_pinned: boolean;
   api_compat: string;
   user_agent: string;
+}
+
+// Wave 2 — per-model manifest editor types
+export interface Manifest {
+  model_tag: string;
+  display_name?: string;
+  description?: string;
+  gguf_blob_sha256: string;
+  gguf_size_bytes?: number;
+  context_size?: number;
+  expected_vram_bytes?: number;
+  revision?: number;
+  llama_server_flags?: Record<string, unknown>;
+  prompt_template?: {
+    system_default?: string;
+    stop_tokens?: string[];
+  };
+}
+
+export interface ManifestWithEtag {
+  manifest: Manifest;
+  etag: string;
+}
+
+export interface ManifestSaveResult {
+  status: string;
+  model_tag: string;
+  revision: number;
+  restart_required: boolean;
 }
 
 const BASE = '';
@@ -89,3 +126,44 @@ export const getStatus = () => getJSON<StatusSnapshot>('/status');
 export const getTags = () => getJSON<{ models: ModelTag[] }>('/api/tags');
 export const getVersion = () => getJSON<VersionInfo>('/api/version');
 export const getConfig = () => getJSON<Record<string, unknown>>('/api/config');
+
+// Wave 2 manifest CRUD with ETag handling
+export async function getManifest(tag: string): Promise<ManifestWithEtag> {
+  const r = await fetch(`${BASE}/api/manifests/${encodeURIComponent(tag)}`);
+  if (!r.ok) throw new Error(`GET /api/manifests/${tag} ${r.status}`);
+  const etag = r.headers.get('etag') || '';
+  const manifest = (await r.json()) as Manifest;
+  return { manifest, etag };
+}
+
+export async function putManifest(
+  tag: string,
+  manifest: Manifest,
+  ifMatch: string | null,
+): Promise<ManifestSaveResult> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (ifMatch) headers['If-Match'] = ifMatch;
+  const r = await fetch(`${BASE}/api/manifests/${encodeURIComponent(tag)}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(manifest),
+  });
+  if (!r.ok) {
+    let detail = '';
+    try {
+      const b = await r.json();
+      detail = (b as { detail?: string }).detail || '';
+    } catch {
+      // ignore
+    }
+    throw new Error(`PUT /api/manifests/${tag} ${r.status}${detail ? ` — ${detail}` : ''}`);
+  }
+  return (await r.json()) as ManifestSaveResult;
+}
+
+export async function deleteManifestApi(tag: string): Promise<void> {
+  const r = await fetch(`${BASE}/api/manifests/${encodeURIComponent(tag)}`, {
+    method: 'DELETE',
+  });
+  if (!r.ok) throw new Error(`DELETE /api/manifests/${tag} ${r.status}`);
+}
