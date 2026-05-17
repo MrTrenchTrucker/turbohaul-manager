@@ -466,6 +466,7 @@ class TurbohaulManager:
             # Build llama-server argv from manifest if available; tolerate missing
             # manifest for testing convenience.
             argv: list[str] = []
+            manifest_found = True
             try:
                 manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
                 argv = flags_to_argv(manifest.llama_server_flags)
@@ -476,7 +477,49 @@ class TurbohaulManager:
                     / manifest.gguf_blob_sha256
                 )
             except FileNotFoundError:
+                manifest_found = False
                 gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
+
+            # GRIP H-4 polish (RELAY stress test #15735): pre-validate the
+            # manifest BEFORE the teardown_idle_holder branch when a warm
+            # holder for a DIFFERENT model is at risk. A bogus model_tag
+            # with no manifest used to fall into the "different model"
+            # path and tear down the warm holder, then the spawn would
+            # inevitably hang in LOADING (missing.gguf) and health-check
+            # timeout. The warm hold was lost for nothing.
+            # Now: if manifest is missing AND an idle holder exists for a
+            # DIFFERENT model, bail fast (LOADING -> LOADING_FAIL -> POPPED)
+            # WITHOUT touching self._idle_handle. Otherwise (no holder OR
+            # same-model holder which we would inherit anyway) fall through
+            # to the legacy missing.gguf -> spawn-then-LOADING_FAIL path so
+            # existing tests that rely on the manifest-missing tolerance
+            # continue to work.
+            holder_at_risk = (
+                not manifest_found
+                and self._idle_handle is not None
+                and self._idle_model_tag != slot.model_tag
+            )
+            if holder_at_risk:
+                transition(slot, SlotState.LOADING)
+                self._audit(slot, "stage_to_loading")
+                transition(slot, SlotState.LOADING_FAIL)
+                self._audit(slot, "manifest_not_found")
+                transition(slot, SlotState.POPPED)
+                _mfn_conn = open_state_db(self.boot.storage.state_db_path)
+                try:
+                    mark_slot_ended(
+                        _mfn_conn, slot.slot_id, "manifest_not_found",
+                    )
+                finally:
+                    _mfn_conn.close()
+                self._fail_completion_future(
+                    slot,
+                    RuntimeError(
+                        f"model_tag {slot.model_tag!r} has no manifest "
+                        f"(idle holder for {self._idle_model_tag!r} preserved)"
+                    ),
+                )
+                return
 
             port = self.boot.runtime.default_port_base
 

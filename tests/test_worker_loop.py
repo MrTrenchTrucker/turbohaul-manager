@@ -364,6 +364,19 @@ class TestIdleHotWire:
         async def fake_complete(slot, handle):
             return {"ok": True}
 
+        # H-4 polish: seed manifests so manifest_found=True keeps the
+        # holder-at-risk bail-fast path inactive; tests the actual swap.
+        manifests_dir = boot.storage.manifests_path
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        for tag in ("gpt-x", "gpt-y"):
+            (manifests_dir / f"{tag}.yaml").write_text(
+                f"model_tag: {tag}\n"
+                "gguf_blob_sha256: " + "a" * 64 + "\n"
+                "context_size: 2048\n"
+                "expected_vram_bytes: 0\n"
+                "llama_server_flags: {}\n"
+            )
+
         mgr = TurbohaulManager(
             boot, runtime,
             spawn_fn=fake_spawn, health_fn=fake_health,
@@ -384,4 +397,75 @@ class TestIdleHotWire:
         assert "gpt-x" in sigterm_calls
         # gpt-y also sigterm at shutdown
         assert sigterm_calls.count("gpt-y") >= 1
+    async def test_bogus_model_tag_preserves_idle_holder(self, tmp_path):
+        """GRIP H-4 polish (#15735): bogus model_tag must NOT tear down idle holder."""
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=120,
+        )
+        spawn_calls = []
+        sigterm_calls = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            spawn_calls.append(model_tag)
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(port, timeout_s, **kwargs):
+            return True
+
+        async def fake_sigterm(handle, **kwargs):
+            sigterm_calls.append(handle.model_tag)
+            return True, "sigterm-clean"
+
+        async def fake_vram(*a, **kw):
+            return True, None
+
+        async def fake_complete(slot, handle):
+            return {"ok": True}
+
+        # Pre-seed a manifest for "real-model" so it can spawn cleanly
+        manifests_dir = boot.storage.manifests_path
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        (manifests_dir / "real-model.yaml").write_text(
+            "model_tag: real-model\n"
+            "gguf_blob_sha256: " + "a" * 64 + "\n"
+            "display_name: \"Real Model\"\n"
+            "description: test\n"
+            "context_size: 2048\n"
+            "expected_vram_bytes: 0\n"
+            "llama_server_flags: {}\n"
+        )
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            complete_fn=fake_complete,
+        )
+        # Force safety_enabled=False to isolate the manifest-not-found check
+        mgr.runtime.queue.safety_enabled = False
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        try:
+            # 1st request: real-model — fills the warm idle holder post-grace
+            await mgr.submit_and_wait("real-model", "prompt", thread_id="t1")
+            await asyncio.sleep(0.2)  # let grace expire + idle hold
+            assert mgr._idle_handle is not None, "idle holder should exist"
+            assert mgr._idle_model_tag == "real-model"
+
+            # 2nd request: BOGUS model_tag (no manifest) — must fail fast
+            # WITHOUT tearing down the idle holder.
+            with pytest.raises(RuntimeError, match="no manifest"):
+                await mgr.submit_and_wait(
+                    "qwen-pretend", "prompt-bogus", thread_id="t2",
+                )
+            # Holder must STILL be the real-model warm sidecar
+            assert mgr._idle_handle is not None, (
+                "idle holder was wrongly torn down on bogus-model fail"
+            )
+            assert mgr._idle_model_tag == "real-model"
+            # No bogus-spawn fired (we bailed before spawn)
+            assert "qwen-pretend" not in spawn_calls
+            # No sigterm fired on the holder
+            assert "real-model" not in sigterm_calls
+        finally:
+            await mgr.shutdown()
 
