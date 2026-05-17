@@ -176,6 +176,91 @@ def check_free_vram(min_free_mib: int, manifest_expected_bytes: int = 0) -> Gate
     )
 
 
+# --- KV-cache fit estimator (Wave 1.5-A LEAD fix per DAG synthesis 2026-05-17) ---
+# Closed-form pre-spawn check that refuses when (model body + KV cache + overhead)
+# would not fit free VRAM. Independent of (and complementary to) check_free_vram's
+# manifest-driven expected_vram_bytes check — this one is computed from ctx_size
+# directly, so user can bump ctx_size in the manifest WITHOUT manually re-tuning
+# expected_vram_bytes and the gate still catches over-commit.
+#
+# Empirical calibration (Qwen3.6-27B Q4_K_XL):
+#   17 GiB GGUF body + ~150 KB/token f16 KV → ~9.5 GiB KV at 64K ctx.
+# Generalized: ~9 KB/token per GiB of model body at f16. Quant halves/quarters
+# proportionally. Overhead floor = 1 GiB for activations + scratch.
+
+_KV_QUANT_SCALE: dict[str, float] = {
+    "f32": 2.0,
+    "f16": 1.0,
+    "bf16": 1.0,
+    "q8_0": 0.5,
+    "q4_0": 0.25,
+    "q4_1": 0.25,
+    "iq4_nl": 0.25,
+    "q5_0": 0.32,
+    "q5_1": 0.32,
+}
+
+
+def estimate_kv_cache_mib(
+    ctx_size: int,
+    gguf_size_bytes: int,
+    kv_cache_quant: str = "f16",
+) -> int:
+    """Closed-form KV-cache size estimate in MiB.
+
+    Scales linearly with ctx_size and with model body size (gguf bytes), then
+    scaled by quant factor for cache_type_k/cache_type_v.
+    """
+    if ctx_size <= 0 or gguf_size_bytes <= 0:
+        return 0
+    gguf_mib = gguf_size_bytes // (1024 * 1024)
+    # f16 baseline: ~9 KB/token per GiB of model body. Per-token in KB:
+    bytes_per_token_kb_f16 = (9 * gguf_mib) // 1024
+    scale = _KV_QUANT_SCALE.get(kv_cache_quant.lower(), 1.0)
+    bytes_per_token_kb = int(bytes_per_token_kb_f16 * scale)
+    total_kib = bytes_per_token_kb * ctx_size  # KB total
+    return total_kib // 1024  # MiB
+
+
+def check_kv_cache_fit(
+    ctx_size: int,
+    gguf_size_bytes: int,
+    overhead_mib: int = 1024,
+    kv_cache_quant: str = "f16",
+) -> GateResult:
+    """Refuse spawn if (body + KV-cache + overhead) > free VRAM.
+
+    Closed-form: doesn't trust the manifest's hand-tuned expected_vram_bytes;
+    derives the prediction from ctx_size + gguf_size_bytes + quant. This is
+    the load-bearing change for user-programmable ctx_size — when a user
+    bumps ctx_size from 4096 to 65536 in the manifest, this gate refuses
+    the spawn if the resulting KV cache won't fit on local hardware
+    (regardless of whether expected_vram_bytes was hand-tuned to match).
+    """
+    if ctx_size <= 0 or gguf_size_bytes <= 0:
+        # Insufficient info to predict — pass through to other gates.
+        return GateResult("kv_cache_fit", True, "passed-insufficient-input")
+    free_mib = _read_free_vram_mib()
+    if free_mib is None:
+        return GateResult("kv_cache_fit", True, "passed-no-probe")
+    gguf_mib = gguf_size_bytes // (1024 * 1024)
+    kv_mib = estimate_kv_cache_mib(ctx_size, gguf_size_bytes, kv_cache_quant)
+    total_mib = gguf_mib + kv_mib + overhead_mib
+    if total_mib > free_mib:
+        return GateResult(
+            "kv_cache_fit", False,
+            f"need ~{total_mib} MiB "
+            f"(body={gguf_mib} + KV@ctx{ctx_size}={kv_mib} "
+            f"[{kv_cache_quant}] + overhead={overhead_mib}); "
+            f"only {free_mib} MiB free",
+        )
+    return GateResult(
+        "kv_cache_fit", True,
+        f"need ~{total_mib} MiB / {free_mib} free "
+        f"(body={gguf_mib} KV={kv_mib} overhead={overhead_mib} quant={kv_cache_quant})",
+    )
+
+
 def all_safety_gates(
     *,
     min_free_ram_mib: int,
@@ -184,16 +269,30 @@ def all_safety_gates(
     max_iowait_percent: float,
     manifest_expected_vram_bytes: int = 0,
     iowait_sample_window_s: float = 0.4,
+    ctx_size: int = 0,
+    gguf_size_bytes: int = 0,
+    kv_cache_overhead_mib: int = 1024,
+    kv_cache_quant: str = "f16",
 ) -> list[GateResult]:
     """Run all gates; return their results in order. Caller decides on failures.
 
     A "fail" in any GateResult.ok = False entry is a refusal signal. The
     aggregator does not short-circuit -- collecting all gates' status gives
     the audit + completion_future error a complete picture.
+
+    The new kv_cache_fit gate (Wave 1.5-A) refuses spawn when the predicted
+    KV cache + model body + overhead exceeds free VRAM. When ctx_size or
+    gguf_size_bytes is unknown (0), the gate passes (caller still has the
+    other VRAM gate via manifest_expected_vram_bytes).
     """
     return [
         check_free_ram(min_free_ram_mib),
         check_free_vram(min_free_vram_mib, manifest_expected_vram_bytes),
+        check_kv_cache_fit(
+            ctx_size, gguf_size_bytes,
+            overhead_mib=kv_cache_overhead_mib,
+            kv_cache_quant=kv_cache_quant,
+        ),
         check_load_avg(max_load_per_core),
         check_iowait(max_iowait_percent, sample_window_s=iowait_sample_window_s),
     ]

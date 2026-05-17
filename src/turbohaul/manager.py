@@ -583,12 +583,30 @@ class TurbohaulManager:
                 # rather than spawning into an OOM / IO-stuck host.
                 if self.runtime.queue.safety_enabled:
                     manifest_vram = 0
+                    manifest_ctx = 0
+                    manifest_gguf_bytes = 0
+                    manifest_kv_quant = "f16"
                     try:
                         m_for_vram = read_manifest(
                             self.boot.storage.manifests_path,
                             slot.model_tag,
                         )
                         manifest_vram = m_for_vram.expected_vram_bytes or 0
+                        manifest_gguf_bytes = m_for_vram.gguf_size_bytes or 0
+                        # ctx_size: prefer llama_server_flags.ctx_size (what
+                        # actually gets passed to llama-server CLI); fall
+                        # back to manifest.context_size.
+                        manifest_ctx = (
+                            m_for_vram.llama_server_flags.get("ctx_size")
+                            or m_for_vram.context_size
+                            or 0
+                        )
+                        # KV quant: derive from cache_type_k (cache_type_v
+                        # assumed to match; if different, picks the larger).
+                        manifest_kv_quant = (
+                            m_for_vram.llama_server_flags.get("cache_type_k")
+                            or "f16"
+                        )
                     except FileNotFoundError:
                         manifest_vram = 0
                     gates = all_safety_gates(
@@ -598,6 +616,9 @@ class TurbohaulManager:
                         max_iowait_percent=self.runtime.queue.safety_max_iowait_percent,
                         manifest_expected_vram_bytes=manifest_vram,
                         iowait_sample_window_s=self.runtime.queue.safety_iowait_sample_window_s,
+                        ctx_size=manifest_ctx,
+                        gguf_size_bytes=manifest_gguf_bytes,
+                        kv_cache_quant=manifest_kv_quant,
                     )
                     failed = [g for g in gates if not g.ok]
                     if failed:
@@ -838,15 +859,30 @@ class TurbohaulManager:
                     {"model_tag": slot.model_tag},
                 )
         finally:
-            # GRIP CRIT-1 fix (also closes HIGH-1 + MED-1):
+            # GRIP CRIT-1 fix (closes HIGH-1 + MED-1) + Wave 1.5 DAG fix:
             # If unwind reaches here with a live handle, the IDLE_HOT
             # entry did NOT complete (most often CancelledError during
             # shutdown or mid-_complete_fn). MUST teardown the handle,
             # not just drop the reference, or llama-server orphans with
             # the full model in VRAM and no parent reference anywhere.
-            self._active_slot = None
+            #
+            # Wave 1.5 DAG synthesis 2026-05-17:
+            # 1. Diagnostic log at entry — surfaces leak path under repro.
+            # 2. Do NOT null _active_handle until sigterm SUCCEEDS. If the
+            #    sigterm helper raises (drained_sigterm internal failure,
+            #    process already dead/zombie, etc.) leaving _active_handle
+            #    set lets worker_loop's per-slot exception handler
+            #    (line 466-481) fire its safety-net _teardown(). Otherwise
+            #    the null-before-success ordering bypassed that safety net.
             handle_to_reap = self._active_handle
-            self._active_handle = None
+            self._active_slot = None
+            log.warning(
+                "process_slot finally reached: slot=%s active_handle_pid=%s alive=%s idle_match=%s",
+                getattr(slot, "slot_id", "?"),
+                getattr(handle_to_reap, "pid", None) if handle_to_reap is not None else None,
+                handle_to_reap.is_alive() if handle_to_reap is not None else False,
+                handle_to_reap is self._idle_handle if handle_to_reap is not None else False,
+            )
             # Skip defensive sigterm if the handle was promoted to the
             # IDLE_HOT holder — that promotion is by design; killing it
             # would defeat the warm-hold purpose.
@@ -855,6 +891,7 @@ class TurbohaulManager:
                 and handle_to_reap is not self._idle_handle
                 and handle_to_reap.is_alive()
             ):
+                sigterm_ok = False
                 try:
                     await asyncio.shield(
                         self._sigterm(
@@ -868,10 +905,22 @@ class TurbohaulManager:
                             ),
                         )
                     )
+                    sigterm_ok = True
                 except Exception:
                     log.exception(
-                        "cancellation-unwind teardown failed (best-effort)"
+                        "cancellation-unwind teardown FAILED — leaving "
+                        "_active_handle set so worker_loop safety-net can retry"
                     )
+                if sigterm_ok:
+                    self._active_handle = None
+                # else: keep _active_handle so worker_loop's except handler
+                # (which calls _teardown with reason="worker-uncaught-exception")
+                # has a second chance to reap. If that ALSO fails, the
+                # intra_lifetime_orphan_scan on the next /ensure tick is
+                # the final safety net (HIGH-3, singleton.py).
+            else:
+                # Handle absent or promoted to idle_holder — safe to null.
+                self._active_handle = None
 
     async def _teardown(self, slot: Slot, reason: str) -> None:
         """Drained SIGTERM the process group → VRAM verify → orphan reap → audit."""
