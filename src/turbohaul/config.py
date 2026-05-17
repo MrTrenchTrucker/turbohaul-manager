@@ -82,7 +82,11 @@ class QueueConfig(BaseModel):
     # agents (Hermes / OpenAI-SDK class) with PC-side tool-exec / reflection gaps
     # in the 2-5min range keep their slot warm without needing to send keep_alive.
     # OpenAI-SDK clients can't send keep_alive natively (Ollama Issue #11458).
-    idle_hot_load_seconds: int = Field(default=300, ge=0, le=86400)
+    # Wave 4b.6 (RELAY empirical 21:11Z Test 1 surface): bumped 300 → 600 because
+    # Qwen3 reasoning_budget=1000 on complex compare prompts produces 5-7min
+    # client-side inter-turn gaps. The 300s window was eaten by Hermes' reasoning
+    # chain on the FIRST tool-result reflection, not by Turbohaul itself.
+    idle_hot_load_seconds: int = Field(default=600, ge=0, le=86400)
     # Cmdr #15653 safety guardrails -- mirror Ollama pre-spawn safety posture
     safety_enabled: bool = True
     safety_min_free_ram_mib: int = Field(default=1024, ge=0)

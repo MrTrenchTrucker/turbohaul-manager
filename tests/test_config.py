@@ -51,9 +51,11 @@ class TestQueueConfig:
         q = QueueConfig()
         assert q.grace_seconds == 30
         # Wave 4b.5: bumped 120 → 300 default (advisor MSG 23 Option E).
-        # Covers OpenAI-SDK clients that can't send keep_alive natively
-        # (Ollama Issue #11458) and need a longer warm window for tool loops.
-        assert q.idle_hot_load_seconds == 300
+        # Wave 4b.6: bumped 300 → 600 (RELAY Test 1 surface 21:11Z — Qwen3
+        # reasoning_budget=1000 produces 5-7min inter-turn gaps on complex
+        # prompts, eating the 300s coverage). Covers OpenAI-SDK clients that
+        # can't send keep_alive natively (Ollama Issue #11458).
+        assert q.idle_hot_load_seconds == 600
         assert q.max_grace_extensions == 5
         assert q.drained_sigterm_window_active_s == 15
         assert q.drained_sigterm_window_cold_s == 5
