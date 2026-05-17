@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Ollama-shape inference manager using TurboQuant llama.cpp - fleet-internal local inference one-stop-shop"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "TBD"}
+license = {text = "MIT"}
 authors = [{name = "PL Claude (claude-pl)", email = "pl-claude@contak.local"}]
 dependencies = [
     "fastapi>=0.115.0",
