@@ -231,6 +231,50 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
 # ============================================================================
 
 
+def _merge_reasoning_into_content(result: Any) -> None:
+    """Wave 2.1: merge thinking-model reasoning_content into content.
+
+    Thinking-models (Qwen3, deepseek-r1, Gemma-thinking, etc.) split output
+    between `message.content` (final answer, often empty during thinking)
+    and `message.reasoning_content` (the chain-of-thought). Client parsers
+    that read only `.content` (Hermes-class workers, langchain default,
+    OpenAI SDK) see empty and bail → retry storm → no usable output.
+
+    Wrap reasoning_content inline as `<think>...</think>` tags so EVERY
+    client sees a non-empty content string. Preserve reasoning_content
+    untouched for clients that explicitly read it (Open WebUI, etc.).
+
+    No-op if reasoning_content is empty (non-thinking models) or content
+    is already populated alongside reasoning_content (some configs).
+
+    Per RELAY DAG finding 2026-05-17 + Cmdr empty-response observation.
+    """
+    if not isinstance(result, dict):
+        return
+    choices = result.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        msg = choice.get("message")
+        if not isinstance(msg, dict):
+            continue
+        rc = msg.get("reasoning_content") or ""
+        ct = msg.get("content") or ""
+        if not isinstance(rc, str) or not isinstance(ct, str):
+            continue
+        rc_stripped = rc.strip()
+        if not rc_stripped:
+            continue  # no thinking to merge
+        if ct.strip():
+            # Final answer already populated — prepend thinking as context
+            msg["content"] = f"<think>\n{rc_stripped}\n</think>\n\n{ct}"
+        else:
+            # Final answer empty — surface the thinking so client sees something
+            msg["content"] = f"<think>\n{rc_stripped}\n</think>"
+
+
 def make_llama_server_complete_fn(
     timeout_s: float = 600.0,
     http_client_factory=None,
@@ -264,7 +308,9 @@ def make_llama_server_complete_fn(
             async with client_cm as client:
                 r = await client.post(url, json=payload, timeout=timeout_s)
                 r.raise_for_status()
-                return r.json()
+                result = r.json()
+                _merge_reasoning_into_content(result)
+                return result
         except httpx.HTTPStatusError as e:
             # Sidecar accepted the request but returned 4xx/5xx (context
             # overflow, malformed payload, etc.). Convert to typed error
