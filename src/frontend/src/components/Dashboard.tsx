@@ -3,6 +3,7 @@ import type {
   ActiveInfo,
   GraceInfo,
   IdleHotInfo,
+  LoadingInfo,
   QueueInfo,
 } from '../api';
 import { useStatus } from '../hooks/useStatus';
@@ -117,6 +118,27 @@ function IdleCard({ idle }: { idle: IdleHotInfo | null }) {
   );
 }
 
+function LoadingCard({ loading }: { loading: LoadingInfo | null }) {
+  if (!loading) {
+    return (
+      <Card title="Loading" tone="idle">
+        <div className="text-slate-500 text-sm italic">— idle —</div>
+      </Card>
+    );
+  }
+  return (
+    <Card title="Loading" tone="warn">
+      <div className="text-lg font-semibold text-amber-300 mb-2">{loading.model_tag}</div>
+      <KV k="state" v={loading.state} />
+      <KV k="elapsed" v={`${loading.elapsed_s.toFixed(1)}s`} />
+      {loading.port !== null && <KV k="port" v={loading.port} />}
+      {loading.pid !== null && <KV k="pid" v={loading.pid} />}
+      <KV k="thread" v={loading.thread_id_prefix || '—'} />
+      <KV k="slot" v={loading.slot_id} />
+    </Card>
+  );
+}
+
 export default function Dashboard() {
   const { data, error, lastUpdate } = useStatus();
 
@@ -134,8 +156,9 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
         <ActiveCard active={data.active} />
+        <LoadingCard loading={data.loading} />
         <GraceCard grace={data.grace} />
         <QueueCard
           queue={data.queue}

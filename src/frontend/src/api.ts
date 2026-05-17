@@ -32,6 +32,16 @@ export interface IdleHotInfo {
   model_tag: string;
 }
 
+export interface LoadingInfo {
+  slot_id: string;
+  model_tag: string;
+  state: SlotState;
+  thread_id_prefix: string;
+  elapsed_s: number;
+  pid: number | null;
+  port: number | null;
+}
+
 export interface QueueInfo {
   acceptance_buffer_depth: number;
   staging_queue_depth: number;
@@ -46,6 +56,7 @@ export interface ParallelSlots {
 export interface StatusSnapshot {
   queue: QueueInfo;
   active: ActiveInfo | null;
+  loading: LoadingInfo | null;
   grace: GraceInfo | null;
   idle_hot: IdleHotInfo | null;
   parallel_slots: ParallelSlots;

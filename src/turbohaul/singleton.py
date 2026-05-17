@@ -16,6 +16,7 @@ import errno
 import fcntl
 import logging
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -301,3 +302,71 @@ def detect_foreign_gpu_apps(known_pids: set[int] | None = None) -> list[dict]:
             continue
         foreign.append({**app, "cmdline": _read_proc_cmdline(app["pid"]) or "<unknown>"})
     return foreign
+
+
+def intra_lifetime_orphan_scan(
+    port_base: int,
+    known_handle_pids: set[int],
+    port_range: int = 100,
+) -> dict:
+    """GRIP HIGH-3 fix: detect llama-server processes bound to our port
+    range whose PID is NOT in the live-handle set.
+
+    These are orphans from lost-handle bugs (CancelledError unwind,
+    exception inside finally, ``_active_handle = None`` without prior
+    sigterm) — invisible to boot_orphan_reaper because they are STILL
+    parented to the running manager (PPid != 1). Without this scan the
+    leak only resolves at manager restart.
+
+    Walks /proc/*/cmdline for llama-server processes; extracts --port
+    flag; checks against [port_base, port_base + port_range); SIGTERMs
+    any whose PID is not in known_handle_pids.
+
+    Returns ``{"scanned": N, "matched": M, "reaped": K, "errors": E}``.
+    """
+    stats = {"scanned": 0, "matched": 0, "reaped": 0, "errors": 0}
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return stats
+    port_re = re.compile(r"--port\s+(\d+)")
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return stats
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        stats["scanned"] += 1
+        cmdline = _read_proc_cmdline(int(entry.name))
+        if "llama-server" not in cmdline:
+            continue
+        m = port_re.search(cmdline)
+        if not m:
+            continue
+        try:
+            port = int(m.group(1))
+        except ValueError:
+            continue
+        if not (port_base <= port < port_base + port_range):
+            continue
+        stats["matched"] += 1
+        pid = int(entry.name)
+        if pid in known_handle_pids:
+            continue
+        log.warning(
+            "intra_lifetime_orphan_scan: orphan llama-server pid=%d port=%d "
+            "(not in known_handle_pids); sending SIGTERM",
+            pid, port,
+        )
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stats["reaped"] += 1
+        except ProcessLookupError:
+            pass  # raced; benign
+        except (PermissionError, OSError) as e:
+            log.warning(
+                "intra_lifetime_orphan_scan: failed SIGTERM pid %d: %s",
+                pid, e,
+            )
+            stats["errors"] += 1
+    return stats

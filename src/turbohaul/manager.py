@@ -19,7 +19,7 @@ from turbohaul.fsm import LEGAL_TRANSITIONS, InvalidTransition, is_terminal, tra
 from turbohaul.manifest import flags_to_argv, read_manifest
 from turbohaul.queue import GraceTimer, IdleHotTimer, TurbohaulQueue
 from turbohaul.safety import all_safety_gates
-from turbohaul.singleton import boot_orphan_reaper, detect_foreign_gpu_apps
+from turbohaul.singleton import boot_orphan_reaper, detect_foreign_gpu_apps, intra_lifetime_orphan_scan
 from turbohaul.slot import Slot, SlotState, derive_thread_id_prefix_hash
 from turbohaul.state import (
     known_active_pids,
@@ -351,16 +351,39 @@ class TurbohaulManager:
         depth = self.queue.depth()
 
         active_info: dict | None = None
-        if self._active_slot is not None and self._active_handle is not None:
-            active_info = {
-                "slot_id": self._active_slot.slot_id,
-                "model_tag": self._active_slot.model_tag,
-                "state": self._active_slot.state.value,
-                # Redaction: only first 8 chars of thread_id exposed (v0.2 §11.1)
-                "thread_id_prefix": (self._active_slot.thread_id or "")[:8],
-                "pid": self._active_handle.pid,
-                "port": self._active_handle.port,
-            }
+        loading_info: dict | None = None
+        if self._active_slot is not None:
+            slot = self._active_slot
+            # FE LOADING transition fix: split status into ACTIVE vs the
+            # pre-active transitional states (STAGED / PRE_LOADING /
+            # LOADING / READY). Before this split, FE saw active=null
+            # for the whole 5-30s cold-load window — reads as a hang.
+            state_v = slot.state.value
+            if state_v == "ACTIVE" or state_v == "ACTIVE_MATCH":
+                if self._active_handle is not None:
+                    active_info = {
+                        "slot_id": slot.slot_id,
+                        "model_tag": slot.model_tag,
+                        "state": state_v,
+                        # Redaction: only first 8 chars of thread_id exposed (v0.2 §11.1)
+                        "thread_id_prefix": (slot.thread_id or "")[:8],
+                        "pid": self._active_handle.pid,
+                        "port": self._active_handle.port,
+                    }
+            elif state_v in {"STAGED", "PRE_LOADING", "LOADING", "READY"}:
+                elapsed = 0.0
+                started = getattr(slot, "started_loading_at", None) or getattr(slot, "received_at", None)
+                if started is not None:
+                    elapsed = max(0.0, time.monotonic() - started)
+                loading_info = {
+                    "slot_id": slot.slot_id,
+                    "model_tag": slot.model_tag,
+                    "state": state_v,
+                    "thread_id_prefix": (slot.thread_id or "")[:8],
+                    "elapsed_s": round(elapsed, 1),
+                    "pid": self._active_handle.pid if self._active_handle else None,
+                    "port": self._active_handle.port if self._active_handle else None,
+                }
 
         grace_info: dict | None = None
         if not self.grace.expired():
@@ -400,6 +423,7 @@ class TurbohaulManager:
                 "staging_queue_max": depth["staging_queue_max"],
             },
             "active": active_info,
+            "loading": loading_info,
             "grace": grace_info,
             "idle_hot": idle_info,
             "parallel_slots": {
@@ -814,8 +838,40 @@ class TurbohaulManager:
                     {"model_tag": slot.model_tag},
                 )
         finally:
+            # GRIP CRIT-1 fix (also closes HIGH-1 + MED-1):
+            # If unwind reaches here with a live handle, the IDLE_HOT
+            # entry did NOT complete (most often CancelledError during
+            # shutdown or mid-_complete_fn). MUST teardown the handle,
+            # not just drop the reference, or llama-server orphans with
+            # the full model in VRAM and no parent reference anywhere.
             self._active_slot = None
+            handle_to_reap = self._active_handle
             self._active_handle = None
+            # Skip defensive sigterm if the handle was promoted to the
+            # IDLE_HOT holder — that promotion is by design; killing it
+            # would defeat the warm-hold purpose.
+            if (
+                handle_to_reap is not None
+                and handle_to_reap is not self._idle_handle
+                and handle_to_reap.is_alive()
+            ):
+                try:
+                    await asyncio.shield(
+                        self._sigterm(
+                            handle_to_reap,
+                            drained_window_s=float(
+                                self.runtime.queue.drained_sigterm_window_active_s
+                            ),
+                            is_active=False,
+                            cold_window_s=float(
+                                self.runtime.queue.drained_sigterm_window_cold_s
+                            ),
+                        )
+                    )
+                except Exception:
+                    log.exception(
+                        "cancellation-unwind teardown failed (best-effort)"
+                    )
 
     async def _teardown(self, slot: Slot, reason: str) -> None:
         """Drained SIGTERM the process group → VRAM verify → orphan reap → audit."""
@@ -826,8 +882,13 @@ class TurbohaulManager:
                 is_active=False,
                 cold_window_s=float(self.runtime.queue.drained_sigterm_window_cold_s),
             )
-            # VRAM verify (default expected_drop 1024 MiB; future: read from manifest)
-            await self._vram_verify(expected_drop_mib=1024, timeout_s=30.0)
+            # HAUL #2 fix: dynamic expected_drop_mib derived from manifest
+            # expected_vram_bytes. Was hardcoded 1024 MiB — let a 921 MiB
+            # drop "verify clear" while 17 GiB qwen35b still resident.
+            expected_drop_mib = self._compute_expected_drop_mib(slot.model_tag)
+            await self._vram_verify(
+                expected_drop_mib=expected_drop_mib, timeout_s=30.0,
+            )
             # HAUL P-2 fix: scan for grandchild orphans left behind by
             # Tom's Fork setsid-detach (killpg never reached them) and
             # reap before the next slot needs the port + VRAM. ~50ms
@@ -843,6 +904,25 @@ class TurbohaulManager:
             except Exception:
                 log.exception(
                     "post-teardown orphan reap failed (best-effort)"
+                )
+            # GRIP HIGH-3 fix: intra-lifetime port-bound reaper. Catches
+            # orphans whose parent IS still the running manager (PPid !=
+            # 1 so boot_orphan_reaper misses them) — e.g. handle dropped
+            # without sigterm via lost reference or finally-clear bug.
+            try:
+                live_pids = self._live_handle_pids()
+                il_result = intra_lifetime_orphan_scan(
+                    port_base=self.boot.runtime.default_port_base,
+                    known_handle_pids=live_pids,
+                )
+                if il_result.get("reaped", 0) > 0:
+                    log.warning(
+                        "intra-lifetime reap caught orphans post-teardown: %s",
+                        il_result,
+                    )
+            except Exception:
+                log.exception(
+                    "intra-lifetime orphan scan failed (best-effort)"
                 )
             conn = open_state_db(self.boot.storage.state_db_path)
             try:
@@ -860,6 +940,11 @@ class TurbohaulManager:
                 )
             finally:
                 conn.close()
+            # GRIP CRIT-1 + test expectation: clear _active_handle after
+            # successful teardown so the outer finally's defensive sigterm
+            # net does not double-fire on normal flow. Owner contract:
+            # "if you called _teardown you have handed off the handle."
+            self._active_handle = None
 
     async def _teardown_idle_holder(self, reason: str) -> None:
         """GRIP H-4 wire: tear down the manager-level idle handle.
@@ -886,7 +971,13 @@ class TurbohaulManager:
                 self.runtime.queue.drained_sigterm_window_cold_s
             ),
         )
-        await self._vram_verify(expected_drop_mib=1024, timeout_s=30.0)
+        # HAUL #2 fix: dynamic expected_drop_mib for idle holder teardown.
+        expected_drop_mib = self._compute_expected_drop_mib(
+            model_tag or ""
+        )
+        await self._vram_verify(
+            expected_drop_mib=expected_drop_mib, timeout_s=30.0,
+        )
         try:
             boot_orphan_reaper(
                 port_base=self.boot.runtime.default_port_base,
@@ -895,6 +986,17 @@ class TurbohaulManager:
         except Exception:
             log.exception(
                 "idle-holder orphan reap failed (best-effort)"
+            )
+        # GRIP HIGH-3 fix: intra-lifetime port-bound reaper here too.
+        try:
+            live_pids = self._live_handle_pids()
+            intra_lifetime_orphan_scan(
+                port_base=self.boot.runtime.default_port_base,
+                known_handle_pids=live_pids,
+            )
+        except Exception:
+            log.exception(
+                "intra-lifetime orphan scan failed (best-effort)"
             )
         _ih_conn = open_state_db(self.boot.storage.state_db_path)
         try:
@@ -920,7 +1022,53 @@ class TurbohaulManager:
         ACTIVE→GRACE→POPPED→COLD, IDLE_HOT→COLD. Memory and DB state stay
         in sync (no drift where slot.state stays e.g. LOADING in Python
         while sqlite reads state='COLD').
+
+        GRIP CRIT-2 fix: defensive teardown of any live handle attached
+        to this slot BEFORE forcing COLD. Closes the footgun where a
+        caller forgot to teardown (AM-2 active_match_cancelled path
+        raises after _force_cold(matched, ...) without sigterm'ing the
+        anchor sidecar). Defense-in-depth — GRIP #1-priority fix.
+
+        GRIP HIGH-2 fix: annotate audit with pid_source so post-hoc
+        tooling can distinguish matched-row-on-anchor-pid (anchor_shared)
+        from genuine standalone (self).
         """
+        # GRIP CRIT-2 + HIGH-2: identify pid_source, defensive sigterm
+        # if the slot owns its own live handle.
+        pid_source = "self"
+        if (
+            self._active_slot is not None
+            and slot.slot_id != self._active_slot.slot_id
+            and self._active_handle is not None
+            and slot.pid
+            and slot.pid == self._active_handle.pid
+        ):
+            # matched.pid == anchor.pid via shared warm sidecar
+            # (AM-2 drift path). Do NOT teardown — anchor owns it.
+            pid_source = "anchor_shared"
+        elif (
+            slot.pid
+            and self._active_handle is not None
+            and slot.pid == self._active_handle.pid
+        ):
+            # Slot owns the active handle. Defensive teardown.
+            try:
+                await self._sigterm(
+                    self._active_handle,
+                    drained_window_s=float(
+                        self.runtime.queue.drained_sigterm_window_active_s
+                    ),
+                    is_active=False,
+                    cold_window_s=float(
+                        self.runtime.queue.drained_sigterm_window_cold_s
+                    ),
+                )
+                self._active_handle = None
+            except Exception:
+                log.exception(
+                    "_force_cold defensive teardown failed (best-effort)"
+                )
+
         # Walk legal hops to COLD per the new FSM table.
         # Worst case: ACTIVE → GRACE → POPPED → COLD (3 hops).
         if not is_terminal(slot.state):
@@ -950,8 +1098,54 @@ class TurbohaulManager:
         conn = open_state_db(self.boot.storage.state_db_path)
         try:
             mark_slot_ended(conn, slot.slot_id, reason)
+            # GRIP HIGH-2: pid_source annotation
+            record_audit_event(
+                conn,
+                "force_cold",
+                {"reason": reason, "pid_source": pid_source},
+                slot_id=slot.slot_id,
+            )
         finally:
             conn.close()
+
+    def _compute_expected_drop_mib(self, model_tag: str) -> int:
+        """HAUL #2 fix: dynamic expected_drop_mib derived from manifest.
+
+        Returns max(2048, manifest.expected_vram_bytes/1024**2). Floor
+        at 2 GiB absorbs page-cache noise on small models. If manifest
+        cannot be read (race during teardown of a just-deleted manifest),
+        falls back to 2048 MiB rather than blocking teardown.
+        """
+        try:
+            m = read_manifest(self.boot.storage.manifests_path, model_tag)
+            return max(2048, int(m.expected_vram_bytes / (1024 * 1024)))
+        except Exception:
+            log.warning(
+                "_compute_expected_drop_mib: manifest read failed for %s, "
+                "falling back to 2048 MiB",
+                model_tag,
+            )
+            return 2048
+
+    def _live_handle_pids(self) -> set[int]:
+        """GRIP HIGH-3 helper: set of currently-known live llama-server pids.
+
+        Used by intra_lifetime_orphan_scan to distinguish managed
+        sidecars from leaked orphans on our port range. Includes
+        _active_handle and _idle_handle if alive.
+        """
+        live: set[int] = set()
+        if (
+            self._active_handle is not None
+            and self._active_handle.is_alive()
+        ):
+            live.add(self._active_handle.pid)
+        if (
+            self._idle_handle is not None
+            and self._idle_handle.is_alive()
+        ):
+            live.add(self._idle_handle.pid)
+        return live
 
     def _audit(self, slot: Slot, event_type: str) -> None:
         """Audit: upsert current slot row + record event + publish to event bus."""

@@ -48,8 +48,9 @@ SAFE_LLAMA_FLAGS: dict[str, type] = {
     "chat_template": str,
     "jinja": bool,
     "reasoning_format": str,
-    # MoE
-    "n_cpu_moe": bool,
+    # MoE — cpu_moe is -cmoe (all MoE on CPU bool); n_cpu_moe is -ncmoe N (count of layers)
+    "cpu_moe": bool,
+    "n_cpu_moe": int,
     # Misc safe flags
     "verbose": bool,
     "log_disable": bool,

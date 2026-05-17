@@ -243,6 +243,12 @@ async def drained_sigterm(
     try:
         killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
+        # HAUL #1 fix: best-effort waitpid on already-gone — reaps zombie
+        # if process exited between getpgid and killpg.
+        try:
+            await asyncio.to_thread(handle.proc.wait, timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
         return True, "already-gone-during-sigterm"
     except PermissionError as e:
         return False, f"sigterm-failed-permission-denied"
@@ -250,6 +256,13 @@ async def drained_sigterm(
     deadline = time.monotonic() + wait_window
     while time.monotonic() < deadline:
         if handle.proc.poll() is not None:
+            # HAUL #1 fix: explicit waitpid reap. poll() already reaps if
+            # exited, but be defensive — the zombie-free invariant that
+            # the orphan reaper depends on must be guaranteed here.
+            try:
+                await asyncio.to_thread(handle.proc.wait, timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass  # benign — process exited per poll(), waitpid race
             return True, "sigterm-clean"
         await asyncio.sleep(poll_interval_s)
 
@@ -265,6 +278,14 @@ async def drained_sigterm(
     await asyncio.sleep(0.5)
     if handle.proc.poll() is None:
         return False, "sigkill-failed-still-alive"
+    # HAUL #1 fix: explicit waitpid reap. Without this, kernel keeps the
+    # PID slot occupied as <defunct>; any helper Tom's Fork spawned that
+    # reparents inherits the zombie as PPid, slipping the PPid==1 reaper
+    # filter (false-negative).
+    try:
+        await asyncio.to_thread(handle.proc.wait, timeout=5.0)
+    except subprocess.TimeoutExpired:
+        return False, "wait-timeout-after-sigkill"
     return True, "sigkill-clean"
 
 
