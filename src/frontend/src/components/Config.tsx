@@ -104,7 +104,7 @@ export default function Config() {
               disabled={busy}
               className="px-4 py-2 rounded-md bg-emerald-700 text-white text-sm font-medium hover:bg-emerald-600 disabled:bg-slate-700"
             >
-              {busy ? 'Submitting…' : 'PUT /api/config'}
+              {busy ? 'Saving…' : 'Apply'}
             </button>
             <button
               onClick={() => void refresh()}
