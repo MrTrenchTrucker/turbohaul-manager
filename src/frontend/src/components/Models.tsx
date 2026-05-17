@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   getTags,
   getManifest,
@@ -6,17 +6,17 @@ import {
   type ModelTag,
   type Manifest,
 } from '../api';
+import {
+  FLAGS_SCHEMA,
+  CATEGORY_ORDER,
+  getFlagsByCategory,
+  type FlagSpec,
+  type FlagCategory,
+} from '../flagsSchema';
 
-// Wave 2 Models tab — per-model manifest editor.
-//
-// Per Devil's Advocate scope-down: 5 primary structured fields covering the
-// 90% common-edit surface (ctx_size, n_gpu_layers, temp, top_p, cache_type_k)
-// plus an Advanced (raw JSON) escape hatch for the long tail. Real-world
-// manifest YAMLs in this fleet use 1-2 flags; richer per-knob form is deferred
-// until empirical demand surfaces.
-
-const KV_QUANT_OPTIONS = ['f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1'];
-const FLASH_ATTN_OPTIONS: (boolean | string)[] = [true, false, 'on', 'off', 'auto'];
+// Wave 2 v2 Models tab — comprehensive structured editor mirroring BE
+// SAFE_LLAMA_FLAGS exactly. Per Cmdr directive "FE needs to match BE
+// exactly". ~80 flags grouped by category. Primary flags featured at top.
 
 function fmtBytes(n?: number): string {
   if (!n) return '—';
@@ -32,40 +32,262 @@ function fmtCtx(n?: number): string {
   return String(n);
 }
 
-interface PrimaryFields {
-  ctx_size: number;
-  n_gpu_layers: number | string;
-  temp: number;
-  top_p: number;
-  cache_type_k: string;
-  cache_type_v: string;
+type FlagValue = number | string | boolean | undefined;
+
+function FlagInput({
+  spec,
+  value,
+  enabled,
+  onChange,
+  onToggle,
+}: {
+  spec: FlagSpec;
+  value: FlagValue;
+  enabled: boolean;
+  onChange: (v: FlagValue) => void;
+  onToggle: (en: boolean) => void;
+}) {
+  const inputBase =
+    'w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono text-xs disabled:opacity-40';
+
+  let widget: React.ReactNode;
+  switch (spec.type) {
+    case 'int':
+      widget = (
+        <input
+          type="number"
+          min={spec.bounds?.[0]}
+          max={spec.bounds?.[1]}
+          step={1}
+          disabled={!enabled}
+          value={typeof value === 'number' ? value : (spec.default as number) ?? 0}
+          onChange={(e) => onChange(parseInt(e.target.value || '0', 10))}
+          className={inputBase}
+        />
+      );
+      break;
+    case 'float':
+      widget = (
+        <input
+          type="number"
+          min={spec.bounds?.[0]}
+          max={spec.bounds?.[1]}
+          step={0.01}
+          disabled={!enabled}
+          value={typeof value === 'number' ? value : (spec.default as number) ?? 0}
+          onChange={(e) => onChange(parseFloat(e.target.value || '0'))}
+          className={inputBase}
+        />
+      );
+      break;
+    case 'bool':
+      widget = (
+        <input
+          type="checkbox"
+          disabled={!enabled}
+          checked={typeof value === 'boolean' ? value : (spec.default as boolean) ?? false}
+          onChange={(e) => onChange(e.target.checked)}
+          className="h-4 w-4 accent-emerald-500"
+        />
+      );
+      break;
+    case 'enum-string':
+      widget = (
+        <select
+          disabled={!enabled}
+          value={(value as string) ?? (spec.default as string) ?? ''}
+          onChange={(e) => onChange(e.target.value)}
+          className={inputBase}
+        >
+          {spec.enumValues?.map((opt) => (
+            <option key={opt} value={opt}>{opt}</option>
+          ))}
+        </select>
+      );
+      break;
+    case 'int-or-string': {
+      const isStr = typeof value === 'string';
+      widget = (
+        <div className="flex gap-1">
+          <select
+            disabled={!enabled}
+            value={isStr ? (value as string) : '__int__'}
+            onChange={(e) => {
+              if (e.target.value === '__int__') {
+                onChange(spec.default as number ?? 0);
+              } else {
+                onChange(e.target.value);
+              }
+            }}
+            className={inputBase + ' w-24'}
+          >
+            <option value="__int__">int…</option>
+            {spec.enumValues?.map((opt) => (
+              <option key={opt} value={opt}>{opt}</option>
+            ))}
+          </select>
+          {!isStr && (
+            <input
+              type="number"
+              min={spec.bounds?.[0]}
+              max={spec.bounds?.[1]}
+              disabled={!enabled}
+              value={typeof value === 'number' ? value : (spec.default as number) ?? 0}
+              onChange={(e) => onChange(parseInt(e.target.value || '0', 10))}
+              className={inputBase}
+            />
+          )}
+        </div>
+      );
+      break;
+    }
+    case 'bool-or-enum': {
+      const v = value ?? spec.default;
+      widget = (
+        <select
+          disabled={!enabled}
+          value={typeof v === 'boolean' ? (v ? '__true__' : '__false__') : String(v)}
+          onChange={(e) => {
+            const s = e.target.value;
+            if (s === '__true__') onChange(true);
+            else if (s === '__false__') onChange(false);
+            else onChange(s);
+          }}
+          className={inputBase}
+        >
+          <option value="__true__">true (legacy bool)</option>
+          <option value="__false__">false (legacy bool)</option>
+          {spec.enumValues?.map((opt) => (
+            <option key={opt} value={opt}>{opt}</option>
+          ))}
+        </select>
+      );
+      break;
+    }
+    case 'chat-template':
+      widget = (
+        <div className="flex flex-col gap-1">
+          <select
+            disabled={!enabled}
+            value={
+              spec.enumValues?.includes((value as string) ?? '')
+                ? (value as string)
+                : '__custom__'
+            }
+            onChange={(e) => {
+              if (e.target.value === '__custom__') {
+                onChange('');
+              } else {
+                onChange(e.target.value);
+              }
+            }}
+            className={inputBase}
+          >
+            <option value="__custom__">— custom string —</option>
+            {spec.enumValues?.map((opt) => (
+              <option key={opt} value={opt}>{opt}</option>
+            ))}
+          </select>
+          <input
+            type="text"
+            disabled={!enabled}
+            placeholder="Custom template name (no Jinja {% or {{ )"
+            value={(value as string) ?? ''}
+            onChange={(e) => onChange(e.target.value)}
+            className={inputBase}
+          />
+        </div>
+      );
+      break;
+    case 'string':
+    default:
+      widget = (
+        <input
+          type="text"
+          disabled={!enabled}
+          value={(value as string) ?? ''}
+          onChange={(e) => onChange(e.target.value)}
+          className={inputBase}
+        />
+      );
+      break;
+  }
+
+  return (
+    <div className="grid grid-cols-[24px_minmax(160px,_220px)_1fr] gap-2 items-center py-1 border-b border-slate-900 last:border-b-0">
+      <input
+        type="checkbox"
+        checked={enabled}
+        onChange={(e) => onToggle(e.target.checked)}
+        className="h-3.5 w-3.5 accent-slate-500"
+        title={enabled ? 'Flag SET in manifest — click to omit (use llama-server default)' : 'Flag OMITTED — click to SET'}
+      />
+      <div className="flex flex-col">
+        <span className={`text-xs font-mono ${enabled ? 'text-slate-100' : 'text-slate-500'}`}>
+          {spec.name}
+        </span>
+        <span className="text-[10px] text-slate-500 leading-tight">{spec.hint}</span>
+      </div>
+      <div>{widget}</div>
+    </div>
+  );
 }
 
-function extractPrimary(m: Manifest): PrimaryFields {
-  const f = (m.llama_server_flags || {}) as Record<string, unknown>;
-  return {
-    ctx_size: (f.ctx_size as number) ?? m.context_size ?? 4096,
-    n_gpu_layers: (f.n_gpu_layers as number | string) ?? 999,
-    temp: (f.temp as number) ?? 0.8,
-    top_p: (f.top_p as number) ?? 0.95,
-    cache_type_k: (f.cache_type_k as string) ?? 'f16',
-    cache_type_v: (f.cache_type_v as string) ?? 'f16',
-  };
-}
-
-function applyPrimary(m: Manifest, p: PrimaryFields): Manifest {
-  const flags = { ...(m.llama_server_flags || {}) };
-  flags.ctx_size = p.ctx_size;
-  flags.n_gpu_layers = p.n_gpu_layers;
-  flags.temp = p.temp;
-  flags.top_p = p.top_p;
-  flags.cache_type_k = p.cache_type_k;
-  flags.cache_type_v = p.cache_type_v;
-  return {
-    ...m,
-    context_size: p.ctx_size,
-    llama_server_flags: flags,
-  };
+function CategorySection({
+  cat,
+  flags,
+  values,
+  enabledFlags,
+  onChange,
+  onToggle,
+  defaultOpen,
+}: {
+  cat: FlagCategory;
+  flags: FlagSpec[];
+  values: Record<string, FlagValue>;
+  enabledFlags: Set<string>;
+  onChange: (name: string, v: FlagValue) => void;
+  onToggle: (name: string, en: boolean) => void;
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const setCount = flags.filter((f) => enabledFlags.has(f.name)).length;
+  return (
+    <div className="rounded-md border border-slate-800 bg-slate-925">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full px-3 py-2 flex justify-between items-center hover:bg-slate-800/50"
+      >
+        <span className="text-sm font-semibold text-slate-200">
+          {open ? '▼' : '▶'} {cat}
+          {setCount > 0 && (
+            <span className="ml-2 text-[10px] text-emerald-400 font-mono">
+              {setCount}/{flags.length} set
+            </span>
+          )}
+          {setCount === 0 && (
+            <span className="ml-2 text-[10px] text-slate-600 font-mono">
+              0/{flags.length}
+            </span>
+          )}
+        </span>
+      </button>
+      {open && (
+        <div className="px-3 pb-3 space-y-0">
+          {flags.map((spec) => (
+            <FlagInput
+              key={spec.name}
+              spec={spec}
+              value={values[spec.name]}
+              enabled={enabledFlags.has(spec.name)}
+              onChange={(v) => onChange(spec.name, v)}
+              onToggle={(en) => onToggle(spec.name, en)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function ModelEditor({
@@ -79,7 +301,8 @@ function ModelEditor({
 }) {
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [etag, setEtag] = useState<string>('');
-  const [primary, setPrimary] = useState<PrimaryFields | null>(null);
+  const [flagValues, setFlagValues] = useState<Record<string, FlagValue>>({});
+  const [enabledFlags, setEnabledFlags] = useState<Set<string>>(new Set());
   const [rawJson, setRawJson] = useState<string>('');
   const [rawMode, setRawMode] = useState<boolean>(false);
   const [saving, setSaving] = useState<boolean>(false);
@@ -92,7 +315,9 @@ function ModelEditor({
         const { manifest: m, etag: e } = await getManifest(tag);
         setManifest(m);
         setEtag(e);
-        setPrimary(extractPrimary(m));
+        const flags = (m.llama_server_flags || {}) as Record<string, FlagValue>;
+        setFlagValues(flags);
+        setEnabledFlags(new Set(Object.keys(flags)));
         setRawJson(JSON.stringify(m, null, 2));
       } catch (ex: unknown) {
         setErr(String(ex));
@@ -101,7 +326,7 @@ function ModelEditor({
   }, [tag]);
 
   const onSave = useCallback(async () => {
-    if (!manifest || !primary) return;
+    if (!manifest) return;
     setSaving(true);
     setErr('');
     setOk('');
@@ -114,17 +339,35 @@ function ModelEditor({
           throw new Error(`Invalid JSON: ${String(jx)}`);
         }
       } else {
-        toSave = applyPrimary(manifest, primary);
+        // Rebuild llama_server_flags from enabled set + values
+        const newFlags: Record<string, unknown> = {};
+        enabledFlags.forEach((name) => {
+          const v = flagValues[name];
+          if (v !== undefined && v !== '' && v !== null) {
+            newFlags[name] = v;
+          }
+        });
+        // Also: context_size at manifest top-level mirrors flags.ctx_size
+        const ctxSize = (newFlags.ctx_size as number) ?? manifest.context_size ?? 4096;
+        toSave = {
+          ...manifest,
+          context_size: ctxSize,
+          llama_server_flags: newFlags,
+        };
       }
-      // Force model_tag to URL tag
       toSave.model_tag = tag;
       const res = await putManifest(tag, toSave, etag);
-      setOk(`Saved revision ${res.revision}.${res.restart_required ? ' Restart required.' : ' Hot-reload on next stage.'}`);
-      // Re-fetch to get new ETag
+      setOk(
+        `Saved revision ${res.revision}.${
+          res.restart_required ? ' Restart required.' : ' Hot-reload on next stage.'
+        }`,
+      );
       const { manifest: m2, etag: e2 } = await getManifest(tag);
       setManifest(m2);
       setEtag(e2);
-      setPrimary(extractPrimary(m2));
+      const flags2 = (m2.llama_server_flags || {}) as Record<string, FlagValue>;
+      setFlagValues(flags2);
+      setEnabledFlags(new Set(Object.keys(flags2)));
       setRawJson(JSON.stringify(m2, null, 2));
       onSaved();
     } catch (ex: unknown) {
@@ -132,9 +375,35 @@ function ModelEditor({
     } finally {
       setSaving(false);
     }
-  }, [manifest, primary, rawJson, rawMode, etag, tag, onSaved]);
+  }, [manifest, flagValues, enabledFlags, rawJson, rawMode, etag, tag, onSaved]);
 
-  if (!manifest || !primary) {
+  const onChangeFlag = useCallback((name: string, v: FlagValue) => {
+    setFlagValues((s) => ({ ...s, [name]: v }));
+  }, []);
+
+  const onToggleFlag = useCallback((name: string, en: boolean) => {
+    setEnabledFlags((s) => {
+      const ns = new Set(s);
+      if (en) {
+        ns.add(name);
+        // Seed default value if missing
+        const spec = FLAGS_SCHEMA.find((f) => f.name === name);
+        setFlagValues((v) =>
+          v[name] === undefined && spec?.default !== undefined
+            ? { ...v, [name]: spec.default as FlagValue }
+            : v,
+        );
+      } else {
+        ns.delete(name);
+      }
+      return ns;
+    });
+  }, []);
+
+  // Primary flags featured at top
+  const primaryFlags = useMemo(() => FLAGS_SCHEMA.filter((f) => f.primary), []);
+
+  if (!manifest) {
     return (
       <div className="rounded-lg border border-slate-700 bg-slate-900 p-4">
         <div className="flex items-center justify-between">
@@ -149,152 +418,94 @@ function ModelEditor({
   }
 
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-900 p-4 space-y-4">
-      <div className="flex items-center justify-between">
+    <div className="rounded-lg border border-slate-700 bg-slate-900 p-4 space-y-4 max-h-[80vh] overflow-y-auto">
+      <div className="flex items-center justify-between sticky top-0 bg-slate-900 -mx-4 px-4 pb-3 border-b border-slate-700 z-10">
         <div>
-          <h3 className="text-base font-semibold text-slate-100">Editing: {manifest.display_name || manifest.model_tag}</h3>
-          <p className="text-xs text-slate-400 font-mono">tag={manifest.model_tag} · rev={manifest.revision} · etag={etag}</p>
+          <h3 className="text-base font-semibold text-slate-100">
+            Editing: {manifest.display_name || manifest.model_tag}
+          </h3>
+          <p className="text-xs text-slate-400 font-mono">
+            tag={manifest.model_tag} · rev={manifest.revision} · etag={etag} · {enabledFlags.size}/{FLAGS_SCHEMA.length} flags set
+          </p>
         </div>
         <div className="flex gap-2 items-center">
           <button
             onClick={() => setRawMode((v) => !v)}
             className="px-3 py-1 rounded text-xs font-medium border border-slate-600 text-slate-300 hover:text-white hover:border-slate-400"
           >
-            {rawMode ? '← Primary fields' : 'Advanced (raw JSON) →'}
+            {rawMode ? '← Structured' : 'Raw JSON →'}
           </button>
-          <button onClick={onClose} className="text-slate-400 hover:text-white text-sm">close</button>
+          <button onClick={onClose} className="text-slate-400 hover:text-white text-sm px-2">close</button>
+          <button
+            onClick={onSave}
+            disabled={saving}
+            className="px-4 py-1.5 rounded text-xs font-semibold bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {saving ? 'Saving…' : 'Save manifest'}
+          </button>
         </div>
       </div>
 
-      {!rawMode ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <Field label="ctx_size" hint="Max context window (tokens). Bigger = more KV cache VRAM. Common: 4K/8K/32K/64K/128K">
-            <input
-              type="number"
-              min={1}
-              max={2_000_000}
-              value={primary.ctx_size}
-              onChange={(e) => setPrimary({ ...primary, ctx_size: parseInt(e.target.value || '0', 10) })}
-              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono"
-            />
-          </Field>
-
-          <Field label="n_gpu_layers" hint="Number of layers on GPU. 999 = all-on-GPU. 0 = CPU-only. -1 = auto.">
-            <input
-              type="number"
-              min={-1}
-              max={999}
-              value={typeof primary.n_gpu_layers === 'number' ? primary.n_gpu_layers : 999}
-              onChange={(e) => setPrimary({ ...primary, n_gpu_layers: parseInt(e.target.value || '0', 10) })}
-              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono"
-            />
-          </Field>
-
-          <Field label="temp" hint="Sampling temperature. 0.0 = deterministic. 0.7-1.0 common. >2.0 = chaos.">
-            <input
-              type="number"
-              min={0}
-              max={10}
-              step={0.05}
-              value={primary.temp}
-              onChange={(e) => setPrimary({ ...primary, temp: parseFloat(e.target.value || '0') })}
-              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono"
-            />
-          </Field>
-
-          <Field label="top_p" hint="Nucleus sampling. 1.0 = no truncation. 0.9-0.95 common.">
-            <input
-              type="number"
-              min={0}
-              max={1}
-              step={0.01}
-              value={primary.top_p}
-              onChange={(e) => setPrimary({ ...primary, top_p: parseFloat(e.target.value || '0') })}
-              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono"
-            />
-          </Field>
-
-          <Field label="cache_type_k (K cache quant)" hint="f16 = highest quality, biggest. q4_0 = quarter size, slight quality loss. q8_0 = half size, well-tested.">
-            <select
-              value={primary.cache_type_k}
-              onChange={(e) => setPrimary({ ...primary, cache_type_k: e.target.value })}
-              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono"
-            >
-              {KV_QUANT_OPTIONS.map((q) => (
-                <option key={q} value={q}>{q}</option>
-              ))}
-            </select>
-          </Field>
-
-          <Field label="cache_type_v (V cache quant)" hint="Match cache_type_k for symmetric quant. Mismatch is allowed but unusual.">
-            <select
-              value={primary.cache_type_v}
-              onChange={(e) => setPrimary({ ...primary, cache_type_v: e.target.value })}
-              className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono"
-            >
-              {KV_QUANT_OPTIONS.map((q) => (
-                <option key={q} value={q}>{q}</option>
-              ))}
-            </select>
-          </Field>
-        </div>
-      ) : (
-        <div className="space-y-2">
-          <p className="text-xs text-slate-400">
-            <span className="text-amber-300 font-semibold">Advanced mode:</span> raw JSON manifest editor.
-            Schema validated server-side. All ~80 SAFE_LLAMA_FLAGS + 22 DENIED_FLAGS gated.
-            Adds: rope_*, yarn_*, mirostat_*, dry_*, xtc_*, dynatemp_*, reasoning_*, embeddings, metrics, samplers...
-          </p>
-          <textarea
-            value={rawJson}
-            onChange={(e) => setRawJson(e.target.value)}
-            rows={20}
-            spellCheck={false}
-            className="w-full bg-slate-950 border border-slate-700 rounded p-3 text-xs text-slate-100 font-mono"
-          />
-        </div>
-      )}
-
       {err && (
-        <div className="px-3 py-2 rounded bg-red-950/40 border border-red-700 text-sm text-red-200">
+        <div className="px-3 py-2 rounded bg-red-950/40 border border-red-700 text-xs text-red-200 font-mono">
           ⚠ {err}
         </div>
       )}
       {ok && (
-        <div className="px-3 py-2 rounded bg-emerald-950/40 border border-emerald-700 text-sm text-emerald-200">
+        <div className="px-3 py-2 rounded bg-emerald-950/40 border border-emerald-700 text-xs text-emerald-200">
           ✓ {ok}
         </div>
       )}
 
-      <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
-        <button
-          onClick={onClose}
-          className="px-4 py-2 rounded text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800"
-          disabled={saving}
-        >
-          Cancel
-        </button>
-        <button
-          onClick={onSave}
-          disabled={saving}
-          className="px-4 py-2 rounded text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50"
-        >
-          {saving ? 'Saving…' : 'Save manifest'}
-        </button>
-      </div>
-    </div>
-  );
-}
+      {rawMode ? (
+        <div className="space-y-2">
+          <p className="text-xs text-slate-400">
+            <span className="text-amber-300 font-semibold">Raw JSON manifest:</span> bypasses structured form; pure server-side validation.
+          </p>
+          <textarea
+            value={rawJson}
+            onChange={(e) => setRawJson(e.target.value)}
+            rows={28}
+            spellCheck={false}
+            className="w-full bg-slate-950 border border-slate-700 rounded p-3 text-xs text-slate-100 font-mono"
+          />
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="rounded-md border border-emerald-900 bg-emerald-950/20 p-3">
+            <h4 className="text-xs font-semibold text-emerald-300 mb-2">★ Primary (most-edited)</h4>
+            {primaryFlags.map((spec) => (
+              <FlagInput
+                key={spec.name}
+                spec={spec}
+                value={flagValues[spec.name]}
+                enabled={enabledFlags.has(spec.name)}
+                onChange={(v) => onChangeFlag(spec.name, v)}
+                onToggle={(en) => onToggleFlag(spec.name, en)}
+              />
+            ))}
+          </div>
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return (
-    <label className="block">
-      <div className="flex items-baseline justify-between mb-1">
-        <span className="text-xs font-semibold text-slate-200 font-mono">{label}</span>
-      </div>
-      {children}
-      {hint && <p className="text-[10px] text-slate-500 mt-1">{hint}</p>}
-    </label>
+          {CATEGORY_ORDER.filter((c) => c !== 'Common').map((cat) => {
+            const flagsInCat = getFlagsByCategory(cat);
+            if (flagsInCat.length === 0) return null;
+            const hasSetInCat = flagsInCat.some((f) => enabledFlags.has(f.name));
+            return (
+              <CategorySection
+                key={cat}
+                cat={cat}
+                flags={flagsInCat}
+                values={flagValues}
+                enabledFlags={enabledFlags}
+                onChange={onChangeFlag}
+                onToggle={onToggleFlag}
+                defaultOpen={hasSetInCat}
+              />
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -362,8 +573,8 @@ export default function Models() {
         <div>
           <h2 className="text-xl font-bold text-slate-100">Models</h2>
           <p className="text-sm text-slate-400">
-            Per-model manifest editor. Edits hot-reload on the next stage; no restart required.
-            BE allowlist: ~80 SAFE_LLAMA_FLAGS · 50+ DENIED_FLAGS (path/RCE-class) · suffix-pattern forward-defense.
+            Per-model manifest editor — <strong>FE schema mirrors BE SAFE_LLAMA_FLAGS exactly</strong> ({FLAGS_SCHEMA.length} flags · 50+ DENIED_FLAGS path/RCE-class · suffix-pattern forward-defense · numeric bounds · chat_template Jinja-injection rejected).
+            Edits hot-reload on the next stage; no restart required.
           </p>
         </div>
         <button
