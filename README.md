@@ -42,6 +42,19 @@ Compatible with Ollama-shape clients:
 - `POST /api/import` -- import a local GGUF file
 - `GET /status` -- live queue + active + idle_hot snapshot
 
+## Setting up AI Agents
+
+Pointing an AI agent (Hermes, langchain, llama-index, LiteLLM, raw OpenAI SDK, Ollama clients, etc.) at Turbohaul is two lines:
+
+```yaml
+base_url: http://<turbohaul-host>:11401/v1
+api_key: dummy   # no auth required on the fleet-internal port
+```
+
+Turbohaul ships with sane defaults for multi-tool-call agent loops — `idle_hot_load_seconds=600`, `grace_seconds=30`, streaming SSE pass-through, tool-call field forwarding, and ACTIVE_MATCH warm-slot reuse for same-`thread_id` follow-ups (sub-second after the first turn).
+
+**Full guide:** [docs/AI_AGENT_SETUP.md](docs/AI_AGENT_SETUP.md) — per-agent config recipes (Hermes / OpenAI SDK / langchain / llama-index / LiteLLM / Ollama / curl), multi-tool-call workflow notes, production setup, validation smoke tests, and a troubleshooting table.
+
 ## License
 
 MIT (see LICENSE). All third-party deps audited MIT-compatible (see THIRD_PARTY_NOTICES.md).
