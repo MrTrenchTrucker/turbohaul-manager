@@ -1,5 +1,5 @@
 """Tests for TurbohaulQueue + GraceTimer + IdleHotTimer (v0.2 §5/§6)."""
-import asyncio
+
 import time
 
 import pytest

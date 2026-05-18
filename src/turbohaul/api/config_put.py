@@ -4,11 +4,11 @@ Security #58 F7 must-fix: runtime-mutable fields PUT-able; boot fields → HTTP 
 (prevents the binary-swap attack: PUT /api/config with runtime.llama_server_binary
 pointed at /tmp/evil.sh).
 """
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import ValidationError
 
 from turbohaul.config import RuntimeConfig
-
 
 router = APIRouter(prefix="/api", tags=["config"])
 
@@ -41,9 +41,7 @@ async def put_config(payload: dict, request: Request) -> dict:
     valid_sections = {"queue", "pull"}
     unknown = set(payload.keys()) - valid_sections
     if unknown:
-        raise HTTPException(
-            status_code=400, detail=f"unknown section(s): {sorted(unknown)}"
-        )
+        raise HTTPException(status_code=400, detail=f"unknown section(s): {sorted(unknown)}")
 
     mgr = request.app.state.manager
     current = mgr.runtime.model_dump(mode="json")
@@ -52,9 +50,7 @@ async def put_config(payload: dict, request: Request) -> dict:
     merged = dict(current)
     for section, sec_payload in payload.items():
         if not isinstance(sec_payload, dict):
-            raise HTTPException(
-                status_code=400, detail=f"section {section} must be object"
-            )
+            raise HTTPException(status_code=400, detail=f"section {section} must be object")
         merged[section] = {**current[section], **sec_payload}
 
     try:

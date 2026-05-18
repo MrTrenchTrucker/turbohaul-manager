@@ -1,13 +1,13 @@
 """Tests for safety guardrails (Cmdr #15653 + Wave 1.5-A KV-cache fit gate)."""
+
 from unittest.mock import patch
 
 from turbohaul.safety import (
-    GateResult,
     all_safety_gates,
     check_free_ram,
+    check_iowait,
     check_kv_cache_fit,
     check_load_avg,
-    check_iowait,
     estimate_kv_cache_mib,
 )
 
@@ -56,7 +56,8 @@ class TestCheckLoadAvg:
 class TestCheckIowait:
     def test_passes_no_probe_when_proc_stat_missing(self):
         with patch(
-            "turbohaul.safety._read_stat_iowait_jiffies", return_value=None,
+            "turbohaul.safety._read_stat_iowait_jiffies",
+            return_value=None,
         ):
             r = check_iowait(max_percent=30.0, sample_window_s=0.01)
         assert r.ok
@@ -153,7 +154,8 @@ class TestAllGatesAggregate:
     def test_returns_5_gates(self):
         with patch("turbohaul.safety._read_meminfo_kib", return_value={}):
             with patch(
-                "turbohaul.safety._read_free_vram_mib", return_value=None,
+                "turbohaul.safety._read_free_vram_mib",
+                return_value=None,
             ):
                 with patch(
                     "turbohaul.safety._read_stat_iowait_jiffies",

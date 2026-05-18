@@ -1,4 +1,5 @@
 """Tests for Slot + thread_id prefix-hash derivation (v0.2 §4, §6, §9)."""
+
 from turbohaul.slot import Slot, SlotState, derive_thread_id_prefix_hash
 
 

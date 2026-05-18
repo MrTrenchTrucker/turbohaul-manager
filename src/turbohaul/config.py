@@ -5,13 +5,13 @@ Per v0.2 ARCHITECTURE.md §7 + §7.1 - Security Reviewer #58 F7 must-fix.
 BootConfig fields require restart to change (server bind, storage paths, binary path).
 RuntimeConfig fields are mutable via PUT /api/config (queue timings, pull params).
 """
+
 import os
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-
 
 # Wave 4b.5: maximum honored client `keep_alive` value (advisor MSG 23 cap).
 # Module constant, not a QueueConfig field — operational policy, not per-deployment
@@ -31,7 +31,7 @@ class ServerConfig(BaseModel):
     @field_validator("host")
     @classmethod
     def host_safe_default(cls, v: str) -> str:
-        if v == "0.0.0.0":
+        if v == "0.0.0.0":  # noqa: S104 — guard rejecting public bind, not setting one
             raise ValueError(
                 "server.host cannot be 0.0.0.0 from yaml; set allow_public_bind: true "
                 "AND pass --allow-public-bind CLI flag explicitly to bind public"
@@ -106,7 +106,15 @@ class PullConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hf_api_key_env: str = "HF_API_KEY"
-    hf_host_allowlist: list[str] = Field(default_factory=lambda: ["huggingface.co", "hf.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.hf.co", "cdn-lfs-eu-1.hf.co"])
+    hf_host_allowlist: list[str] = Field(
+        default_factory=lambda: [
+            "huggingface.co",
+            "hf.co",
+            "cdn-lfs.huggingface.co",
+            "cdn-lfs-us-1.hf.co",
+            "cdn-lfs-eu-1.hf.co",
+        ]
+    )
     pull_url_https_only: bool = True
     pull_concurrency: int = Field(default=2, ge=1, le=16)
     pull_chunk_size_mb: int = Field(default=64, ge=1, le=1024)

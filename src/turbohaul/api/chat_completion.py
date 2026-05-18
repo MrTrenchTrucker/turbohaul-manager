@@ -20,6 +20,7 @@ need different client-facing status codes:
   - 500 Internal Server Error               → genuine Turbohaul bug (fallback)
   - 422 RESERVED for input-validation only (NOT used for upstream errors)
 """
+
 import asyncio
 import json
 import logging
@@ -28,9 +29,6 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-
-from turbohaul.config import KEEP_ALIVE_MAX_S  # re-exported for tests + manager
-
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -70,11 +68,7 @@ def parse_keep_alive(value: Any) -> int | None:
             return int(s)
         except ValueError:
             pass
-        if (
-            len(s) >= 2
-            and s[-1].lower() in _KEEP_ALIVE_UNITS
-            and s[:-1].lstrip("-").isdigit()
-        ):
+        if len(s) >= 2 and s[-1].lower() in _KEEP_ALIVE_UNITS and s[:-1].lstrip("-").isdigit():
             return int(s[:-1]) * _KEEP_ALIVE_UNITS[s[-1].lower()]
     return None
 
@@ -98,6 +92,7 @@ HEARTBEAT_INTERVAL_S = 12.0
 
 
 # === Wave 1.5-D typed upstream errors ===
+
 
 class SidecarUnavailableError(RuntimeError):
     """Sidecar process disconnected, crashed, or is otherwise unreachable.
@@ -162,9 +157,7 @@ async def openai_chat_completions(payload: dict, request: Request):
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="`messages` must be a non-empty list")
     # Best-effort prompt extraction for thread-id derivation
-    prompt = " ".join(
-        m.get("content", "") for m in messages if isinstance(m, dict)
-    )
+    prompt = " ".join(m.get("content", "") for m in messages if isinstance(m, dict))
     thread_id = payload.get("thread_id") or ""
     wants_stream = bool(payload.get("stream", False))
 
@@ -174,7 +167,13 @@ async def openai_chat_completions(payload: dict, request: Request):
     # to the client. The non-streaming path below is unchanged.
     if wants_stream:
         return await _openai_chat_completions_stream(
-            request, mgr, model, messages, prompt, thread_id, payload,
+            request,
+            mgr,
+            model,
+            messages,
+            prompt,
+            thread_id,
+            payload,
         )
 
     client_meta = {
@@ -245,13 +244,25 @@ async def openai_chat_completions(payload: dict, request: Request):
 # mirrors the non-streaming forwarder so reasoning/sampling parity holds.
 _STREAM_FORWARDED_KNOBS = (
     # Core OpenAI-compat
-    "temperature", "top_p", "top_k", "max_tokens", "min_p",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "min_p",
     # Wave 2.2: Hermes preserved-thinking controls
-    "thinking_budget_tokens", "reasoning_budget", "reasoning",
+    "thinking_budget_tokens",
+    "reasoning_budget",
+    "reasoning",
     # Wave 2.2: Ollama-parity samplers
-    "presence_penalty", "frequency_penalty", "repeat_penalty",
-    "repeat_last_n", "typical_p", "seed",
-    "mirostat", "mirostat_lr", "mirostat_ent",
+    "presence_penalty",
+    "frequency_penalty",
+    "repeat_penalty",
+    "repeat_last_n",
+    "typical_p",
+    "seed",
+    "mirostat",
+    "mirostat_lr",
+    "mirostat_ent",
     # Wave 2.2: max-output alias
     "n_predict",
     # Wave 4b-light: tool-call pass-through (minimal — full capability
@@ -260,8 +271,11 @@ _STREAM_FORWARDED_KNOBS = (
     # that supports tool_calls natively, e.g. Qwen3.6-27b-dense"). llama-server
     # mirrors OpenAI's schema, so structured values (list/dict/string) just
     # pass through unchanged.
-    "tools", "tool_choice", "parallel_tool_calls",
-    "function_call", "functions",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "function_call",
+    "functions",
 )
 
 
@@ -391,7 +405,7 @@ async def _openai_chat_completions_stream(
                         asyncio.shield(ready_task),
                         timeout=min(HEARTBEAT_INTERVAL_S, remaining),
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     if not ready_task.done():
                         yield b": keep-alive\n\n"
 
@@ -409,7 +423,10 @@ async def _openai_chat_completions_stream(
 
             async with httpx.AsyncClient(timeout=STREAM_TIMEOUT_S) as client:
                 async with client.stream(
-                    "POST", url, json=stream_payload, timeout=STREAM_TIMEOUT_S,
+                    "POST",
+                    url,
+                    json=stream_payload,
+                    timeout=STREAM_TIMEOUT_S,
                 ) as r:
                     # raise_for_status is NOT auto-called by httpx.stream;
                     # the body may not be loaded yet so we read it manually if
@@ -459,12 +476,14 @@ async def _openai_chat_completions_stream(
             # additional frames after cancellation (the connection is dead).
             log.info(
                 "client disconnect during stream slot=%s thread=%s",
-                slot.slot_id, slot.thread_id,
+                slot.slot_id,
+                slot.thread_id,
             )
             raise
         except Exception as e:  # pragma: no cover — defensive
             log.exception(
-                "unexpected error in stream_gen slot=%s", slot.slot_id,
+                "unexpected error in stream_gen slot=%s",
+                slot.slot_id,
             )
             yield _stream_error_frame("internal_error", str(e))
             yield b"data: [DONE]\n\n"
@@ -626,6 +645,7 @@ def make_llama_server_complete_fn(
     Used by main.py to wire the production completion_fn. Tests typically inject
     a simpler fake instead.
     """
+
     async def _complete(slot, handle):
         client_meta = slot.client_meta or {}
         messages = client_meta.get("messages")
@@ -642,13 +662,25 @@ def make_llama_server_complete_fn(
         # sampling knobs (presence/frequency/seed/repeat_penalty + mirostat trio).
         for k in (
             # Core OpenAI-compat
-            "temperature", "top_p", "top_k", "max_tokens", "min_p",
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "min_p",
             # Wave 2.2: Hermes preserved-thinking controls
-            "thinking_budget_tokens", "reasoning_budget", "reasoning",
+            "thinking_budget_tokens",
+            "reasoning_budget",
+            "reasoning",
             # Wave 2.2: Ollama-parity samplers (clients sending these get them honored)
-            "presence_penalty", "frequency_penalty", "repeat_penalty",
-            "repeat_last_n", "typical_p", "seed",
-            "mirostat", "mirostat_lr", "mirostat_ent",
+            "presence_penalty",
+            "frequency_penalty",
+            "repeat_penalty",
+            "repeat_last_n",
+            "typical_p",
+            "seed",
+            "mirostat",
+            "mirostat_lr",
+            "mirostat_ent",
             # Wave 2.2: alias for max output budget (some clients send n_predict)
             "n_predict",
         ):
@@ -677,9 +709,15 @@ def make_llama_server_complete_fn(
                 upstream_status=e.response.status_code,
                 upstream_body=e.response.text,
             ) from e
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError,
-                httpx.ConnectError, httpx.NetworkError, httpx.CloseError,
-                httpx.ProtocolError) as e:
+        except (
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.ConnectError,
+            httpx.NetworkError,
+            httpx.CloseError,
+            httpx.ProtocolError,
+        ) as e:
             # Sidecar disconnected / crashed / port closed. Most often
             # KV-cache OOM mid-response per RELAY's stress observations.
             # Convert to 503 + Retry-After. (Wave 1.5-D DAG synthesis.)
@@ -688,7 +726,7 @@ def make_llama_server_complete_fn(
                 cause="sidecar_disconnected_or_crashed",
                 retry_after_s=30,
             ) from e
-        except (httpx.TimeoutException,) as e:
+        except httpx.TimeoutException as e:
             # Includes ConnectTimeout, ReadTimeout, WriteTimeout, PoolTimeout.
             raise SidecarTimeoutError(
                 f"sidecar request timed out after {timeout_s}s: {type(e).__name__}",

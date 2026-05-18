@@ -3,6 +3,7 @@
 GET/PUT /api/manifests/{tag} with ETag/If-Match concurrency control + closed flag
 allowlist enforcement (Security #58 F1 + F2 must-fixes).
 """
+
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from pydantic import ValidationError
 
@@ -11,12 +12,10 @@ from turbohaul.manifest import (
     Manifest,
     ManifestValidationError,
     delete_manifest,
-    manifest_etag,
     read_manifest,
     validate_tag,
     write_manifest_atomic,
 )
-
 
 router = APIRouter(prefix="/api/manifests", tags=["manifests"])
 
@@ -68,9 +67,7 @@ async def put_manifest(
 
     mgr = request.app.state.manager
     try:
-        written = write_manifest_atomic(
-            mgr.boot.storage.manifests_path, manifest, if_match=if_match
-        )
+        written = write_manifest_atomic(mgr.boot.storage.manifests_path, manifest, if_match=if_match)
     except ConcurrencyError as e:
         raise HTTPException(status_code=412, detail=str(e)) from e
     except ManifestValidationError as e:

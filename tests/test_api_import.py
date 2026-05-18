@@ -1,4 +1,5 @@
 """Tests for /api/import + DELETE /api/delete (Wave 15, v0.2 §9.2 + §12.1)."""
+
 import hashlib
 import os
 from pathlib import Path
@@ -142,9 +143,7 @@ class TestImportHappyPath:
         app, client, storage = app_test
         f = storage / "import-staging" / "m.gguf"
         _make_gguf_file(f, b"data")
-        r = client.post(
-            "/api/import", json={"path": str(f), "expected_sha256": "f" * 64}
-        )
+        r = client.post("/api/import", json={"path": str(f), "expected_sha256": "f" * 64})
         assert r.status_code == 400
 
 
@@ -170,9 +169,7 @@ class TestDeleteRoute:
         contents = _make_gguf_file(f, b"y")
         r1 = client.post("/api/import", json={"path": str(f)})
         sha = r1.json()["sha256"]
-        r2 = client.request(
-            "DELETE", "/api/delete", json={"digest": "sha256:" + sha}
-        )
+        r2 = client.request("DELETE", "/api/delete", json={"digest": "sha256:" + sha})
         assert r2.status_code == 200
 
     def test_delete_400_missing_sha(self, app_test):

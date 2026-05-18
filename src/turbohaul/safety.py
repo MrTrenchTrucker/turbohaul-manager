@@ -11,6 +11,7 @@ All gates degrade gracefully: if the underlying probe is unavailable
 gate returns "passed-no-probe" rather than blocking the spawn. Cmdr can
 disable the whole subsystem via runtime.queue.safety_enabled = False.
 """
+
 from __future__ import annotations
 
 import logging
@@ -20,7 +21,6 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +61,8 @@ def check_free_ram(min_free_mib: int) -> GateResult:
     avail_mib = avail_kib // 1024
     if avail_mib < min_free_mib:
         return GateResult(
-            "ram", False,
+            "ram",
+            False,
             f"only {avail_mib} MiB free; need >= {min_free_mib} MiB",
         )
     return GateResult("ram", True, f"{avail_mib} MiB free")
@@ -77,11 +78,14 @@ def check_load_avg(max_per_core: float) -> GateResult:
     per_core = load1 / cpus
     if per_core > max_per_core:
         return GateResult(
-            "cpu_load", False,
+            "cpu_load",
+            False,
             f"1min-load-per-core={per_core:.2f} > max {max_per_core:.2f}",
         )
     return GateResult(
-        "cpu_load", True, f"1min-load-per-core={per_core:.2f}",
+        "cpu_load",
+        True,
+        f"1min-load-per-core={per_core:.2f}",
     )
 
 
@@ -124,7 +128,8 @@ def check_iowait(max_percent: float, sample_window_s: float = 0.4) -> GateResult
     pct = 100.0 * d_iowait / d_total
     if pct > max_percent:
         return GateResult(
-            "iowait", False,
+            "iowait",
+            False,
             f"iowait {pct:.1f}% > max {max_percent:.1f}%",
         )
     return GateResult("iowait", True, f"iowait {pct:.1f}%")
@@ -133,12 +138,13 @@ def check_iowait(max_percent: float, sample_window_s: float = 0.4) -> GateResult
 def _read_free_vram_mib() -> int | None:
     """Query nvidia-smi for GPU 0 free memory in MiB. None if unavailable."""
     try:
-        out = subprocess.check_output(
+        out = subprocess.check_output(  # noqa: S603 — argv is constant, no shell
             [
                 _NVIDIA_SMI_PATH,
                 "--query-gpu=memory.free",
                 "--format=csv,noheader,nounits",
-                "-i", "0",
+                "-i",
+                "0",
             ],
             text=True,
             timeout=5,
@@ -166,12 +172,13 @@ def check_free_vram(min_free_mib: int, manifest_expected_bytes: int = 0) -> Gate
     threshold = max(min_free_mib, expected_mib)
     if free_mib < threshold:
         return GateResult(
-            "vram", False,
-            f"only {free_mib} MiB free; need >= {threshold} MiB "
-            f"(min_floor={min_free_mib}, manifest={expected_mib})",
+            "vram",
+            False,
+            f"only {free_mib} MiB free; need >= {threshold} MiB (min_floor={min_free_mib}, manifest={expected_mib})",
         )
     return GateResult(
-        "vram", True,
+        "vram",
+        True,
         f"{free_mib} MiB free (threshold {threshold})",
     )
 
@@ -248,14 +255,16 @@ def check_kv_cache_fit(
     total_mib = gguf_mib + kv_mib + overhead_mib
     if total_mib > free_mib:
         return GateResult(
-            "kv_cache_fit", False,
+            "kv_cache_fit",
+            False,
             f"need ~{total_mib} MiB "
             f"(body={gguf_mib} + KV@ctx{ctx_size}={kv_mib} "
             f"[{kv_cache_quant}] + overhead={overhead_mib}); "
             f"only {free_mib} MiB free",
         )
     return GateResult(
-        "kv_cache_fit", True,
+        "kv_cache_fit",
+        True,
         f"need ~{total_mib} MiB / {free_mib} free "
         f"(body={gguf_mib} KV={kv_mib} overhead={overhead_mib} quant={kv_cache_quant})",
     )
@@ -289,7 +298,8 @@ def all_safety_gates(
         check_free_ram(min_free_ram_mib),
         check_free_vram(min_free_vram_mib, manifest_expected_vram_bytes),
         check_kv_cache_fit(
-            ctx_size, gguf_size_bytes,
+            ctx_size,
+            gguf_size_bytes,
             overhead_mib=kv_cache_overhead_mib,
             kv_cache_quant=kv_cache_quant,
         ),

@@ -7,12 +7,12 @@ Subscribers receive STATE-level events only:
 
 NEVER broadcasts: prompt text, response text, stderr lines, full thread_ids, IPs.
 """
+
 import asyncio
 import logging
 
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
-
 
 log = logging.getLogger(__name__)
 router = APIRouter()

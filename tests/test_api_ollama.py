@@ -1,4 +1,5 @@
 """Tests for Ollama-compat read-only routes (Wave 8)."""
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -14,7 +15,6 @@ from turbohaul.config import (
     UIConfig,
 )
 from turbohaul.manifest import Manifest, write_manifest_atomic
-
 
 SAMPLE_SHA = "f" * 64
 SECOND_SHA = "e" * 64

@@ -1,4 +1,5 @@
 """Tests for FastAPI app skeleton (v0.2 §9) + Phase 5 §11 UI mount."""
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -60,12 +61,8 @@ def app_and_client_with_ui(tmp_path):
         encoding="utf-8",
     )
     (ui_dist / "assets").mkdir()
-    (ui_dist / "assets" / "index-DEADBEEF.js").write_text(
-        'console.log("turbohaul");', encoding="utf-8"
-    )
-    (ui_dist / "assets" / "index-CAFEBABE.css").write_text(
-        "body{color:white}", encoding="utf-8"
-    )
+    (ui_dist / "assets" / "index-DEADBEEF.js").write_text('console.log("turbohaul");', encoding="utf-8")
+    (ui_dist / "assets" / "index-CAFEBABE.css").write_text("body{color:white}", encoding="utf-8")
 
     boot = BootConfig(
         server=ServerConfig(),
@@ -137,7 +134,7 @@ class TestApiConfig:
         assert "ui" in body
         assert "queue" in body
         assert body["queue"]["grace_seconds"] == 30
-        assert body["queue"]["idle_hot_load_seconds"] == 120
+        assert body["queue"]["idle_hot_load_seconds"] == 600
         assert "pull" in body
         assert body["pull"]["pull_url_https_only"] is True
 
@@ -147,6 +144,7 @@ class TestAppCreation:
         app, client = app_and_client
         assert hasattr(app.state, "manager")
         from turbohaul.manager import TurbohaulManager
+
         assert isinstance(app.state.manager, TurbohaulManager)
 
     def test_unknown_endpoint_404(self, app_and_client):
@@ -275,7 +273,6 @@ class TestUIPathTraversal:
         assert b"root:" not in r.content
 
 
-
 class TestProductionWiring:
     """Asserts create_app() injects real factory functions into TurbohaulManager.
 
@@ -300,14 +297,13 @@ class TestProductionWiring:
         """
         app, _ = app_and_client
         mgr = app.state.manager
-        assert mgr._complete_fn is not None, (
-            "TurbohaulManager._complete_fn is None — create_app() didn't wire it"
-        )
+        assert mgr._complete_fn is not None, "TurbohaulManager._complete_fn is None — create_app() didn't wire it"
         # The default no-op (manager.py default) is identifiable by its docstring
         # containing the 'no completion_fn wired' sentinel raise. The production
         # injection wraps the httpx forwarder factory — check it does NOT raise
         # the wiring-missing sentinel when introspected.
         import inspect
+
         src = inspect.getsource(mgr._complete_fn) if callable(mgr._complete_fn) else ""
         assert "no completion_fn wired" not in src, (
             "create_app() injected the DEFAULT no-op complete_fn, not the real "

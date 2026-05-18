@@ -1,5 +1,5 @@
 """Tests for subprocess_mgr (mocked Popen + httpx + nvidia-smi + killpg)."""
-import asyncio
+
 import hashlib
 import signal
 from pathlib import Path
@@ -80,9 +80,7 @@ class TestSpawn:
         def fake_popen(*a, **k):
             return _make_fake_proc(pid=99)
 
-        handle = spawn_sidecar(
-            Path("/x"), Path("/y"), 11500, "model-a", [], popen_factory=fake_popen
-        )
+        handle = spawn_sidecar(Path("/x"), Path("/y"), 11500, "model-a", [], popen_factory=fake_popen)
         assert isinstance(handle, SidecarHandle)
         assert handle.port == 11500
         assert handle.model_tag == "model-a"
@@ -134,6 +132,7 @@ class TestHealthCheck:
 
     async def test_health_check_network_error_returns_none(self):
         import httpx
+
         mock_client = MagicMock()
         mock_client.get = AsyncMock(side_effect=httpx.ConnectError("conn refused"))
         assert await health_check_once(11500, mock_client) is None
@@ -169,6 +168,7 @@ class TestGpuMemoryRead:
     def test_get_gpu_memory_handles_nvidia_smi_missing(self):
         def runner():
             raise FileNotFoundError("nvidia-smi")
+
         assert get_gpu_memory_used_mib(runner) is None
 
     def test_get_gpu_memory_csv_with_comma(self):
@@ -264,10 +264,12 @@ class TestDrainedSigterm:
     async def test_cold_uses_shorter_window(self):
         """Cold slot uses cold_window_s (5s default) not drained_window_s (15s)."""
         killpg_calls = []
+
         def killpg_fn(pgid, sig):
             killpg_calls.append((pgid, sig))
 
         poll_count = [0]
+
         def poll_side_effect():
             poll_count[0] += 1
             return None if poll_count[0] < 5 else 0

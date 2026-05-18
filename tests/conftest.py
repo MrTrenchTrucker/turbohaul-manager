@@ -1,8 +1,9 @@
 """Pytest fixtures shared across the test suite."""
-import os
+
 import tempfile
-import pytest
 from pathlib import Path
+
+import pytest
 
 
 @pytest.fixture

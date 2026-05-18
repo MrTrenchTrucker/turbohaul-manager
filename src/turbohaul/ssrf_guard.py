@@ -7,11 +7,11 @@ Per Security Reviewer #58 F3 CRITICAL must-fix. Defends against:
   - DNS rebinding → resolve-once + peer-IP verify (caller responsibility)
   - HF_API_KEY exfil to non-HF hosts → host allowlist
 """
+
 import ipaddress
 import logging
 import socket
 from urllib.parse import urlparse
-
 
 log = logging.getLogger(__name__)
 
@@ -25,26 +25,26 @@ ALLOWED_SCHEMES: set[str] = {"https"}
 
 # Private + link-local + reserved IP ranges (IPv4 + IPv6)
 DENY_IPV4_NETWORKS: list[ipaddress.IPv4Network] = [
-    ipaddress.IPv4Network("10.0.0.0/8"),     # RFC1918 + ZeroTier (10.244/16 subset)
+    ipaddress.IPv4Network("10.0.0.0/8"),  # RFC1918 + ZeroTier (10.244/16 subset)
     ipaddress.IPv4Network("172.16.0.0/12"),  # RFC1918
-    ipaddress.IPv4Network("192.168.0.0/16"), # RFC1918
-    ipaddress.IPv4Network("127.0.0.0/8"),    # loopback
-    ipaddress.IPv4Network("169.254.0.0/16"), # link-local (IMDS lives here)
+    ipaddress.IPv4Network("192.168.0.0/16"),  # RFC1918
+    ipaddress.IPv4Network("127.0.0.0/8"),  # loopback
+    ipaddress.IPv4Network("169.254.0.0/16"),  # link-local (IMDS lives here)
     ipaddress.IPv4Network("100.64.0.0/10"),  # CGNAT
-    ipaddress.IPv4Network("0.0.0.0/8"),      # "this network"
-    ipaddress.IPv4Network("224.0.0.0/4"),    # multicast
-    ipaddress.IPv4Network("240.0.0.0/4"),    # reserved
+    ipaddress.IPv4Network("0.0.0.0/8"),  # "this network"
+    ipaddress.IPv4Network("224.0.0.0/4"),  # multicast
+    ipaddress.IPv4Network("240.0.0.0/4"),  # reserved
 ]
 
 DENY_IPV6_NETWORKS: list[ipaddress.IPv6Network] = [
-    ipaddress.IPv6Network("::1/128"),         # loopback
-    ipaddress.IPv6Network("fc00::/7"),        # unique-local
-    ipaddress.IPv6Network("fe80::/10"),       # link-local
-    ipaddress.IPv6Network("ff00::/8"),        # multicast
-    ipaddress.IPv6Network("64:ff9b::/96"),    # NAT64 (RC-D7EFD0 bypass class)
-    ipaddress.IPv6Network("::/96"),           # IPv4-compat IPv6 (RC-D7EFD0)
-    ipaddress.IPv6Network("::ffff:0:0/96"),   # IPv4-mapped IPv6
-    ipaddress.IPv6Network("2001:db8::/32"),   # documentation
+    ipaddress.IPv6Network("::1/128"),  # loopback
+    ipaddress.IPv6Network("fc00::/7"),  # unique-local
+    ipaddress.IPv6Network("fe80::/10"),  # link-local
+    ipaddress.IPv6Network("ff00::/8"),  # multicast
+    ipaddress.IPv6Network("64:ff9b::/96"),  # NAT64 (RC-D7EFD0 bypass class)
+    ipaddress.IPv6Network("::/96"),  # IPv4-compat IPv6 (RC-D7EFD0)
+    ipaddress.IPv6Network("::ffff:0:0/96"),  # IPv4-mapped IPv6
+    ipaddress.IPv6Network("2001:db8::/32"),  # documentation
 ]
 
 
@@ -95,9 +95,7 @@ def validate_pull_url(url: str) -> tuple[str, str]:
     """
     parsed = urlparse(url)
     if parsed.scheme not in ALLOWED_SCHEMES:
-        raise UrlSafetyError(
-            f"scheme {parsed.scheme!r} not in {ALLOWED_SCHEMES} (only https:// allowed)"
-        )
+        raise UrlSafetyError(f"scheme {parsed.scheme!r} not in {ALLOWED_SCHEMES} (only https:// allowed)")
     if not parsed.hostname:
         raise UrlSafetyError("URL missing hostname")
 
@@ -112,9 +110,7 @@ def validate_pull_url(url: str) -> tuple[str, str]:
 
     if ip_literal is not None:
         if is_blocked_ip(str(ip_literal)):
-            raise UrlSafetyError(
-                f"URL host is IP literal {parsed.hostname} in denied range"
-            )
+            raise UrlSafetyError(f"URL host is IP literal {parsed.hostname} in denied range")
         return parsed.hostname, str(ip_literal)
 
     resolved = resolve_safely(parsed.hostname)

@@ -1,8 +1,9 @@
 """Tests for the CLI entry point (src/turbohaul/__main__.py)."""
+
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -74,9 +75,7 @@ class TestMain:
         rc = main(["--config", str(tmp_path / "nope.yaml")])
         assert rc == 2
 
-    def test_main_loads_config_and_invokes_uvicorn(
-        self, write_minimal_yaml, monkeypatch
-    ):
+    def test_main_loads_config_and_invokes_uvicorn(self, write_minimal_yaml, monkeypatch):
         """main() must reach uvicorn.run with host from BootConfig (no public bind)."""
         called = {}
 
@@ -91,19 +90,20 @@ class TestMain:
         assert called["host"] == "127.0.0.1"
         assert called["port"] == 11401
 
-    def test_main_allow_public_bind_overrides_host(
-        self, write_minimal_yaml
-    ):
+    def test_main_allow_public_bind_overrides_host(self, write_minimal_yaml):
         called = {}
 
         def fake_run(app, **kwargs):
             called["host"] = kwargs.get("host")
 
         with patch("turbohaul.__main__.uvicorn.run", side_effect=fake_run):
-            rc = main([
-                "--config", str(write_minimal_yaml),
-                "--allow-public-bind",
-            ])
+            rc = main(
+                [
+                    "--config",
+                    str(write_minimal_yaml),
+                    "--allow-public-bind",
+                ]
+            )
         assert rc == 0
         assert called["host"] == "0.0.0.0"
 
@@ -114,8 +114,12 @@ class TestMain:
             called["log_level"] = kwargs.get("log_level")
 
         with patch("turbohaul.__main__.uvicorn.run", side_effect=fake_run):
-            main([
-                "--config", str(write_minimal_yaml),
-                "--log-level", "debug",
-            ])
+            main(
+                [
+                    "--config",
+                    str(write_minimal_yaml),
+                    "--log-level",
+                    "debug",
+                ]
+            )
         assert called["log_level"] == "debug"

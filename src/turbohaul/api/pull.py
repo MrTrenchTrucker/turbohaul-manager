@@ -7,10 +7,11 @@ POST /api/pull — Ollama registry (501 stub; Phase 5+ implements manifest+layer
 All streaming pulls land via write_stream_atomic_async with per_stream_max_bytes
 ceiling. Progress events emit to /ws/state via mgr.event_bus.
 """
+
 import logging
 import os
 import secrets
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -22,7 +23,6 @@ from turbohaul.blob_store import (
     write_stream_atomic_async,
 )
 from turbohaul.ssrf_guard import UrlSafetyError, is_hf_host, validate_pull_url
-
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["pull"])
@@ -55,8 +55,7 @@ def _double_resolve_check(url: str) -> tuple[str, str]:
     host2, ip2 = validate_pull_url(url)
     if host1 != host2 or ip1 != ip2:
         raise UrlSafetyError(
-            f"DNS rebind class detected: validate#1 ({host1}->{ip1}) != "
-            f"validate#2 ({host2}->{ip2}). Refusing pull."
+            f"DNS rebind class detected: validate#1 ({host1}->{ip1}) != validate#2 ({host2}->{ip2}). Refusing pull."
         )
     return host1, ip1
 
@@ -97,27 +96,16 @@ async def _stream_with_redirects(
     for hop in range(max_hops):
         host, _ip = _double_resolve_check(current_url)
         if allowlist_check is not None and not allowlist_check(host):
-            raise UrlSafetyError(
-                f"redirect host {host} not in allowlist (hop={hop})"
-            )
+            raise UrlSafetyError(f"redirect host {host} not in allowlist (hop={hop})")
         if prev_host is not None and host != prev_host:
-            current_headers = {
-                k: v
-                for k, v in current_headers.items()
-                if k.lower() != "authorization"
-            }
-        async with client.stream(
-            "GET", current_url, headers=current_headers
-        ) as resp:
+            current_headers = {k: v for k, v in current_headers.items() if k.lower() != "authorization"}
+        async with client.stream("GET", current_url, headers=current_headers) as resp:
             location = None
             try:
                 location = resp.headers.get("location")
             except AttributeError:
                 location = None
-            if (
-                300 <= resp.status_code < 400
-                and location
-            ):
+            if 300 <= resp.status_code < 400 and location:
                 next_url = urljoin(current_url, location)
                 prev_host = host
                 current_url = next_url
@@ -126,9 +114,7 @@ async def _stream_with_redirects(
             async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
                 yield chunk
             return
-    raise UrlSafetyError(
-        f"too many redirects (>{max_hops}) starting from {url}"
-    )
+    raise UrlSafetyError(f"too many redirects (>{max_hops}) starting from {url}")
 
 
 def _http_client_factory_from_app(app):
@@ -154,9 +140,7 @@ async def pull_url(payload: dict, request: Request) -> dict:
     mgr = request.app.state.manager
     blobs_root = mgr.boot.storage.blob_store_path
     pull_id = "pull-" + secrets.token_hex(8)
-    mgr.event_bus.publish_nowait(
-        {"event": "pull_url_started", "pull_id": pull_id, "host": host}
-    )
+    mgr.event_bus.publish_nowait({"event": "pull_url_started", "pull_id": pull_id, "host": host})
 
     factory = _http_client_factory_from_app(request.app)
     try:
@@ -168,24 +152,16 @@ async def pull_url(payload: dict, request: Request) -> dict:
                 per_stream_max_bytes=mgr.runtime.pull.per_stream_max_bytes,
             )
     except BlobSizeExceeded as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "pull_url_failed", "pull_id": pull_id, "reason": "size-exceeded"}
-        )
+        mgr.event_bus.publish_nowait({"event": "pull_url_failed", "pull_id": pull_id, "reason": "size-exceeded"})
         raise HTTPException(status_code=413, detail=str(e)) from e
     except BlobHashMismatch as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "pull_url_failed", "pull_id": pull_id, "reason": "hash-mismatch"}
-        )
+        mgr.event_bus.publish_nowait({"event": "pull_url_failed", "pull_id": pull_id, "reason": "hash-mismatch"})
         raise HTTPException(status_code=400, detail=str(e)) from e
     except BlobError as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "pull_url_failed", "pull_id": pull_id, "reason": "blob-error"}
-        )
+        mgr.event_bus.publish_nowait({"event": "pull_url_failed", "pull_id": pull_id, "reason": "blob-error"})
         raise HTTPException(status_code=500, detail=str(e)) from e
     except httpx.HTTPError as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "pull_url_failed", "pull_id": pull_id, "reason": "upstream-error"}
-        )
+        mgr.event_bus.publish_nowait({"event": "pull_url_failed", "pull_id": pull_id, "reason": "upstream-error"})
         raise HTTPException(status_code=502, detail=f"upstream HTTP error: {e}") from e
 
     mgr.event_bus.publish_nowait(
@@ -220,9 +196,7 @@ async def pull_hf(payload: dict, request: Request) -> dict:
     revision = payload.get("revision", "main")
     expected_sha256 = payload.get("expected_sha256")
     if not repo_id or not filename:
-        raise HTTPException(
-            status_code=400, detail="`repo_id` + `filename` required"
-        )
+        raise HTTPException(status_code=400, detail="`repo_id` + `filename` required")
     # Build canonical HF URL
     url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
 
@@ -237,8 +211,7 @@ async def pull_hf(payload: dict, request: Request) -> dict:
     if not is_hf_host(host, allowlist):
         raise HTTPException(
             status_code=403,
-            detail=f"host {host} not in hf_host_allowlist (Security F3 - "
-            "HF_API_KEY only sent to allowlisted hosts)",
+            detail=f"host {host} not in hf_host_allowlist (Security F3 - HF_API_KEY only sent to allowlisted hosts)",
         )
 
     hf_key_env = mgr.runtime.pull.hf_api_key_env
@@ -273,24 +246,16 @@ async def pull_hf(payload: dict, request: Request) -> dict:
                 per_stream_max_bytes=mgr.runtime.pull.per_stream_max_bytes,
             )
     except BlobSizeExceeded as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "pull_hf_failed", "pull_id": pull_id, "reason": "size-exceeded"}
-        )
+        mgr.event_bus.publish_nowait({"event": "pull_hf_failed", "pull_id": pull_id, "reason": "size-exceeded"})
         raise HTTPException(status_code=413, detail=str(e)) from e
     except BlobHashMismatch as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "pull_hf_failed", "pull_id": pull_id, "reason": "hash-mismatch"}
-        )
+        mgr.event_bus.publish_nowait({"event": "pull_hf_failed", "pull_id": pull_id, "reason": "hash-mismatch"})
         raise HTTPException(status_code=400, detail=str(e)) from e
     except BlobError as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "pull_hf_failed", "pull_id": pull_id, "reason": "blob-error"}
-        )
+        mgr.event_bus.publish_nowait({"event": "pull_hf_failed", "pull_id": pull_id, "reason": "blob-error"})
         raise HTTPException(status_code=500, detail=str(e)) from e
     except httpx.HTTPError as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "pull_hf_failed", "pull_id": pull_id, "reason": "upstream-error"}
-        )
+        mgr.event_bus.publish_nowait({"event": "pull_hf_failed", "pull_id": pull_id, "reason": "upstream-error"})
         raise HTTPException(status_code=502, detail=str(e)) from e
 
     mgr.event_bus.publish_nowait(

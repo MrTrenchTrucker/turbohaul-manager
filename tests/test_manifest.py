@@ -1,4 +1,5 @@
 """Tests for manifest schema + atomic write + ETag/If-Match concurrency (v0.2 §8.1+§8.2)."""
+
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 

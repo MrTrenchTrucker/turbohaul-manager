@@ -1,4 +1,5 @@
 """Tests for state machine transitions (v0.2 §6)."""
+
 import pytest
 
 from turbohaul.fsm import (
@@ -87,9 +88,14 @@ class TestLegalTransitions:
         """IDLE_HOT → POPPED → STAGED (different model swap)."""
         s = Slot.new("m")
         for target in [
-            SlotState.STAGED, SlotState.LOADING, SlotState.ACTIVE,
-            SlotState.GRACE, SlotState.POPPED, SlotState.IDLE_HOT,
-            SlotState.POPPED, SlotState.STAGED,
+            SlotState.STAGED,
+            SlotState.LOADING,
+            SlotState.ACTIVE,
+            SlotState.GRACE,
+            SlotState.POPPED,
+            SlotState.IDLE_HOT,
+            SlotState.POPPED,
+            SlotState.STAGED,
         ]:
             transition(s, target)
 
@@ -97,8 +103,12 @@ class TestLegalTransitions:
         """IDLE_HOT → ACTIVE (fresh request for same model_tag)."""
         s = Slot.new("m")
         for target in [
-            SlotState.STAGED, SlotState.LOADING, SlotState.ACTIVE,
-            SlotState.GRACE, SlotState.POPPED, SlotState.IDLE_HOT,
+            SlotState.STAGED,
+            SlotState.LOADING,
+            SlotState.ACTIVE,
+            SlotState.GRACE,
+            SlotState.POPPED,
+            SlotState.IDLE_HOT,
             SlotState.ACTIVE,
         ]:
             transition(s, target)
@@ -169,8 +179,12 @@ class TestIsTerminal:
 class TestIsWarmState:
     def test_warm_states(self):
         for st in [
-            SlotState.LOADING, SlotState.ACTIVE, SlotState.GRACE,
-            SlotState.GRACE_BUSY, SlotState.ACTIVE_MATCH, SlotState.IDLE_HOT,
+            SlotState.LOADING,
+            SlotState.ACTIVE,
+            SlotState.GRACE,
+            SlotState.GRACE_BUSY,
+            SlotState.ACTIVE_MATCH,
+            SlotState.IDLE_HOT,
         ]:
             assert is_warm_state(st) is True
 
@@ -186,8 +200,7 @@ class TestIsRequestInFlight:
         assert is_request_in_flight(SlotState.ACTIVE_MATCH) is True
 
     def test_not_in_flight(self):
-        for st in [SlotState.STAGED, SlotState.LOADING, SlotState.GRACE,
-                   SlotState.IDLE_HOT, SlotState.COLD]:
+        for st in [SlotState.STAGED, SlotState.LOADING, SlotState.GRACE, SlotState.IDLE_HOT, SlotState.COLD]:
             assert is_request_in_flight(st) is False
 
 

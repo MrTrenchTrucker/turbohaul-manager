@@ -1,6 +1,6 @@
 """Tests for TurbohaulManager (mocked subprocess/GPU; foundations only - worker_loop in Wave 6)."""
+
 import asyncio
-from pathlib import Path
 
 import pytest
 
@@ -15,7 +15,6 @@ from turbohaul.config import (
     UIConfig,
 )
 from turbohaul.manager import TurbohaulManager
-from turbohaul.slot import SlotState
 from turbohaul.state import open_state_db
 
 
@@ -71,6 +70,7 @@ class TestBootReconcile:
         mgr = TurbohaulManager(boot, runtime)
         # Pre-populate state.sqlite with a fake-active slot whose pid is dead
         from turbohaul.state import upsert_slot
+
         conn = open_state_db(boot.storage.state_db_path)
         upsert_slot(
             conn,
@@ -174,9 +174,7 @@ class TestSubmit:
         mgr = TurbohaulManager(boot, runtime)
         slot = await mgr.submit(model_tag="m", prompt="hi")
         conn = open_state_db(boot.storage.state_db_path)
-        cur = conn.execute(
-            "SELECT event_type FROM audit_events WHERE slot_id=?", (slot.slot_id,)
-        )
+        cur = conn.execute("SELECT event_type FROM audit_events WHERE slot_id=?", (slot.slot_id,))
         events = [row["event_type"] for row in cur.fetchall()]
         assert "submit" in events
         conn.close()
@@ -258,8 +256,6 @@ class TestWorkerLoopSkeleton:
 
 
 import pytest
-from turbohaul.manager import TurbohaulManager
-from turbohaul.config import BootConfig, ServerConfig, StorageConfig, RuntimePathsConfig, UIConfig, RuntimeConfig, QueueConfig, PullConfig
 
 
 @pytest.mark.asyncio
@@ -294,17 +290,12 @@ class TestShutdownFailsPending:
         # Submit a slot via submit_and_wait WITHOUT starting worker_loop.
         # The slot sits in staging with an unresolved completion_future.
         # Wrap in a task so we can await shutdown concurrently.
-        caller_task = asyncio.create_task(
-            mgr.submit_and_wait("anymodel", "hi")
-        )
+        caller_task = asyncio.create_task(mgr.submit_and_wait("anymodel", "hi"))
         # Give the submit_and_wait task time to register the future
         await asyncio.sleep(0.05)
-        assert not caller_task.done(), (
-            "caller_task should be blocked on completion_future before shutdown"
-        )
+        assert not caller_task.done(), "caller_task should be blocked on completion_future before shutdown"
         # Shutdown should fail the pending future, not let the caller hang.
         await mgr.shutdown()
         # Caller now completes (with exception)
         with pytest.raises((asyncio.CancelledError, RuntimeError)):
             await asyncio.wait_for(caller_task, timeout=2.0)
-

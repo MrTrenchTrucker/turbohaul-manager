@@ -1,4 +1,5 @@
 """Tests for /api/manifests CRUD routes (Wave 9 - v0.2 §8.1 + §8.2)."""
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -13,7 +14,6 @@ from turbohaul.config import (
     StorageConfig,
     UIConfig,
 )
-
 
 SAMPLE_SHA = "abcdef01" + "0" * 56
 

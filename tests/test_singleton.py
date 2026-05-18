@@ -1,4 +1,5 @@
 """Tests for singleton invariant + orphan reaper (v0.2 §3.1)."""
+
 import pytest
 
 from turbohaul.singleton import (

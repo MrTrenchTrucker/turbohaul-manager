@@ -15,16 +15,15 @@ Layout:
         └── <ab>/
             └── <full-64-char>   (final, chmod 0o400)
 """
+
 import contextlib
 import hashlib
 import logging
 import os
 import re
 import secrets
-import tempfile
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-
 
 log = logging.getLogger(__name__)
 
@@ -126,9 +125,7 @@ def write_stream_atomic(
             if computed != expected_sha256:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(tmp)
-                raise BlobHashMismatch(
-                    f"computed {computed[:16]}... != expected {expected_sha256[:16]}..."
-                )
+                raise BlobHashMismatch(f"computed {computed[:16]}... != expected {expected_sha256[:16]}...")
 
         # Atomic rename → final path
         final = _final_path(blobs_root, computed)
@@ -196,15 +193,11 @@ async def write_stream_atomic_async(
             if not SHA256_RE.match(expected_sha256):
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(tmp)
-                raise BlobError(
-                    f"expected_sha256 not valid hex: {expected_sha256[:32]}..."
-                )
+                raise BlobError(f"expected_sha256 not valid hex: {expected_sha256[:32]}...")
             if computed != expected_sha256:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(tmp)
-                raise BlobHashMismatch(
-                    f"computed {computed[:16]}... != expected {expected_sha256[:16]}..."
-                )
+                raise BlobHashMismatch(f"computed {computed[:16]}... != expected {expected_sha256[:16]}...")
 
         final = _final_path(blobs_root, computed)
         final.parent.mkdir(parents=True, exist_ok=True)
@@ -248,9 +241,7 @@ def verify_blob_on_stage(blobs_root: Path, expected_sha256: str) -> bool:
             h.update(chunk)
     actual = h.hexdigest()
     if actual != expected_sha256:
-        raise BlobIntegrityFailure(
-            f"blob hash drift: on-disk {actual[:16]}... != expected {expected_sha256[:16]}..."
-        )
+        raise BlobIntegrityFailure(f"blob hash drift: on-disk {actual[:16]}... != expected {expected_sha256[:16]}...")
     return True
 
 

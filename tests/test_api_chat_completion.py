@@ -1,4 +1,5 @@
 """Tests for chat-completion routes (Wave 12 — /v1/chat/completions + /api/chat)."""
+
 import asyncio
 from unittest.mock import MagicMock
 
@@ -137,6 +138,7 @@ class TestOpenaiChatCompletions:
         # We instead use the simpler dispatch: spawn the worker BEFORE the request.
 
         import threading
+
         loop = asyncio.new_event_loop()
 
         def _runner():
@@ -202,8 +204,10 @@ def app_completion_autostart(tmp_path):
     )
     runtime = RuntimeConfig(
         queue=QueueConfig(
-            grace_seconds=0, idle_hot_load_seconds=0,
-            drained_sigterm_window_active_s=1, drained_sigterm_window_cold_s=1,
+            grace_seconds=0,
+            idle_hot_load_seconds=0,
+            drained_sigterm_window_active_s=1,
+            drained_sigterm_window_cold_s=1,
         ),
         pull=PullConfig(),
     )
@@ -299,6 +303,7 @@ class TestStreamPayloadBuilder:
 
     def test_build_payload_includes_stream_true(self):
         from turbohaul.api.chat_completion import _build_stream_payload
+
         payload = _build_stream_payload(
             client_meta={"max_tokens": 100, "temperature": 0.7},
             model="test",
@@ -312,6 +317,7 @@ class TestStreamPayloadBuilder:
 
     def test_build_payload_omits_unset_knobs(self):
         from turbohaul.api.chat_completion import _build_stream_payload
+
         payload = _build_stream_payload(
             client_meta={"temperature": 0.5},
             model="m",
@@ -325,6 +331,7 @@ class TestStreamPayloadBuilder:
 
     def test_build_payload_forwards_reasoning_budget(self):
         from turbohaul.api.chat_completion import _build_stream_payload
+
         payload = _build_stream_payload(
             client_meta={"reasoning_budget": 1000, "thinking_budget_tokens": 500},
             model="m",
@@ -339,6 +346,7 @@ class TestStreamPayloadBuilder:
         values (list of tool defs, dict tool_choice, etc.) are forwarded as-is.
         """
         from turbohaul.api.chat_completion import _build_stream_payload
+
         tools = [
             {
                 "type": "function",
@@ -367,9 +375,7 @@ class TestStreamPayloadBuilder:
         assert payload["tool_choice"] == tool_choice_obj
         assert payload["parallel_tool_calls"] is False
         # Enum form of tool_choice also passes through.
-        payload2 = _build_stream_payload(
-            client_meta={"tool_choice": "auto"}, model="m", messages=[]
-        )
+        payload2 = _build_stream_payload(client_meta={"tool_choice": "auto"}, model="m", messages=[])
         assert payload2["tool_choice"] == "auto"
 
 
@@ -378,7 +384,9 @@ class TestStreamErrorFrame:
 
     def test_error_frame_shape(self):
         import json as _json
+
         from turbohaul.api.chat_completion import _stream_error_frame
+
         b = _stream_error_frame("test_error", "test message")
         assert b.startswith(b"data: ")
         assert b.endswith(b"\n\n")
@@ -388,7 +396,9 @@ class TestStreamErrorFrame:
 
     def test_error_frame_extras_included(self):
         import json as _json
+
         from turbohaul.api.chat_completion import _stream_error_frame
+
         b = _stream_error_frame("upstream_sidecar_error", "boom", upstream_status=503)
         parsed = _json.loads(b[6:-2].decode())
         assert parsed["error"]["upstream_status"] == 503
@@ -509,21 +519,21 @@ class TestSseHeartbeat:
     def test_heartbeat_constants_at_module_level(self):
         """Constants must be patchable from tests (module-level not local)."""
         from turbohaul.api import chat_completion as cc
+
         assert hasattr(cc, "HEARTBEAT_INTERVAL_S")
         assert hasattr(cc, "SLOT_READY_TIMEOUT_S")
         assert hasattr(cc, "STREAM_TIMEOUT_S")
         assert cc.HEARTBEAT_INTERVAL_S > 0
         assert cc.HEARTBEAT_INTERVAL_S < cc.SLOT_READY_TIMEOUT_S
 
-    def test_heartbeat_emitted_during_slow_cold_load(
-        self, app_completion_autostart, monkeypatch
-    ):
+    def test_heartbeat_emitted_during_slow_cold_load(self, app_completion_autostart, monkeypatch):
         """When _wait_healthy takes longer than HEARTBEAT_INTERVAL_S, the SSE
         body should contain at least one `: keep-alive\\n\\n` comment before
         the upstream-error frame fires (the fake sidecar port has no listener,
         so the route emits an error frame once stream_ready_event fires).
         """
         from turbohaul.api import chat_completion as cc
+
         app, client = app_completion_autostart
 
         # Shrink heartbeat cadence so the test is fast (4 heartbeats in 0.4s).
@@ -555,15 +565,11 @@ class TestSseHeartbeat:
                 body_bytes += chunk
 
         # CORE ASSERTION: heartbeat comment present in body
-        assert b": keep-alive\n\n" in body_bytes, (
-            f"no heartbeat comment in SSE body: {body_bytes!r}"
-        )
+        assert b": keep-alive\n\n" in body_bytes, f"no heartbeat comment in SSE body: {body_bytes!r}"
         # Stream still terminates with [DONE] after the error frame
         assert b"[DONE]" in body_bytes
 
-    def test_no_heartbeat_when_ready_event_fires_immediately(
-        self, app_completion_autostart
-    ):
+    def test_no_heartbeat_when_ready_event_fires_immediately(self, app_completion_autostart):
         """Regression: when the slot reaches ACTIVE within HEARTBEAT_INTERVAL_S
         (the normal warm/IDLE_HOT case), no heartbeat comments are emitted —
         body goes straight to upstream error/data + [DONE].
@@ -587,9 +593,7 @@ class TestSseHeartbeat:
             for chunk in r.iter_bytes():
                 body_bytes += chunk
 
-        assert b": keep-alive\n\n" not in body_bytes, (
-            f"unexpected heartbeat in fast-path body: {body_bytes!r}"
-        )
+        assert b": keep-alive\n\n" not in body_bytes, f"unexpected heartbeat in fast-path body: {body_bytes!r}"
         assert b"[DONE]" in body_bytes
 
 
@@ -607,10 +611,12 @@ class TestParseKeepAlive:
 
     def test_none_returns_none(self):
         from turbohaul.api.chat_completion import parse_keep_alive
+
         assert parse_keep_alive(None) is None
 
     def test_int_passthrough(self):
         from turbohaul.api.chat_completion import parse_keep_alive
+
         assert parse_keep_alive(60) == 60
         assert parse_keep_alive(0) == 0
         assert parse_keep_alive(-1) == -1
@@ -618,11 +624,13 @@ class TestParseKeepAlive:
 
     def test_float_truncates_to_int(self):
         from turbohaul.api.chat_completion import parse_keep_alive
+
         assert parse_keep_alive(60.7) == 60
         assert parse_keep_alive(-1.0) == -1
 
     def test_string_int_forms(self):
         from turbohaul.api.chat_completion import parse_keep_alive
+
         assert parse_keep_alive("0") == 0
         assert parse_keep_alive("-1") == -1
         assert parse_keep_alive("60") == 60
@@ -631,6 +639,7 @@ class TestParseKeepAlive:
 
     def test_string_ollama_suffix_forms(self):
         from turbohaul.api.chat_completion import parse_keep_alive
+
         assert parse_keep_alive("30s") == 30
         assert parse_keep_alive("5m") == 300
         assert parse_keep_alive("2h") == 7200
@@ -639,6 +648,7 @@ class TestParseKeepAlive:
 
     def test_string_invalid_returns_none(self):
         from turbohaul.api.chat_completion import parse_keep_alive
+
         assert parse_keep_alive("abc") is None
         assert parse_keep_alive("1x") is None  # unknown unit
         assert parse_keep_alive("m") is None  # no digit
@@ -654,11 +664,13 @@ class TestParseKeepAlive:
         to default 300s instead of the immediate teardown they asked for.
         """
         from turbohaul.api.chat_completion import parse_keep_alive
+
         assert parse_keep_alive(False) == 0
 
     def test_bool_true_means_use_default(self):
         """Ollama keep_alive: true → "on", let server pick default."""
         from turbohaul.api.chat_completion import parse_keep_alive
+
         assert parse_keep_alive(True) is None
 
 
@@ -679,6 +691,7 @@ class TestKeepAliveClientMetaPlumbing:
             _STREAM_FORWARDED_KNOBS,
             _build_stream_payload,
         )
+
         assert "keep_alive" not in _STREAM_FORWARDED_KNOBS
         assert "keep_alive_s" not in _STREAM_FORWARDED_KNOBS
         payload = _build_stream_payload(

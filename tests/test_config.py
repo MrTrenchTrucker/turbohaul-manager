@@ -1,6 +1,6 @@
 """Tests for BootConfig + RuntimeConfig schema (v0.2 §7 + §7.1)."""
+
 import pytest
-from pathlib import Path
 from pydantic import ValidationError
 
 from turbohaul.config import (
@@ -9,11 +9,8 @@ from turbohaul.config import (
     PullConfig,
     QueueConfig,
     RuntimeConfig,
-    RuntimePathsConfig,
     ServerConfig,
-    StorageConfig,
     TurbohaulConfig,
-    UIConfig,
     apply_env_overrides,
     load_config_yaml,
 )

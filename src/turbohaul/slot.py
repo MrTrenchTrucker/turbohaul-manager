@@ -2,6 +2,7 @@
 
 Per v0.2 ARCHITECTURE.md §4 + §6 + §9 thread_id prefix-hash fallback.
 """
+
 import dataclasses
 import enum
 import hashlib
@@ -10,7 +11,7 @@ import uuid
 from typing import Any
 
 
-class SlotState(str, enum.Enum):
+class SlotState(enum.StrEnum):
     """States per v0.2 §6 state machine (10 states total)."""
 
     RECEIVED = "RECEIVED"
@@ -57,8 +58,8 @@ class Slot:
     # exhausts (or on client disconnect / error). Only then does worker_loop
     # advance ACTIVE → GRACE.
     stream_ready_event: Any = None  # asyncio.Event, set by worker_loop on ACTIVE
-    stream_done_event: Any = None   # asyncio.Event, set by route on stream close
-    stream_handle: Any = None       # SidecarHandle assigned when ACTIVE
+    stream_done_event: Any = None  # asyncio.Event, set by route on stream close
+    stream_handle: Any = None  # SidecarHandle assigned when ACTIVE
 
     @classmethod
     def new(
@@ -81,9 +82,7 @@ class Slot:
         )
 
 
-def derive_thread_id_prefix_hash(
-    prompt: str, model_tag: str, prefix_tokens: int = 64
-) -> str:
+def derive_thread_id_prefix_hash(prompt: str, model_tag: str, prefix_tokens: int = 64) -> str:
     """Auto-derive thread_id for naive Ollama clients (v0.2 §9 - Devil F7 fix).
 
     Same-prefix follow-ups in the same model get the same thread_id, enabling

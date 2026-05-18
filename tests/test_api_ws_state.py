@@ -1,7 +1,6 @@
 """Tests for WS /ws/state redacted broadcaster (Wave 11 - v0.2 §11.1)."""
+
 import asyncio
-from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,7 +17,6 @@ from turbohaul.config import (
     UIConfig,
 )
 from turbohaul.manager import EventBus
-from turbohaul.subprocess_mgr import SidecarHandle
 
 
 @pytest.fixture
@@ -74,9 +72,7 @@ class TestEventBus:
         bus = EventBus()
         q = asyncio.Queue()
         bus.subscribe(q)
-        bus.publish_nowait(
-            {"event": "active", "prompt": "SECRET PROMPT", "state": "ACTIVE"}
-        )
+        bus.publish_nowait({"event": "active", "prompt": "SECRET PROMPT", "state": "ACTIVE"})
         ev = q.get_nowait()
         assert "prompt" not in ev
         assert ev["event"] == "active"
@@ -86,9 +82,7 @@ class TestEventBus:
         bus = EventBus()
         q = asyncio.Queue()
         bus.subscribe(q)
-        bus.publish_nowait(
-            {"event": "complete", "response": "SECRET RESPONSE", "state": "GRACE"}
-        )
+        bus.publish_nowait({"event": "complete", "response": "SECRET RESPONSE", "state": "GRACE"})
         ev = q.get_nowait()
         assert "response" not in ev
 
@@ -96,9 +90,7 @@ class TestEventBus:
         bus = EventBus()
         q = asyncio.Queue()
         bus.subscribe(q)
-        bus.publish_nowait(
-            {"event": "fail", "stderr": "trace line with sensitive paths", "state": "POPPED"}
-        )
+        bus.publish_nowait({"event": "fail", "stderr": "trace line with sensitive paths", "state": "POPPED"})
         ev = q.get_nowait()
         assert "stderr" not in ev
 
@@ -148,6 +140,7 @@ class TestWsStateConnect:
         # After exit, should unsubscribe
         # Give time for cleanup
         import time
+
         time.sleep(0.1)
         assert mgr.event_bus.subscriber_count == 0
 
@@ -181,6 +174,7 @@ class TestWsStateRedaction:
     def test_manager_audit_events_arrive_at_ws(self, app_test):
         """When the manager's _audit fires, the event reaches WS subscribers."""
         import asyncio
+
         app, client = app_test
         mgr = app.state.manager
         with client.websocket_connect("/ws/state") as ws:

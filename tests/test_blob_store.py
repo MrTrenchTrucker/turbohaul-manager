@@ -1,4 +1,5 @@
 """Tests for blob_store - content-addressed storage + lifecycle (v0.2 §12.1)."""
+
 import hashlib
 import os
 
@@ -55,26 +56,20 @@ class TestWriteStream:
     def test_write_with_expected_hash_pass(self, tmp_path):
         data = b"data" * 50
         expected = hashlib.sha256(data).hexdigest()
-        sha, n = write_stream_atomic(
-            tmp_path, _chunks_of(data), expected_sha256=expected
-        )
+        sha, n = write_stream_atomic(tmp_path, _chunks_of(data), expected_sha256=expected)
         assert sha == expected
 
     def test_write_with_wrong_expected_hash_raises(self, tmp_path):
         data = b"data" * 50
         with pytest.raises(BlobHashMismatch, match="computed"):
-            write_stream_atomic(
-                tmp_path, _chunks_of(data), expected_sha256="f" * 64
-            )
+            write_stream_atomic(tmp_path, _chunks_of(data), expected_sha256="f" * 64)
         # Tempfile should be cleaned up
         assert not list((tmp_path / "sha256" / "incoming").iterdir())
 
     def test_write_exceeds_size_cap(self, tmp_path):
         data = b"x" * 1000
         with pytest.raises(BlobSizeExceeded, match="per_stream_max_bytes"):
-            write_stream_atomic(
-                tmp_path, _chunks_of(data, 100), per_stream_max_bytes=500
-            )
+            write_stream_atomic(tmp_path, _chunks_of(data, 100), per_stream_max_bytes=500)
         # Tempfile cleanup
         assert not list((tmp_path / "sha256" / "incoming").iterdir())
 
@@ -140,6 +135,7 @@ class TestGcStaleIncoming:
         old_tmp.write_bytes(b"stale")
         # backdate the file
         import time
+
         old_time = time.time() - 7200  # 2 hours ago
         os.utime(str(old_tmp), (old_time, old_time))
         n = gc_stale_incoming(tmp_path, max_age_s=3600.0)

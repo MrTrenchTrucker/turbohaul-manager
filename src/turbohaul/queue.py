@@ -2,6 +2,7 @@
 
 Per v0.2 ARCHITECTURE.md §5 + §6.
 """
+
 import asyncio
 import logging
 import time
@@ -48,9 +49,7 @@ class TurbohaulQueue:
                 self._staging.append(slot)
                 return
             if len(self._accept_buf) >= self.acceptance_max:
-                raise QueueFull(
-                    f"acceptance buffer at max {self.acceptance_max}"
-                )
+                raise QueueFull(f"acceptance buffer at max {self.acceptance_max}")
             slot.state = SlotState.ACCEPT_BUFFER
             self._accept_buf.append(slot)
 
@@ -95,9 +94,7 @@ class TurbohaulQueue:
                     return slot
         return None
 
-    async def pop_matched_thread(
-        self, thread_id: str, model_tag: str
-    ) -> Slot | None:
+    async def pop_matched_thread(self, thread_id: str, model_tag: str) -> Slot | None:
         """GRIP H-3 fix: atomic find + remove under one lock acquire.
 
         The legacy find_matched_thread + remove(slot_id) pattern released the
@@ -111,10 +108,7 @@ class TurbohaulQueue:
             return None
         async with self._lock:
             for i, slot in enumerate(self._staging):
-                if (
-                    slot.thread_id == thread_id
-                    and slot.model_tag == model_tag
-                ):
+                if slot.thread_id == thread_id and slot.model_tag == model_tag:
                     del self._staging[i]
                     return slot
         return None
@@ -234,11 +228,7 @@ class IdleHotTimer:
         return self._started_at is None or self.remaining_s() <= 0.0
 
     def matches_same_model(self, model_tag: str) -> bool:
-        return (
-            self._started_at is not None
-            and self.model_tag == model_tag
-            and not self.expired()
-        )
+        return self._started_at is not None and self.model_tag == model_tag and not self.expired()
 
     def reset(self) -> None:
         self._started_at = None

@@ -8,6 +8,7 @@ or TURBOHAUL_ALLOW_PUBLIC_BIND=1. The yaml ServerConfig still validates as 127.0
 (per v0.2 §3.2); the public-bind override only changes the uvicorn host argument,
 not the loaded BootConfig.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -21,7 +22,6 @@ import uvicorn
 from turbohaul.api.main import create_app
 from turbohaul.config import apply_env_overrides, load_config_yaml
 
-
 log = logging.getLogger("turbohaul.main")
 
 
@@ -33,9 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--config",
         type=Path,
-        default=Path(
-            os.environ.get("TURBOHAUL_CONFIG_PATH", "/etc/turbohaul/turbohaul.yaml")
-        ),
+        default=Path(os.environ.get("TURBOHAUL_CONFIG_PATH", "/etc/turbohaul/turbohaul.yaml")),
         help="Path to turbohaul.yaml (default /etc/turbohaul/turbohaul.yaml).",
     )
     p.add_argument(
@@ -76,8 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.allow_public_bind:
         bind_host = "0.0.0.0"  # noqa: S104 -- explicit container bind override
         log.warning(
-            "--allow-public-bind in effect: uvicorn binding 0.0.0.0 "
-            "(BootConfig.server.host=%s preserved)",
+            "--allow-public-bind in effect: uvicorn binding 0.0.0.0 (BootConfig.server.host=%s preserved)",
             boot.server.host,
         )
 

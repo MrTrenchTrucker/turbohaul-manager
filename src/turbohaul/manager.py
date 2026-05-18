@@ -5,13 +5,13 @@ machine. Phase 2 Wave 5 ships the foundational interface; the full worker_loop
 streaming implementation lands in Wave 6 alongside the API layer that forwards
 to llama-server.
 """
+
 import asyncio
 import contextlib
 import logging
 import os
 import time
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 from turbohaul.config import KEEP_ALIVE_MAX_S, BootConfig, RuntimeConfig
@@ -38,7 +38,6 @@ from turbohaul.subprocess_mgr import (
     verify_vram_cleared,
     wait_until_healthy,
 )
-
 
 log = logging.getLogger(__name__)
 
@@ -196,7 +195,7 @@ class TurbohaulManager:
         )
         try:
             result = await asyncio.wait_for(slot.completion_future, timeout=timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise
         return slot, result
 
@@ -315,9 +314,7 @@ class TurbohaulManager:
         if expected:
             self._binary_fd = open_and_verify_binary(binary_path, expected)
             if self._binary_fd is None:
-                log.error(
-                    "binary hash drift between verify and fd-pin -- refusing"
-                )
+                log.error("binary hash drift between verify and fd-pin -- refusing")
                 return False
         return True
 
@@ -348,9 +345,8 @@ class TurbohaulManager:
         # the documented queue-closed exception type.
         if self._stop_event.is_set():
             from turbohaul.queue import QueueClosed
-            raise QueueClosed(
-                "TurbohaulManager is shutting down — new submissions are refused."
-            )
+
+            raise QueueClosed("TurbohaulManager is shutting down — new submissions are refused.")
 
         if not thread_id:
             thread_id = derive_thread_id_prefix_hash(prompt, model_tag)
@@ -510,9 +506,7 @@ class TurbohaulManager:
                     try:
                         await self._teardown_idle_holder("idle_expired")
                     except Exception:
-                        log.exception(
-                            "idle expiry teardown failed (best-effort)"
-                        )
+                        log.exception("idle expiry teardown failed (best-effort)")
                 await asyncio.sleep(0.05)
                 continue
             try:
@@ -532,9 +526,7 @@ class TurbohaulManager:
                     try:
                         await self._teardown(slot, "worker-uncaught-exception")
                     except Exception:
-                        log.exception(
-                            "teardown during worker exception failed (best-effort)"
-                        )
+                        log.exception("teardown during worker exception failed (best-effort)")
                 await self._force_cold(slot, "worker-uncaught-exception")
         log.info("worker_loop exited")
 
@@ -580,9 +572,7 @@ class TurbohaulManager:
             # existing tests that rely on the manifest-missing tolerance
             # continue to work.
             holder_at_risk = (
-                not manifest_found
-                and self._idle_handle is not None
-                and self._idle_model_tag != slot.model_tag
+                not manifest_found and self._idle_handle is not None and self._idle_model_tag != slot.model_tag
             )
             if holder_at_risk:
                 transition(slot, SlotState.LOADING)
@@ -593,7 +583,9 @@ class TurbohaulManager:
                 _mfn_conn = open_state_db(self.boot.storage.state_db_path)
                 try:
                     mark_slot_ended(
-                        _mfn_conn, slot.slot_id, "manifest_not_found",
+                        _mfn_conn,
+                        slot.slot_id,
+                        "manifest_not_found",
                     )
                 finally:
                     _mfn_conn.close()
@@ -657,17 +649,10 @@ class TurbohaulManager:
                         # ctx_size: prefer llama_server_flags.ctx_size (what
                         # actually gets passed to llama-server CLI); fall
                         # back to manifest.context_size.
-                        manifest_ctx = (
-                            m_for_vram.llama_server_flags.get("ctx_size")
-                            or m_for_vram.context_size
-                            or 0
-                        )
+                        manifest_ctx = m_for_vram.llama_server_flags.get("ctx_size") or m_for_vram.context_size or 0
                         # KV quant: derive from cache_type_k (cache_type_v
                         # assumed to match; if different, picks the larger).
-                        manifest_kv_quant = (
-                            m_for_vram.llama_server_flags.get("cache_type_k")
-                            or "f16"
-                        )
+                        manifest_kv_quant = m_for_vram.llama_server_flags.get("cache_type_k") or "f16"
                     except FileNotFoundError:
                         manifest_vram = 0
                     gates = all_safety_gates(
@@ -684,32 +669,28 @@ class TurbohaulManager:
                     failed = [g for g in gates if not g.ok]
                     if failed:
                         # Build a single error message + emit audit detail.
-                        detail = "; ".join(
-                            f"{g.name}: {g.detail}" for g in failed
-                        )
+                        detail = "; ".join(f"{g.name}: {g.detail}" for g in failed)
                         log.warning(
                             "safety gates refused spawn for slot %s: %s",
-                            slot.slot_id, detail,
+                            slot.slot_id,
+                            detail,
                         )
                         transition(slot, SlotState.LOADING_FAIL)
                         self._audit(slot, "safety_gate_refused")
                         self._audit_event_only(
                             slot.slot_id,
                             "safety_gate_detail",
-                            {"failed": [
-                                {"name": g.name, "detail": g.detail}
-                                for g in failed
-                            ]},
+                            {"failed": [{"name": g.name, "detail": g.detail} for g in failed]},
                         )
                         transition(slot, SlotState.POPPED)
                         # No sidecar spawned; _teardown is a no-op + audit-only.
                         # Just mark slot ended + fail caller future.
-                        _sg_conn = open_state_db(
-                            self.boot.storage.state_db_path
-                        )
+                        _sg_conn = open_state_db(self.boot.storage.state_db_path)
                         try:
                             mark_slot_ended(
-                                _sg_conn, slot.slot_id, "safety_gate_refused",
+                                _sg_conn,
+                                slot.slot_id,
+                                "safety_gate_refused",
                             )
                         finally:
                             _sg_conn.close()
@@ -732,9 +713,7 @@ class TurbohaulManager:
                 slot.pid = handle.pid
                 self._active_handle = handle
                 # LOADING → ACTIVE (or LOADING_FAIL → POPPED)
-                healthy = await self._wait_healthy(
-                    port, self.runtime.queue.loading_health_timeout_s
-                )
+                healthy = await self._wait_healthy(port, self.runtime.queue.loading_health_timeout_s)
             if not healthy:
                 transition(slot, SlotState.LOADING_FAIL)
                 self._audit(slot, "loading_fail_health_timeout")
@@ -784,18 +763,14 @@ class TurbohaulManager:
                         slot.stream_done_event.wait(),
                         timeout=3600.0,  # 1 hour cap; routes typically signal in seconds
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     log.warning(
-                        "streaming slot %s exceeded 3600s waiting for stream_done_event; "
-                        "advancing to GRACE anyway",
+                        "streaming slot %s exceeded 3600s waiting for stream_done_event; advancing to GRACE anyway",
                         slot.slot_id,
                     )
                 # Resolve the completion_future so any caller awaiting the
                 # slot (e.g. tests or programmatic await) is unblocked.
-                if (
-                    slot.completion_future is not None
-                    and not slot.completion_future.done()
-                ):
+                if slot.completion_future is not None and not slot.completion_future.done():
                     slot.completion_future.set_result({"_streamed": True})
             else:
                 # Non-streaming path (existing behaviour, unchanged).
@@ -818,9 +793,7 @@ class TurbohaulManager:
             deadline = time.monotonic() + self.runtime.queue.grace_seconds
             while time.monotonic() < deadline and not self._stop_event.is_set():
                 # GRIP H-3 fix: atomic find + remove in one lock acquire
-                matched = await self.queue.pop_matched_thread(
-                    slot.thread_id, slot.model_tag
-                )
+                matched = await self.queue.pop_matched_thread(slot.thread_id, slot.model_tag)
                 if matched is not None:
                     matched.port = handle.port
                     matched.pid = handle.pid
@@ -837,13 +810,13 @@ class TurbohaulManager:
                         # Wave 4b.5: each matched-follow-up's keep_alive overrides
                         # the anchor's for the next grace→idle calculation. Mirrors
                         # Ollama "timer resets on request receipt" rule.
-                        self._latest_keep_alive_s = (
-                            matched.client_meta or {}
-                        ).get("keep_alive_s")
+                        self._latest_keep_alive_s = (matched.client_meta or {}).get("keep_alive_s")
                     except InvalidTransition as drift_err:
                         log.warning(
                             "active_match state drift: slot %s in %s — terminal-park; %s",
-                            matched.slot_id, matched.state.value, drift_err,
+                            matched.slot_id,
+                            matched.state.value,
+                            drift_err,
                         )
                         self._fail_completion_future(matched, drift_err)
                         await self._force_cold(
@@ -863,15 +836,11 @@ class TurbohaulManager:
                     # stream_ready_event was never set → route's SLOT_READY_TIMEOUT_S fired at 600s
                     # every turn ≥ 2 of a Hermes multi-tool-call agent loop.
                     matched_is_streaming = bool(
-                        isinstance(matched.client_meta, dict)
-                        and matched.client_meta.get("stream", False)
+                        isinstance(matched.client_meta, dict) and matched.client_meta.get("stream", False)
                     )
                     try:
                         if matched_is_streaming:
-                            assert (
-                                matched.stream_ready_event is not None
-                                and matched.stream_done_event is not None
-                            ), (
+                            assert matched.stream_ready_event is not None and matched.stream_done_event is not None, (
                                 f"streaming slot {matched.slot_id} missing events at ACTIVE_MATCH promotion"
                             )
                             matched.stream_handle = handle
@@ -881,7 +850,7 @@ class TurbohaulManager:
                                     matched.stream_done_event.wait(),
                                     timeout=3600.0,
                                 )
-                            except asyncio.TimeoutError:
+                            except TimeoutError:
                                 log.warning(
                                     "active_match streaming slot %s exceeded 3600s waiting for stream_done_event",
                                     matched.slot_id,
@@ -890,10 +859,7 @@ class TurbohaulManager:
                                 matched.completion_future.set_result({"_streamed": True})
                         else:
                             result2 = await self._complete_fn(matched, handle)
-                            if (
-                                matched.completion_future is not None
-                                and not matched.completion_future.done()
-                            ):
+                            if matched.completion_future is not None and not matched.completion_future.done():
                                 matched.completion_future.set_result(result2)
                     except asyncio.CancelledError:
                         # Round 8 MOD-5: cooperatively unwind route's blocking httpx call
@@ -919,9 +885,7 @@ class TurbohaulManager:
                             pass
                         self._audit(matched, "active_match_cancelled")
                         try:
-                            _am_conn = open_state_db(
-                                self.boot.storage.state_db_path
-                            )
+                            _am_conn = open_state_db(self.boot.storage.state_db_path)
                             try:
                                 mark_slot_ended(
                                     _am_conn,
@@ -1005,11 +969,7 @@ class TurbohaulManager:
             else:
                 # 0 falls through this expression cleanly → idle disabled.
                 idle_seconds = min(keep_alive_s, KEEP_ALIVE_MAX_S)
-            ka_clamped = (
-                keep_alive_s is not None
-                and keep_alive_s >= 0
-                and keep_alive_s > KEEP_ALIVE_MAX_S
-            )
+            ka_clamped = keep_alive_s is not None and keep_alive_s >= 0 and keep_alive_s > KEEP_ALIVE_MAX_S
             # Consumed — clear before any further decisions so the next anchor
             # starts cleanly (defense-in-depth on top of _process_slot reset).
             self._latest_keep_alive_s = None
@@ -1036,9 +996,7 @@ class TurbohaulManager:
                 # plain grace-expired teardown.
                 _ih_conn = open_state_db(self.boot.storage.state_db_path)
                 try:
-                    mark_slot_ended(
-                        _ih_conn, slot.slot_id, "grace-expired-held-idle"
-                    )
+                    mark_slot_ended(_ih_conn, slot.slot_id, "grace-expired-held-idle")
                 finally:
                     _ih_conn.close()
             else:
@@ -1078,23 +1036,15 @@ class TurbohaulManager:
             # Skip defensive sigterm if the handle was promoted to the
             # IDLE_HOT holder — that promotion is by design; killing it
             # would defeat the warm-hold purpose.
-            if (
-                handle_to_reap is not None
-                and handle_to_reap is not self._idle_handle
-                and handle_to_reap.is_alive()
-            ):
+            if handle_to_reap is not None and handle_to_reap is not self._idle_handle and handle_to_reap.is_alive():
                 sigterm_ok = False
                 try:
                     await asyncio.shield(
                         self._sigterm(
                             handle_to_reap,
-                            drained_window_s=float(
-                                self.runtime.queue.drained_sigterm_window_active_s
-                            ),
+                            drained_window_s=float(self.runtime.queue.drained_sigterm_window_active_s),
                             is_active=False,
-                            cold_window_s=float(
-                                self.runtime.queue.drained_sigterm_window_cold_s
-                            ),
+                            cold_window_s=float(self.runtime.queue.drained_sigterm_window_cold_s),
                         )
                     )
                     sigterm_ok = True
@@ -1128,7 +1078,8 @@ class TurbohaulManager:
             # drop "verify clear" while 17 GiB qwen35b still resident.
             expected_drop_mib = self._compute_expected_drop_mib(slot.model_tag)
             await self._vram_verify(
-                expected_drop_mib=expected_drop_mib, timeout_s=30.0,
+                expected_drop_mib=expected_drop_mib,
+                timeout_s=30.0,
             )
             # HAUL P-2 fix: scan for grandchild orphans left behind by
             # Tom's Fork setsid-detach (killpg never reached them) and
@@ -1139,13 +1090,11 @@ class TurbohaulManager:
                 orphan_reap_result = boot_orphan_reaper(
                     port_base=self.boot.runtime.default_port_base,
                     known_pids=set(),  # single-slot mode; multi-slot
-                                       # Wave-6 will pass live sidecar pids
+                    # Wave-6 will pass live sidecar pids
                 )
                 orphan_reaped = orphan_reap_result.get("reaped", 0)
             except Exception:
-                log.exception(
-                    "post-teardown orphan reap failed (best-effort)"
-                )
+                log.exception("post-teardown orphan reap failed (best-effort)")
             # GRIP HIGH-3 fix: intra-lifetime port-bound reaper. Catches
             # orphans whose parent IS still the running manager (PPid !=
             # 1 so boot_orphan_reaper misses them) — e.g. handle dropped
@@ -1162,9 +1111,7 @@ class TurbohaulManager:
                         il_result,
                     )
             except Exception:
-                log.exception(
-                    "intra-lifetime orphan scan failed (best-effort)"
-                )
+                log.exception("intra-lifetime orphan scan failed (best-effort)")
             conn = open_state_db(self.boot.storage.state_db_path)
             try:
                 mark_slot_ended(conn, slot.slot_id, reason)
@@ -1204,20 +1151,15 @@ class TurbohaulManager:
         self._idle_expires_at = None
         ok, status = await self._sigterm(
             held,
-            drained_window_s=float(
-                self.runtime.queue.drained_sigterm_window_active_s
-            ),
+            drained_window_s=float(self.runtime.queue.drained_sigterm_window_active_s),
             is_active=False,
-            cold_window_s=float(
-                self.runtime.queue.drained_sigterm_window_cold_s
-            ),
+            cold_window_s=float(self.runtime.queue.drained_sigterm_window_cold_s),
         )
         # HAUL #2 fix: dynamic expected_drop_mib for idle holder teardown.
-        expected_drop_mib = self._compute_expected_drop_mib(
-            model_tag or ""
-        )
+        expected_drop_mib = self._compute_expected_drop_mib(model_tag or "")
         await self._vram_verify(
-            expected_drop_mib=expected_drop_mib, timeout_s=30.0,
+            expected_drop_mib=expected_drop_mib,
+            timeout_s=30.0,
         )
         try:
             boot_orphan_reaper(
@@ -1225,9 +1167,7 @@ class TurbohaulManager:
                 known_pids=set(),
             )
         except Exception:
-            log.exception(
-                "idle-holder orphan reap failed (best-effort)"
-            )
+            log.exception("idle-holder orphan reap failed (best-effort)")
         # GRIP HIGH-3 fix: intra-lifetime port-bound reaper here too.
         try:
             live_pids = self._live_handle_pids()
@@ -1236,9 +1176,7 @@ class TurbohaulManager:
                 known_handle_pids=live_pids,
             )
         except Exception:
-            log.exception(
-                "intra-lifetime orphan scan failed (best-effort)"
-            )
+            log.exception("intra-lifetime orphan scan failed (best-effort)")
         _ih_conn = open_state_db(self.boot.storage.state_db_path)
         try:
             record_audit_event(
@@ -1287,28 +1225,18 @@ class TurbohaulManager:
             # matched.pid == anchor.pid via shared warm sidecar
             # (AM-2 drift path). Do NOT teardown — anchor owns it.
             pid_source = "anchor_shared"
-        elif (
-            slot.pid
-            and self._active_handle is not None
-            and slot.pid == self._active_handle.pid
-        ):
+        elif slot.pid and self._active_handle is not None and slot.pid == self._active_handle.pid:
             # Slot owns the active handle. Defensive teardown.
             try:
                 await self._sigterm(
                     self._active_handle,
-                    drained_window_s=float(
-                        self.runtime.queue.drained_sigterm_window_active_s
-                    ),
+                    drained_window_s=float(self.runtime.queue.drained_sigterm_window_active_s),
                     is_active=False,
-                    cold_window_s=float(
-                        self.runtime.queue.drained_sigterm_window_cold_s
-                    ),
+                    cold_window_s=float(self.runtime.queue.drained_sigterm_window_cold_s),
                 )
                 self._active_handle = None
             except Exception:
-                log.exception(
-                    "_force_cold defensive teardown failed (best-effort)"
-                )
+                log.exception("_force_cold defensive teardown failed (best-effort)")
 
         # Walk legal hops to COLD per the new FSM table.
         # Worst case: ACTIVE → GRACE → POPPED → COLD (3 hops).
@@ -1360,10 +1288,9 @@ class TurbohaulManager:
         try:
             m = read_manifest(self.boot.storage.manifests_path, model_tag)
             return max(2048, int(m.expected_vram_bytes / (1024 * 1024)))
-        except Exception:
+        except Exception:  # noqa: BLE001 — fallback path must survive any manifest read failure
             log.warning(
-                "_compute_expected_drop_mib: manifest read failed for %s, "
-                "falling back to 2048 MiB",
+                "_compute_expected_drop_mib: manifest read failed for %s, falling back to 2048 MiB",
                 model_tag,
             )
             return 2048
@@ -1376,15 +1303,9 @@ class TurbohaulManager:
         _active_handle and _idle_handle if alive.
         """
         live: set[int] = set()
-        if (
-            self._active_handle is not None
-            and self._active_handle.is_alive()
-        ):
+        if self._active_handle is not None and self._active_handle.is_alive():
             live.add(self._active_handle.pid)
-        if (
-            self._idle_handle is not None
-            and self._idle_handle.is_alive()
-        ):
+        if self._idle_handle is not None and self._idle_handle.is_alive():
             live.add(self._idle_handle.pid)
         return live
 
@@ -1450,9 +1371,7 @@ class TurbohaulManager:
         for cleared in cleared_slots:
             self._fail_completion_future(
                 cleared,
-                asyncio.CancelledError(
-                    "manager shutdown -- slot was never processed"
-                ),
+                asyncio.CancelledError("manager shutdown -- slot was never processed"),
             )
         # GRIP H-4 wire: tear down any idle holder so VRAM is released
         # and llama-server child is reaped on graceful shutdown.
@@ -1460,9 +1379,7 @@ class TurbohaulManager:
             try:
                 await self._teardown_idle_holder("shutdown")
             except Exception:
-                log.exception(
-                    "idle teardown during shutdown failed (best-effort)"
-                )
+                log.exception("idle teardown during shutdown failed (best-effort)")
         # HAUL P-4: release the TOCTOU-pinned binary fd on shutdown
         if self._binary_fd is not None:
             with contextlib.suppress(OSError):

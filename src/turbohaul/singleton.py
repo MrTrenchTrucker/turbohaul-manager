@@ -11,14 +11,15 @@ Three enforcement layers:
   3. Boot-time orphan reaper - find llama-server children with PPid=1 (orphaned to
      init) and ports in our runtime.default_port_base range; SIGTERM then SIGKILL
 """
+
 import contextlib
 import errno
 import fcntl
 import logging
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import time
 from collections.abc import Iterator
@@ -41,7 +42,7 @@ def _detect_subreaper_pid() -> int | None:
     """
     try:
         ppid = os.getppid()
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort orphan-scan, any failure → skip
         return None
     if ppid == 1:
         return None
@@ -53,9 +54,7 @@ def _detect_subreaper_pid() -> int | None:
             break
         seen.add(current)
         try:
-            status_text = Path(f"/proc/{current}/status").read_text(
-                errors="ignore"
-            )
+            status_text = Path(f"/proc/{current}/status").read_text(errors="ignore")
         except (FileNotFoundError, PermissionError, OSError):
             break
         next_ppid: int | None = None
@@ -108,7 +107,7 @@ def scan_gpu_compute_apps() -> list[dict]:
     Returns [] silently if nvidia-smi is unavailable (dev / test environments).
     """
     try:
-        out = subprocess.check_output(
+        out = subprocess.check_output(  # noqa: S603 — argv is constant, no shell
             [
                 _NVIDIA_SMI_PATH,
                 "--query-compute-apps=pid,used_memory",
@@ -136,12 +135,7 @@ def scan_gpu_compute_apps() -> list[dict]:
 
 def _read_proc_cmdline(pid: int) -> str:
     try:
-        return (
-            Path(f"/proc/{pid}/cmdline")
-            .read_text(errors="ignore")
-            .replace("\x00", " ")
-            .strip()
-        )
+        return Path(f"/proc/{pid}/cmdline").read_text(errors="ignore").replace("\x00", " ").strip()
     except (FileNotFoundError, PermissionError, OSError):
         return ""
 
@@ -212,12 +206,13 @@ def _read_proc_starttime(pid: int) -> int | None:
     rp = stat_text.rfind(")")
     if rp == -1:
         return None
-    rest = stat_text[rp + 1:].split()
+    rest = stat_text[rp + 1 :].split()
     if len(rest) < 20:  # field 3..22 -> indices 0..19 in rest
         return None
     with contextlib.suppress(ValueError):
         return int(rest[19])
     return None
+
 
 def reap_orphan(pid: int, sigterm_wait_s: float = 5.0) -> tuple[bool, str]:
     """SIGTERM the orphan; wait; SIGKILL on timeout. Returns (success, status_str).
@@ -249,11 +244,7 @@ def reap_orphan(pid: int, sigterm_wait_s: float = 5.0) -> tuple[bool, str]:
         # comparing starttime; if different the original is gone and a
         # new process re-used the pid.
         current_starttime = _read_proc_starttime(pid)
-        if (
-            original_starttime is not None
-            and current_starttime is not None
-            and current_starttime != original_starttime
-        ):
+        if original_starttime is not None and current_starttime is not None and current_starttime != original_starttime:
             return True, "sigkill-clean-pid-reused"
         return False, "sigkill-failed-still-alive"
     except ProcessLookupError:
@@ -356,7 +347,8 @@ def intra_lifetime_orphan_scan(
         log.warning(
             "intra_lifetime_orphan_scan: orphan llama-server pid=%d port=%d "
             "(not in known_handle_pids); sending SIGTERM",
-            pid, port,
+            pid,
+            port,
         )
         try:
             os.kill(pid, signal.SIGTERM)
@@ -366,7 +358,8 @@ def intra_lifetime_orphan_scan(
         except (PermissionError, OSError) as e:
             log.warning(
                 "intra_lifetime_orphan_scan: failed SIGTERM pid %d: %s",
-                pid, e,
+                pid,
+                e,
             )
             stats["errors"] += 1
     return stats

@@ -1,4 +1,5 @@
 """Tests for ssrf_guard - URL safety validation (v0.2 §9.1)."""
+
 import socket
 from unittest.mock import patch
 
@@ -82,9 +83,7 @@ class TestResolveSafely:
 
     def test_blocks_private_resolution(self):
         with patch("socket.getaddrinfo") as m:
-            m.return_value = [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0))
-            ]
+            m.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0))]
             with pytest.raises(UrlSafetyError, match="denied network"):
                 resolve_safely("rebinding-attack.example")
 
@@ -97,9 +96,7 @@ class TestResolveSafely:
 class TestValidatePullUrl:
     def test_https_public_ok(self):
         with patch("socket.getaddrinfo") as m:
-            m.return_value = [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("1.1.1.1", 0))
-            ]
+            m.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("1.1.1.1", 0))]
             host, ip = validate_pull_url("https://example.com/model.gguf")
             assert host == "example.com"
             assert ip == "1.1.1.1"
@@ -143,9 +140,7 @@ class TestValidatePullUrl:
     def test_host_resolving_to_private_rejected(self):
         """DNS-rebind attempt: host name resolves to private IP."""
         with patch("socket.getaddrinfo") as m:
-            m.return_value = [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0))
-            ]
+            m.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0))]
             with pytest.raises(UrlSafetyError, match="denied network"):
                 validate_pull_url("https://attacker-rebind.example/x")
 

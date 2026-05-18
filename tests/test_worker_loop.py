@@ -3,6 +3,7 @@
 Uses DI to inject mocks for spawn / health / sigterm / vram / complete so no real
 llama-server is spawned. Phase 6 smoke E2E uses the real backend.
 """
+
 import asyncio
 from unittest.mock import MagicMock
 
@@ -19,7 +20,6 @@ from turbohaul.config import (
     UIConfig,
 )
 from turbohaul.manager import TurbohaulManager
-from turbohaul.slot import SlotState
 from turbohaul.state import open_state_db
 from turbohaul.subprocess_mgr import SidecarHandle
 
@@ -116,9 +116,7 @@ class TestWorkerLoopFullCycle:
 
         # Verify slot ended COLD via teardown
         conn = open_state_db(boot.storage.state_db_path)
-        cur = conn.execute(
-            "SELECT state, end_reason FROM slots WHERE slot_id=?", (slot.slot_id,)
-        )
+        cur = conn.execute("SELECT state, end_reason FROM slots WHERE slot_id=?", (slot.slot_id,))
         row = cur.fetchone()
         assert row["state"] == "COLD"
         assert "grace-expired" in row["end_reason"]
@@ -144,9 +142,13 @@ class TestWorkerLoopFullCycle:
             pass
 
         mgr = TurbohaulManager(
-            boot, runtime,
-            spawn_fn=fake_spawn, health_fn=fake_health,
-            sigterm_fn=fake_sigterm, vram_fn=fake_vram, complete_fn=fake_complete,
+            boot,
+            runtime,
+            spawn_fn=fake_spawn,
+            health_fn=fake_health,
+            sigterm_fn=fake_sigterm,
+            vram_fn=fake_vram,
+            complete_fn=fake_complete,
         )
         slot = await mgr.submit(model_tag="m1", prompt="hi")
         mgr._worker_task = asyncio.create_task(mgr.worker_loop())
@@ -187,9 +189,13 @@ class TestWorkerLoopFullCycle:
             pass  # never reached
 
         mgr = TurbohaulManager(
-            boot, runtime,
-            spawn_fn=fake_spawn, health_fn=fake_health_timeout,
-            sigterm_fn=fake_sigterm, vram_fn=fake_vram, complete_fn=fake_complete,
+            boot,
+            runtime,
+            spawn_fn=fake_spawn,
+            health_fn=fake_health_timeout,
+            sigterm_fn=fake_sigterm,
+            vram_fn=fake_vram,
+            complete_fn=fake_complete,
         )
         slot = await mgr.submit(model_tag="m1", prompt="hi")
         mgr._worker_task = asyncio.create_task(mgr.worker_loop())
@@ -231,9 +237,13 @@ class TestWorkerLoopFullCycle:
             await asyncio.sleep(0.01)
 
         mgr = TurbohaulManager(
-            boot, runtime,
-            spawn_fn=fake_spawn, health_fn=fake_health,
-            sigterm_fn=fake_sigterm, vram_fn=fake_vram, complete_fn=fake_complete,
+            boot,
+            runtime,
+            spawn_fn=fake_spawn,
+            health_fn=fake_health,
+            sigterm_fn=fake_sigterm,
+            vram_fn=fake_vram,
+            complete_fn=fake_complete,
         )
         s1 = await mgr.submit(model_tag="m1", prompt="first")
         s2 = await mgr.submit(model_tag="m2", prompt="second")
@@ -258,9 +268,7 @@ class TestIdleHotWire:
 
     async def test_grace_expiry_holds_warm_idle_when_idle_seconds_gt0(self, tmp_path):
         """After grace expires WITHOUT match, _idle_handle is held + sigterm NOT called yet."""
-        boot, runtime = _boot_runtime(
-            tmp_path, grace_seconds=0, idle_hot_load_seconds=120
-        )
+        boot, runtime = _boot_runtime(tmp_path, grace_seconds=0, idle_hot_load_seconds=120)
         spawn_call_count = [0]
         sigterm_calls = []
 
@@ -282,9 +290,12 @@ class TestIdleHotWire:
             return {"ok": True}
 
         mgr = TurbohaulManager(
-            boot, runtime,
-            spawn_fn=fake_spawn, health_fn=fake_health,
-            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            boot,
+            runtime,
+            spawn_fn=fake_spawn,
+            health_fn=fake_health,
+            sigterm_fn=fake_sigterm,
+            vram_fn=fake_vram,
             complete_fn=fake_complete,
         )
         mgr._worker_task = asyncio.create_task(mgr.worker_loop())
@@ -301,9 +312,7 @@ class TestIdleHotWire:
 
     async def test_warm_inherit_same_model_skips_spawn(self, tmp_path):
         """Second request for SAME model_tag inherits the warm handle."""
-        boot, runtime = _boot_runtime(
-            tmp_path, grace_seconds=0, idle_hot_load_seconds=120
-        )
+        boot, runtime = _boot_runtime(tmp_path, grace_seconds=0, idle_hot_load_seconds=120)
         spawn_call_count = [0]
 
         def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
@@ -323,9 +332,12 @@ class TestIdleHotWire:
             return {"ok": True}
 
         mgr = TurbohaulManager(
-            boot, runtime,
-            spawn_fn=fake_spawn, health_fn=fake_health,
-            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            boot,
+            runtime,
+            spawn_fn=fake_spawn,
+            health_fn=fake_health,
+            sigterm_fn=fake_sigterm,
+            vram_fn=fake_vram,
             complete_fn=fake_complete,
         )
         mgr._worker_task = asyncio.create_task(mgr.worker_loop())
@@ -341,9 +353,7 @@ class TestIdleHotWire:
 
     async def test_different_model_tears_down_idle_then_spawns(self, tmp_path):
         """Second request for DIFFERENT model_tag tears down idle holder first."""
-        boot, runtime = _boot_runtime(
-            tmp_path, grace_seconds=0, idle_hot_load_seconds=120
-        )
+        boot, runtime = _boot_runtime(tmp_path, grace_seconds=0, idle_hot_load_seconds=120)
         spawn_calls = []
         sigterm_calls = []
 
@@ -378,9 +388,12 @@ class TestIdleHotWire:
             )
 
         mgr = TurbohaulManager(
-            boot, runtime,
-            spawn_fn=fake_spawn, health_fn=fake_health,
-            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            boot,
+            runtime,
+            spawn_fn=fake_spawn,
+            health_fn=fake_health,
+            sigterm_fn=fake_sigterm,
+            vram_fn=fake_vram,
             complete_fn=fake_complete,
         )
         mgr._worker_task = asyncio.create_task(mgr.worker_loop())
@@ -397,10 +410,13 @@ class TestIdleHotWire:
         assert "gpt-x" in sigterm_calls
         # gpt-y also sigterm at shutdown
         assert sigterm_calls.count("gpt-y") >= 1
+
     async def test_bogus_model_tag_preserves_idle_holder(self, tmp_path):
         """GRIP H-4 polish (#15735): bogus model_tag must NOT tear down idle holder."""
         boot, runtime = _boot_runtime(
-            tmp_path, grace_seconds=0, idle_hot_load_seconds=120,
+            tmp_path,
+            grace_seconds=0,
+            idle_hot_load_seconds=120,
         )
         spawn_calls = []
         sigterm_calls = []
@@ -428,7 +444,7 @@ class TestIdleHotWire:
         (manifests_dir / "real-model.yaml").write_text(
             "model_tag: real-model\n"
             "gguf_blob_sha256: " + "a" * 64 + "\n"
-            "display_name: \"Real Model\"\n"
+            'display_name: "Real Model"\n'
             "description: test\n"
             "context_size: 2048\n"
             "expected_vram_bytes: 0\n"
@@ -436,9 +452,12 @@ class TestIdleHotWire:
         )
 
         mgr = TurbohaulManager(
-            boot, runtime,
-            spawn_fn=fake_spawn, health_fn=fake_health,
-            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            boot,
+            runtime,
+            spawn_fn=fake_spawn,
+            health_fn=fake_health,
+            sigterm_fn=fake_sigterm,
+            vram_fn=fake_vram,
             complete_fn=fake_complete,
         )
         # Force safety_enabled=False to isolate the manifest-not-found check
@@ -455,12 +474,12 @@ class TestIdleHotWire:
             # WITHOUT tearing down the idle holder.
             with pytest.raises(RuntimeError, match="no manifest"):
                 await mgr.submit_and_wait(
-                    "qwen-pretend", "prompt-bogus", thread_id="t2",
+                    "qwen-pretend",
+                    "prompt-bogus",
+                    thread_id="t2",
                 )
             # Holder must STILL be the real-model warm sidecar
-            assert mgr._idle_handle is not None, (
-                "idle holder was wrongly torn down on bogus-model fail"
-            )
+            assert mgr._idle_handle is not None, "idle holder was wrongly torn down on bogus-model fail"
             assert mgr._idle_model_tag == "real-model"
             # No bogus-spawn fired (we bailed before spawn)
             assert "qwen-pretend" not in spawn_calls
@@ -468,4 +487,3 @@ class TestIdleHotWire:
             assert "real-model" not in sigterm_calls
         finally:
             await mgr.shutdown()
-

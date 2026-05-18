@@ -3,14 +3,14 @@
 Per v0.2 ARCHITECTURE.md §12. Supports cold-recovery on boot
 (orphan reconciliation in §3.1 / §10).
 """
+
 import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 SCHEMA_VERSION = 1
 
@@ -63,7 +63,7 @@ _SCHEMA: list[str] = [
 
 def utcnow_iso() -> str:
     """ISO-8601 UTC timestamp to-the-second."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def open_state_db(state_db_path: Path) -> sqlite3.Connection:
@@ -85,9 +85,7 @@ def open_state_db(state_db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")  # NEMO V2 4.1
     for stmt in _SCHEMA:
         conn.execute(stmt)
-    cur = conn.execute(
-        "SELECT version FROM schema_version WHERE version = ?", (SCHEMA_VERSION,)
-    )
+    cur = conn.execute("SELECT version FROM schema_version WHERE version = ?", (SCHEMA_VERSION,))
     if cur.fetchone() is None:
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
@@ -185,7 +183,7 @@ def reconcile_orphaned_slots(conn: sqlite3.Connection, live_pids: set[int]) -> i
     Two passes:
     1. Slots with pid set but pid NOT in live_pids -> 'boot-reconcile-orphaned-pid'
     2. Slots with pid IS NULL in a pre-active state (RECEIVED / STAGED /
-       LOADING / LOADING_FAIL / GRACE / ACTIVE_MATCH) -> 
+       LOADING / LOADING_FAIL / GRACE / ACTIVE_MATCH) ->
        'boot-reconcile-pre-active-orphan'. These cannot be live since they
        were never assigned a pid (caller crashed pre-spawn).
 
@@ -212,8 +210,6 @@ def reconcile_orphaned_slots(conn: sqlite3.Connection, live_pids: set[int]) -> i
              AND ended_at IS NULL"""
     )
     for row in cur.fetchall():
-        mark_slot_ended(
-            conn, row["slot_id"], "boot-reconcile-pre-active-orphan"
-        )
+        mark_slot_ended(conn, row["slot_id"], "boot-reconcile-pre-active-orphan")
         n += 1
     return n

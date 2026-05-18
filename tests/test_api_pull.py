@@ -1,6 +1,7 @@
 """Tests for pull endpoints (Wave 14 - v0.2 §9.1)."""
+
 import hashlib
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -156,9 +157,7 @@ class TestPullUrl:
         with patch("turbohaul.ssrf_guard.socket.getaddrinfo") as ga:
             ga.return_value = [(2, 1, 0, "", ("1.1.1.1", 0))]
             app.state.http_client_factory = _make_mock_httpx_factory([data])
-            r = client.post(
-                "/api/pull-url", json={"url": "https://example.com/big.gguf"}
-            )
+            r = client.post("/api/pull-url", json={"url": "https://example.com/big.gguf"})
             assert r.status_code == 413
 
 
@@ -201,6 +200,7 @@ class TestProgressEvents:
         mgr = app.state.manager
         # Subscribe a queue to event_bus
         import asyncio
+
         q = asyncio.Queue()
         mgr.event_bus.subscribe(q)
         data = b"data"

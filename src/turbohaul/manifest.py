@@ -16,6 +16,7 @@ Wave 2 DAG synthesis 2026-05-17 (RBSRS specialists #4 + #58 + #13):
 - chat_template hardened: must match built-in enum OR be plain non-Jinja string
   (closes F3 SSTI gap per Security Reviewer).
 """
+
 import contextlib
 import os
 import re
@@ -25,7 +26,6 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-
 
 # === Closed allowlist of safe llama-server flags (v0.2 §8.1, Security F1) ===
 # Each entry is (key, expected_python_type | tuple of types). To add a new
@@ -81,13 +81,13 @@ SAFE_LLAMA_FLAGS: dict[str, Any] = {
     "yarn_beta_slow": float,
     "yarn_beta_fast": float,
     # === MoE / multi-GPU ===
-    "cpu_moe": bool,            # -cmoe (all MoE on CPU)
-    "n_cpu_moe": int,           # -ncmoe N (count of MoE layers on CPU)
-    "split_mode": str,          # enum: none/layer/row/tensor
+    "cpu_moe": bool,  # -cmoe (all MoE on CPU)
+    "n_cpu_moe": int,  # -ncmoe N (count of MoE layers on CPU)
+    "split_mode": str,  # enum: none/layer/row/tensor
     "main_gpu": int,
     # NOTE: tensor_split intentionally NOT added — CSV-string with shell-meta risk;
     # defer until validator can parse "N,N,N" safely (Wave 3 work).
-    "fit": str,                 # enum on/off (Tom's Fork auto-mem-fit)
+    "fit": str,  # enum on/off (Tom's Fork auto-mem-fit)
     "fit_ctx": int,
     # NOTE: fit_target also CSV-string; defer.
     # === Sampling — full set ===
@@ -95,14 +95,14 @@ SAFE_LLAMA_FLAGS: dict[str, Any] = {
     "top_k": int,
     "top_p": float,
     "min_p": float,
-    "typical_p": float,         # Ollama parity
+    "typical_p": float,  # Ollama parity
     "top_n_sigma": float,
     "repeat_penalty": float,
     "repeat_last_n": int,
     "presence_penalty": float,  # Ollama parity
-    "frequency_penalty": float, # Ollama parity
+    "frequency_penalty": float,  # Ollama parity
     "seed": int,
-    "mirostat": int,            # Ollama parity — 0/1/2
+    "mirostat": int,  # Ollama parity — 0/1/2
     "mirostat_lr": float,
     "mirostat_ent": float,
     "xtc_probability": float,
@@ -117,27 +117,27 @@ SAFE_LLAMA_FLAGS: dict[str, Any] = {
     "adaptive_decay": float,
     "ignore_eos": bool,
     # === Chat / template (value names + bounded strings only) ===
-    "chat_template": str,       # gated: built-in enum OR plain non-Jinja string
+    "chat_template": str,  # gated: built-in enum OR plain non-Jinja string
     "jinja": bool,
     "skip_chat_parsing": bool,
     "special": bool,
     "spm_infill": bool,
     # === Reasoning — Hermes preserved-thinking ===
-    "reasoning_format": str,    # enum: none/deepseek/deepseek-legacy/auto
-    "reasoning": str,           # enum: on/off/auto
-    "reasoning_budget": int,    # -1/0/N — Hermes preserved-thinking knob
+    "reasoning_format": str,  # enum: none/deepseek/deepseek-legacy/auto
+    "reasoning": str,  # enum: on/off/auto
+    "reasoning_budget": int,  # -1/0/N — Hermes preserved-thinking knob
     # === Server toggles ===
     "metrics": bool,
     "slots": bool,
     "props": bool,
     "embeddings": bool,
     "reranking": bool,
-    "pooling": str,             # enum: none/mean/cls/last/rank
+    "pooling": str,  # enum: none/mean/cls/last/rank
     "offline": bool,
     # === Debug ===
     "verbose": bool,
     "log_disable": bool,
-    "log_colors": str,          # enum: on/off/auto
+    "log_colors": str,  # enum: on/off/auto
     "log_prefix": bool,
     "log_timestamps": bool,
     "log_verbosity": int,
@@ -231,16 +231,50 @@ _N_GPU_LAYERS_STR_VALUES: set[str] = {"all", "auto"}
 # `{%` or `{{` (Jinja constructs that could SSTI-inject via filesystem
 # reads in non-sandboxed Jinja envs).
 SAFE_CHAT_TEMPLATE_NAMES: set[str] = {
-    "chatml", "llama2", "llama3", "llama3.1", "llama3.2", "llama3.3",
-    "gemma", "gemma2", "gemma3", "gemma4",
-    "mistral", "mistral-v1", "mistral-v3", "mistral-v3-tekken", "mistral-v7",
-    "phi3", "phi4",
-    "deepseek", "deepseek2", "deepseek-r1",
-    "qwen", "qwen2", "qwen2.5", "qwen3", "qwen3.5", "qwen3.6",
-    "command-r", "command-r-plus",
-    "vicuna", "alpaca", "zephyr", "chatglm3", "chatglm4",
-    "openchat", "orion", "yi", "monarch", "smollm", "minicpm",
-    "exaone3", "rwkv-world", "granite", "qwen3-thinking", "qwq",
+    "chatml",
+    "llama2",
+    "llama3",
+    "llama3.1",
+    "llama3.2",
+    "llama3.3",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "gemma4",
+    "mistral",
+    "mistral-v1",
+    "mistral-v3",
+    "mistral-v3-tekken",
+    "mistral-v7",
+    "phi3",
+    "phi4",
+    "deepseek",
+    "deepseek2",
+    "deepseek-r1",
+    "qwen",
+    "qwen2",
+    "qwen2.5",
+    "qwen3",
+    "qwen3.5",
+    "qwen3.6",
+    "command-r",
+    "command-r-plus",
+    "vicuna",
+    "alpaca",
+    "zephyr",
+    "chatglm3",
+    "chatglm4",
+    "openchat",
+    "orion",
+    "yi",
+    "monarch",
+    "smollm",
+    "minicpm",
+    "exaone3",
+    "rwkv-world",
+    "granite",
+    "qwen3-thinking",
+    "qwq",
     "default",
 }
 
@@ -316,38 +350,38 @@ DENIED_FLAGS: set[str] = {
     "host",
     "port",
     # Wave 2 +22 (Security Reviewer 2026-05-17 — Tom's Fork ships these, were unguarded)
-    "model_draft",            # -md — arbitrary GGUF path
-    "model_url",              # SSRF + RCE — network fetch by attacker URL
+    "model_draft",  # -md — arbitrary GGUF path
+    "model_url",  # SSRF + RCE — network fetch by attacker URL
     "model_url_draft",
-    "hf_repo",                # SSRF + arbitrary download via HF
+    "hf_repo",  # SSRF + arbitrary download via HF
     "hf_repo_draft",
     "hf_file",
-    "hf_repo_v",              # vocoder variant
+    "hf_repo_v",  # vocoder variant
     "hf_file_v",
-    "docker_repo",            # docker-hub fetch primitive
-    "api_key",                # credential injection
-    "api_key_file",           # path read
-    "ssl_key_file",           # path read (PEM exfil)
+    "docker_repo",  # docker-hub fetch primitive
+    "api_key",  # credential injection
+    "api_key_file",  # path read
+    "ssl_key_file",  # path read (PEM exfil)
     "ssl_cert_file",
-    "lookup_cache_static",    # -lcs — arbitrary read/write
-    "lookup_cache_dynamic",   # -lcd
-    "model_vocoder",          # -mv — arbitrary file read
-    "webui_config_file",      # arbitrary JSON read
-    "webui_mcp_proxy",        # CORS bypass / SSRF (per Tom's Fork README)
-    "path",                   # CRITICAL — sets static-files dir for HTTP serve, /etc exfil
-    "media_path",             # CRITICAL — same exfil class
-    "models_dir",             # path read + arbitrary model load
-    "models_preset",          # arbitrary INI read
-    "control_vector",         # path read
+    "lookup_cache_static",  # -lcs — arbitrary read/write
+    "lookup_cache_dynamic",  # -lcd
+    "model_vocoder",  # -mv — arbitrary file read
+    "webui_config_file",  # arbitrary JSON read
+    "webui_mcp_proxy",  # CORS bypass / SSRF (per Tom's Fork README)
+    "path",  # CRITICAL — sets static-files dir for HTTP serve, /etc exfil
+    "media_path",  # CRITICAL — same exfil class
+    "models_dir",  # path read + arbitrary model load
+    "models_preset",  # arbitrary INI read
+    "control_vector",  # path read
     "control_vector_scaled",
-    "tools",                  # DIRECT RCE — enables exec_shell_command / write_file / edit_file via server API
-    "grammar",                # inline BNF — deferred (needs grammar-parser pre-validator)
-    "tensor_split",           # CSV-string with shell-meta risk — deferred to Wave 3
-    "samplers",               # semi-colon list — deferred (validator needed)
-    "dry_sequence_breaker",   # str list — deferred
-    "chat_template_kwargs",   # JSON-str — deferred (recursive scalar validator needed)
-    "reasoning_budget_message", # str injected mid-stream — deferred (length-cap + ctrl-char strip needed)
-    "fit_target",             # CSV "MiB,MiB" — deferred to Wave 3
+    "tools",  # DIRECT RCE — enables exec_shell_command / write_file / edit_file via server API
+    "grammar",  # inline BNF — deferred (needs grammar-parser pre-validator)
+    "tensor_split",  # CSV-string with shell-meta risk — deferred to Wave 3
+    "samplers",  # semi-colon list — deferred (validator needed)
+    "dry_sequence_breaker",  # str list — deferred
+    "chat_template_kwargs",  # JSON-str — deferred (recursive scalar validator needed)
+    "reasoning_budget_message",  # str injected mid-stream — deferred (length-cap + ctrl-char strip needed)
+    "fit_target",  # CSV "MiB,MiB" — deferred to Wave 3
 }
 
 
@@ -410,9 +444,7 @@ def _validate_flag_value(key: str, value: Any) -> None:
     # Special-case: n_gpu_layers (int OR "all"/"auto")
     if key == "n_gpu_layers":
         if isinstance(value, bool):
-            raise ManifestValidationError(
-                f"llama_server_flags.n_gpu_layers expects int or str, got bool"
-            )
+            raise ManifestValidationError("llama_server_flags.n_gpu_layers expects int or str, got bool")
         if isinstance(value, int):
             lo, hi = SAFE_LLAMA_FLAG_BOUNDS.get(key, (None, None))
             if lo is not None and value < lo:
@@ -429,9 +461,7 @@ def _validate_flag_value(key: str, value: Any) -> None:
     # Special-case: chat_template (enum OR plain non-Jinja string)
     if key == "chat_template":
         if not isinstance(value, str):
-            raise ManifestValidationError(
-                f"chat_template expects str, got {type(value).__name__}"
-            )
+            raise ManifestValidationError(f"chat_template expects str, got {type(value).__name__}")
         _check_jinja_injection(value)
         # Accept if in built-in enum, OR plain string short enough not to be a template body
         if value in SAFE_CHAT_TEMPLATE_NAMES:
@@ -453,13 +483,10 @@ def _validate_flag_value(key: str, value: Any) -> None:
     # General string-enum validation
     if key in SAFE_LLAMA_FLAG_STRING_ENUMS:
         if not isinstance(value, str):
-            raise ManifestValidationError(
-                f"llama_server_flags.{key} expects str enum, got {type(value).__name__}"
-            )
+            raise ManifestValidationError(f"llama_server_flags.{key} expects str enum, got {type(value).__name__}")
         if value not in SAFE_LLAMA_FLAG_STRING_ENUMS[key]:
             raise ManifestValidationError(
-                f"llama_server_flags.{key}={value!r} not in allowed enum "
-                f"{sorted(SAFE_LLAMA_FLAG_STRING_ENUMS[key])}"
+                f"llama_server_flags.{key}={value!r} not in allowed enum {sorted(SAFE_LLAMA_FLAG_STRING_ENUMS[key])}"
             )
         return
 
@@ -467,16 +494,13 @@ def _validate_flag_value(key: str, value: Any) -> None:
     if isinstance(expected, tuple):
         if not isinstance(value, expected):
             raise ManifestValidationError(
-                f"llama_server_flags.{key} expects one of "
-                f"{[t.__name__ for t in expected]}, got {type(value).__name__}"
+                f"llama_server_flags.{key} expects one of {[t.__name__ for t in expected]}, got {type(value).__name__}"
             )
     else:
         # bool is a subclass of int; reject int→bool coercion explicitly
         if expected is bool:
             if not isinstance(value, bool):
-                raise ManifestValidationError(
-                    f"llama_server_flags.{key} expects bool, got {type(value).__name__}"
-                )
+                raise ManifestValidationError(f"llama_server_flags.{key} expects bool, got {type(value).__name__}")
         elif expected is int and isinstance(value, bool):
             # Wave 1.6: reject bool-for-int coerce
             raise ManifestValidationError(
@@ -487,8 +511,7 @@ def _validate_flag_value(key: str, value: Any) -> None:
             pass  # int → float promotion OK
         elif not isinstance(value, expected):
             raise ManifestValidationError(
-                f"llama_server_flags.{key} expects {expected.__name__}, "
-                f"got {type(value).__name__}"
+                f"llama_server_flags.{key} expects {expected.__name__}, got {type(value).__name__}"
             )
 
     # Numeric bounds (DoS prevention)
@@ -496,13 +519,9 @@ def _validate_flag_value(key: str, value: Any) -> None:
         lo, hi = SAFE_LLAMA_FLAG_BOUNDS[key]
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             if lo is not None and value < lo:
-                raise ManifestValidationError(
-                    f"llama_server_flags.{key}={value} below min {lo}"
-                )
+                raise ManifestValidationError(f"llama_server_flags.{key}={value} below min {lo}")
             if hi is not None and value > hi:
-                raise ManifestValidationError(
-                    f"llama_server_flags.{key}={value} above max {hi}"
-                )
+                raise ManifestValidationError(f"llama_server_flags.{key}={value} above max {hi}")
 
 
 class Manifest(BaseModel):
@@ -531,9 +550,7 @@ class Manifest(BaseModel):
     @classmethod
     def _sha256_format(cls, v: str) -> str:
         if not re.fullmatch(r"[0-9a-f]{64}", v):
-            raise ManifestValidationError(
-                f"gguf_blob_sha256 must be 64 hex chars; got {v[:32]}... (len={len(v)})"
-            )
+            raise ManifestValidationError(f"gguf_blob_sha256 must be 64 hex chars; got {v[:32]}... (len={len(v)})")
         return v
 
     @field_validator("llama_server_flags")
@@ -568,13 +585,9 @@ def _safe_manifest_path(manifests_root: Path, tag: str) -> Path:
     try:
         target.relative_to(root_real)
     except ValueError as e:
-        raise ManifestValidationError(
-            f"manifest path {target} escapes manifests root {root_real}"
-        ) from e
+        raise ManifestValidationError(f"manifest path {target} escapes manifests root {root_real}") from e
     if target_unresolved.is_symlink() or target.is_symlink():
-        raise ManifestValidationError(
-            f"manifest path is a symlink - refusing (v0.2 §8.1 safety)"
-        )
+        raise ManifestValidationError("manifest path is a symlink - refusing (v0.2 §8.1 safety)")
     return target
 
 
@@ -585,9 +598,7 @@ def read_manifest(manifests_root: Path, tag: str) -> Manifest:
         raise FileNotFoundError(f"manifest not found: {tag}")
     data = yaml.safe_load(path.read_text())
     if not isinstance(data, dict):
-        raise ManifestValidationError(
-            f"manifest root must be mapping, got {type(data).__name__}"
-        )
+        raise ManifestValidationError(f"manifest root must be mapping, got {type(data).__name__}")
     return Manifest(**data)
 
 
@@ -596,9 +607,7 @@ def manifest_etag(manifests_root: Path, tag: str) -> str:
     return f'"{m.revision}"'
 
 
-def write_manifest_atomic(
-    manifests_root: Path, manifest: Manifest, if_match: str | None = None
-) -> Manifest:
+def write_manifest_atomic(manifests_root: Path, manifest: Manifest, if_match: str | None = None) -> Manifest:
     """Atomic write with ETag/If-Match concurrency check (v0.2 §8.2 + HAUL M-1).
 
     - First write (no existing manifest): writes as-is, revision preserved;
@@ -618,14 +627,11 @@ def write_manifest_atomic(
             # caller could omit the header and silently overwrite the
             # concurrent write of another caller. Lost-update class.
             raise ConcurrencyError(
-                "If-Match header required for manifest update "
-                f"(current ETag is \"{existing.revision}\")"
+                f'If-Match header required for manifest update (current ETag is "{existing.revision}")'
             )
         actual = f'"{existing.revision}"'
         if if_match != actual:
-            raise ConcurrencyError(
-                f"If-Match {if_match!r} does not match current ETag {actual!r}"
-            )
+            raise ConcurrencyError(f"If-Match {if_match!r} does not match current ETag {actual!r}")
         # Increment revision on update
         manifest = manifest.model_copy(update={"revision": existing.revision + 1})
 
@@ -701,9 +707,7 @@ def flags_to_argv(flags: dict[str, Any]) -> list[str]:
     argv: list[str] = []
     for key, value in flags.items():
         if key not in SAFE_LLAMA_FLAGS or key in DENIED_FLAGS:
-            raise ManifestValidationError(
-                f"flag {key} blocked at argv-build (allowlist enforcement)"
-            )
+            raise ManifestValidationError(f"flag {key} blocked at argv-build (allowlist enforcement)")
         cli_key = "--" + key.replace("_", "-")
         # Special-case: flash_attn tri-state CLI
         if key == "flash_attn":

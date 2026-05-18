@@ -6,6 +6,7 @@ DELETE /api/delete — remove blob by sha256 (Ollama-compat shape).
 Security #58 F4 must-fix: import_allowed_root sandbox + O_NOFOLLOW + GGUF magic
 check + denylist of system paths. Path-traversal + symlink escape REJECTED.
 """
+
 import logging
 import os
 import secrets
@@ -20,7 +21,6 @@ from turbohaul.blob_store import (
     delete_blob,
     write_stream_atomic,
 )
-
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["import-delete"])
@@ -62,24 +62,18 @@ def _validate_import_path(import_allowed_root: Path, candidate: str) -> Path:
         raise ImportSafetyError("path must be absolute")
     for denied in DENIED_PATH_PREFIXES:
         if candidate.startswith(denied):
-            raise ImportSafetyError(
-                f"path {candidate!r} starts with denied prefix {denied}"
-            )
+            raise ImportSafetyError(f"path {candidate!r} starts with denied prefix {denied}")
 
     target = Path(candidate)
     if target.is_symlink():
-        raise ImportSafetyError(
-            f"path {candidate} is a symlink (rejected per v0.2 §9.2)"
-        )
+        raise ImportSafetyError(f"path {candidate} is a symlink (rejected per v0.2 §9.2)")
 
     resolved = target.resolve(strict=False)
     root_resolved = import_allowed_root.resolve()
     try:
         resolved.relative_to(root_resolved)
     except ValueError as e:
-        raise ImportSafetyError(
-            f"path {candidate} escapes import_allowed_root {root_resolved}"
-        ) from e
+        raise ImportSafetyError(f"path {candidate} escapes import_allowed_root {root_resolved}") from e
     if not resolved.exists():
         raise ImportSafetyError(f"path {candidate} does not exist")
     if not resolved.is_file():
@@ -94,9 +88,7 @@ def _stream_local_file(path: Path, chunk_size: int = 64 * 1024):
         # Magic check
         head = os.read(fd, 4)
         if len(head) < 4 or head != GGUF_MAGIC:
-            raise ImportSafetyError(
-                f"file does not start with GGUF magic (saw {head!r})"
-            )
+            raise ImportSafetyError(f"file does not start with GGUF magic (saw {head!r})")
         yield head
         while True:
             chunk = os.read(fd, chunk_size)
@@ -122,16 +114,12 @@ async def import_local(payload: dict, request: Request) -> dict:
 
     mgr = request.app.state.manager
     try:
-        safe_path = _validate_import_path(
-            mgr.boot.storage.import_allowed_root, raw_path or ""
-        )
+        safe_path = _validate_import_path(mgr.boot.storage.import_allowed_root, raw_path or "")
     except ImportSafetyError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     pull_id = "import-" + secrets.token_hex(8)
-    mgr.event_bus.publish_nowait(
-        {"event": "import_started", "pull_id": pull_id, "path_basename": safe_path.name}
-    )
+    mgr.event_bus.publish_nowait({"event": "import_started", "pull_id": pull_id, "path_basename": safe_path.name})
 
     try:
         sha, bytes_written = write_stream_atomic(
@@ -141,24 +129,16 @@ async def import_local(payload: dict, request: Request) -> dict:
             per_stream_max_bytes=mgr.runtime.pull.per_stream_max_bytes,
         )
     except ImportSafetyError as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "import_failed", "pull_id": pull_id, "reason": "magic-check"}
-        )
+        mgr.event_bus.publish_nowait({"event": "import_failed", "pull_id": pull_id, "reason": "magic-check"})
         raise HTTPException(status_code=400, detail=str(e)) from e
     except BlobSizeExceeded as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "import_failed", "pull_id": pull_id, "reason": "size-exceeded"}
-        )
+        mgr.event_bus.publish_nowait({"event": "import_failed", "pull_id": pull_id, "reason": "size-exceeded"})
         raise HTTPException(status_code=413, detail=str(e)) from e
     except BlobHashMismatch as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "import_failed", "pull_id": pull_id, "reason": "hash-mismatch"}
-        )
+        mgr.event_bus.publish_nowait({"event": "import_failed", "pull_id": pull_id, "reason": "hash-mismatch"})
         raise HTTPException(status_code=400, detail=str(e)) from e
     except BlobError as e:
-        mgr.event_bus.publish_nowait(
-            {"event": "import_failed", "pull_id": pull_id, "reason": "blob-error"}
-        )
+        mgr.event_bus.publish_nowait({"event": "import_failed", "pull_id": pull_id, "reason": "blob-error"})
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     mgr.event_bus.publish_nowait(
@@ -185,9 +165,7 @@ async def delete_blob_route(payload: dict, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="payload must be JSON object")
     sha = payload.get("sha256") or payload.get("digest", "").removeprefix("sha256:")
     if not sha:
-        raise HTTPException(
-            status_code=400, detail="`sha256` (or `digest: sha256:...`) required"
-        )
+        raise HTTPException(status_code=400, detail="`sha256` (or `digest: sha256:...`) required")
     mgr = request.app.state.manager
     try:
         removed = delete_blob(mgr.boot.storage.blob_store_path, sha)

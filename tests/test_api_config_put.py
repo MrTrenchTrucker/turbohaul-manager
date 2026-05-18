@@ -1,4 +1,5 @@
 """Tests for PUT /api/config split (Wave 10 - v0.2 §7.1)."""
+
 import pytest
 from fastapi.testclient import TestClient
 

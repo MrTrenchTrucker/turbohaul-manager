@@ -12,21 +12,20 @@ Pop: drained-SIGTERM on the whole process group; killpg(SIGKILL) on timeout.
 VRAM verify: nvidia-smi cross-check after POPPED before next stage.
 Binary integrity: sha256 verify at boot (defense-in-depth, v0.2 §7.1).
 """
+
 import asyncio
 import contextlib
 import hashlib
 import logging
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import httpx
-
 
 log = logging.getLogger(__name__)
 
@@ -90,14 +89,19 @@ def spawn_sidecar(
         pass_fds = ()
     cmd = [
         exec_path,
-        "--port", str(port),
-        "--host", "127.0.0.1",
-        "-m", str(gguf_path),
+        "--port",
+        str(port),
+        "--host",
+        "127.0.0.1",
+        "-m",
+        str(gguf_path),
         *argv_flags,
     ]
     log.info(
         "spawning llama-server pid=? port=%d model=%s pinned_fd=%s",
-        port, model_tag, "yes" if binary_fd is not None else "no",
+        port,
+        model_tag,
+        "yes" if binary_fd is not None else "no",
     )
     # HAUL P-3 fix: stdout/stderr to DEVNULL — PIPE without an active drainer
     # fills the 64KB OS pipe buffer once llama-server emits enough log lines
@@ -177,12 +181,13 @@ async def wait_until_healthy(
 
 
 def _default_nvidia_smi_runner() -> str:
-    return subprocess.check_output(
+    return subprocess.check_output(  # noqa: S603 — argv is constant, no shell
         [
             _NVIDIA_SMI_PATH,
             "--query-gpu=memory.used",
             "--format=csv,noheader,nounits",
-            "-i", "0",
+            "-i",
+            "0",
         ],
         text=True,
         timeout=5,
@@ -250,8 +255,8 @@ async def drained_sigterm(
         except subprocess.TimeoutExpired:
             pass
         return True, "already-gone-during-sigterm"
-    except PermissionError as e:
-        return False, f"sigterm-failed-permission-denied"
+    except PermissionError:
+        return False, "sigterm-failed-permission-denied"
 
     deadline = time.monotonic() + wait_window
     while time.monotonic() < deadline:

@@ -7,8 +7,8 @@ and calls these transition primitives.
 Encodes the 10-state machine plus the new GRACE-BUSY, ACTIVE-MATCH, COLD-RECOVERY
 transitions added in v0.2 per Brainstormer #12 F2 must-fix.
 """
-from turbohaul.slot import Slot, SlotState
 
+from turbohaul.slot import Slot, SlotState
 
 # Legal transitions per v0.2 §6.
 # Each entry: from_state → set of allowed to_states.

@@ -6,6 +6,7 @@ moved here from main.py is still served from main). The streaming completion rou
 
 Trademark hygiene per v0.2 §14: 'Ollama-compatible' (nominative fair use) only.
 """
+
 from fastapi import APIRouter, HTTPException, Request
 
 from turbohaul.manifest import (
@@ -13,7 +14,6 @@ from turbohaul.manifest import (
     list_manifests,
     read_manifest,
 )
-
 
 router = APIRouter(prefix="/api", tags=["ollama-compat"])
 

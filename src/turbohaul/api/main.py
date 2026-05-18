@@ -3,6 +3,7 @@
 Per v0.2 ARCHITECTURE.md §9 + §11. Phase 5 Wave 16 adds /ui static-file serving
 with SPA fallback + CSP + security headers.
 """
+
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -13,6 +14,8 @@ from fastapi.responses import FileResponse
 from turbohaul import __version__
 from turbohaul.api.chat_completion import (
     make_llama_server_complete_fn,
+)
+from turbohaul.api.chat_completion import (
     router as chat_completion_router,
 )
 from turbohaul.api.config_put import router as config_put_router
@@ -23,7 +26,6 @@ from turbohaul.api.pull import router as pull_router
 from turbohaul.api.ws_state import router as ws_state_router
 from turbohaul.config import BootConfig, RuntimeConfig
 from turbohaul.manager import TurbohaulManager
-
 
 log = logging.getLogger(__name__)
 
