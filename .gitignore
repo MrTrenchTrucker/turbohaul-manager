@@ -61,3 +61,5 @@ ui_dist/
 turbohaul.local.yaml
 docker_build.*
 cuda_build.*
+# Build artifacts (broad-arch CUDA build attempts)
+cuda_multi.*
