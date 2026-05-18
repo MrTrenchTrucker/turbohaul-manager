@@ -1,0 +1,48 @@
+# Auto-format and lint on commit.
+#
+# Install (once per clone):
+#   pip install -e ".[dev]"   # pulls in pre-commit
+#   npm install               # populates node_modules/.bin (oxfmt, oxlint)
+#   pre-commit install
+#
+# Manual run over the whole repo:
+#   pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.13
+    hooks:
+      - id: ruff-format
+        name: ruff-format (autoformat python)
+      - id: ruff-check
+        name: ruff-check (lint python, autofix)
+        args: [--fix]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+  - repo: local
+    hooks:
+      - id: oxfmt
+        name: oxfmt (autoformat js/ts/md/json/yaml/toml/css/html)
+        language: system
+        entry: node_modules/.bin/oxfmt
+        files: \.(ts|tsx|js|jsx|cjs|mjs|json|jsonc|css|scss|less|html|md|mdx|yml|yaml|toml|graphql)$
+        exclude: ^(node_modules|src/frontend/dist)/
+        pass_filenames: true
+
+      - id: oxlint
+        name: oxlint (lint js/ts, autofix)
+        language: system
+        entry: node_modules/.bin/oxlint
+        args: [--fix]
+        files: \.(ts|tsx|js|jsx|cjs|mjs)$
+        exclude: ^(node_modules|src/frontend/dist)/
+        pass_filenames: true
