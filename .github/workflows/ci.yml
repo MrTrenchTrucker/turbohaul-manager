@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  backend-lint:
+    name: backend · ruff (format + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff==0.15.13
+      - name: ruff format --check
+        run: ruff format --check src tests
+      - name: ruff check
+        run: ruff check src tests
+
+  backend-tests:
+    name: backend · pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest -v --tb=short
+
+  frontend:
+    name: frontend · oxc + tsc + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: npm ci (root + workspace)
+        run: npm ci
+
+      - name: oxfmt --check
+        run: npm run format:check
+
+      - name: oxlint
+        run: npm run lint
+
+      - name: tsc --noEmit
+        run: npm run typecheck
+
+      - name: vite build
+        run: npm run build
