@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["import", "typescript", "react"],
+  "env": {
+    "browser": true,
+    "es2024": true
+  },
+  "settings": {
+    "react": {
+      "version": "18.3.1"
+    }
+  },
+  "rules": {
+    "eqeqeq": "error",
+    "no-unused-vars": "warn",
+    "typescript/no-explicit-any": "warn"
+  },
+  "ignorePatterns": ["**/dist", "**/node_modules"]
+}

@@ -32,6 +32,7 @@ docker build -f Dockerfile.cuda -t turbohaul-manager:v0.2.1 .
 ## API
 
 Compatible with Ollama-shape clients:
+
 - `GET /api/tags` -- list models
 - `GET /api/show?name=<tag>` -- model detail
 - `POST /v1/chat/completions` -- OpenAI-shape inference
@@ -48,12 +49,30 @@ Pointing an AI agent (Hermes, langchain, llama-index, LiteLLM, raw OpenAI SDK, O
 
 ```yaml
 base_url: http://<turbohaul-host>:11401/v1
-api_key: dummy   # no auth required on the fleet-internal port
+api_key: dummy # no auth required on the fleet-internal port
 ```
 
 Turbohaul ships with sane defaults for multi-tool-call agent loops — `idle_hot_load_seconds=600`, `grace_seconds=30`, streaming SSE pass-through, tool-call field forwarding, and ACTIVE_MATCH warm-slot reuse for same-`thread_id` follow-ups (sub-second after the first turn).
 
 **Full guide:** [docs/AI_AGENT_SETUP.md](docs/AI_AGENT_SETUP.md) — per-agent config recipes (Hermes / OpenAI SDK / langchain / llama-index / LiteLLM / Ollama / curl), multi-tool-call workflow notes, production setup, validation smoke tests, and a troubleshooting table.
+
+## Development
+
+```bash
+pip install -e ".[dev]"   # backend deps + pre-commit
+npm install               # frontend + oxc tooling (workspace root)
+pre-commit install        # auto-format + lint on every commit
+
+pytest                    # backend test suite
+npm run build             # frontend production build
+npm run dev               # frontend dev server
+```
+
+CI (`.github/workflows/ci.yml`) runs three parallel jobs on every PR:
+
+- `backend-lint` — `ruff format --check` + `ruff check`
+- `backend-tests` — `pytest` on py3.11 and py3.12
+- `frontend` — `oxfmt --check` + `oxlint` + `tsc --noEmit` + `vite build`
 
 ## License
 

@@ -6,11 +6,12 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
 # Frontend build artifacts
-src/frontend/node_modules/
+node_modules/
 src/frontend/dist/
 src/frontend/build.log
 src/frontend/build.done
@@ -31,7 +32,7 @@ var/
 *.swp
 *.swo
 
-# Project meta + tests (kept for image — but `tests/` is large; comment to include)
+# Project meta + tests (kept for image — but tests are large; comment to include)
 tests/
 ARCHITECTURE.md
 TODO.md

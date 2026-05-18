@@ -63,3 +63,9 @@ docker_build.*
 cuda_build.*
 # Build artifacts (broad-arch CUDA build attempts)
 cuda_multi.*
+
+.ruff_cache/
+
+# Node
+node_modules/
+**/dist/

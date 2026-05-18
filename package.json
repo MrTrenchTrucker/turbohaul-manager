@@ -1,0 +1,22 @@
+{
+  "name": "turbohaul-manager",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Repo-level npm workspace root. Hosts repo-wide JS tooling (oxc) and references the frontend workspace at src/frontend.",
+  "workspaces": [
+    "src/frontend"
+  ],
+  "scripts": {
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
+    "build": "npm run build -w turbohaul-frontend",
+    "typecheck": "npm run typecheck -w turbohaul-frontend",
+    "dev": "npm run dev -w turbohaul-frontend"
+  },
+  "devDependencies": {
+    "oxfmt": "0.50.0",
+    "oxlint": "1.65.0"
+  }
+}

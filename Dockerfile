@@ -15,11 +15,12 @@
 FROM node:20-alpine AS frontend-build
 
 WORKDIR /work
-COPY src/frontend/package.json src/frontend/package-lock.json ./
+COPY package.json package-lock.json ./
+COPY src/frontend/package.json ./src/frontend/package.json
 RUN npm ci --no-audit --no-fund
 
-COPY src/frontend/. ./
-RUN npm run typecheck && npm run build
+COPY src/frontend/. ./src/frontend/
+RUN npm run typecheck -w turbohaul-frontend && npm run build -w turbohaul-frontend
 
 # ----------------------------------------------------------------------------
 # Stage 2: Python runtime
@@ -38,7 +39,7 @@ COPY src/turbohaul/ ./src/turbohaul/
 RUN pip install --no-cache-dir .
 
 # Frontend bundle from stage 1.
-COPY --from=frontend-build /work/dist /opt/turbohaul/ui_dist
+COPY --from=frontend-build /work/src/frontend/dist /opt/turbohaul/ui_dist
 
 # Runtime directories (state + config).
 RUN mkdir -p /var/lib/turbohaul /etc/turbohaul /opt/turbohaul/bin \
