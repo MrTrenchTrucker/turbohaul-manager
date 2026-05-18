@@ -30,6 +30,8 @@ This project is in early days. If you want to contribute:
 
 Future contributors will be added below in the order their first commit lands on `main`.
 
+- **lmist** -- favicon set + project logo PNG, frontend integration (PR #1), started 2026-05
+
 <!-- Add new contributors above this line, format:
 - **Handle** -- one-line description, started YYYY-MM
 -->
