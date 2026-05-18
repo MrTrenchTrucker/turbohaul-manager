@@ -12,7 +12,7 @@ Most agents need this and only this:
 
 ```yaml
 base_url: http://<turbohaul-host>:11401/v1
-api_key: dummy   # any string — Turbohaul doesn't require auth on the fleet-internal port
+api_key: dummy # any string — Turbohaul doesn't require auth on the fleet-internal port
 ```
 
 If your agent is OpenAI-API-shaped (Hermes, OpenAI Python SDK, langchain `ChatOpenAI`, llama-index `OpenAI`, etc.), point it at `:11401/v1`. If it's Ollama-shaped, point it at `:11434` (no `/v1` suffix). Both surfaces talk to the same container and the same slot lifecycle.
@@ -27,16 +27,16 @@ The rest of this doc is for when "just works" doesn't, or when you want to tune.
 
 You don't have to set any of these; they're the default. Listed so you can recognize the behavior you'll see in logs:
 
-| Behavior | Default | What it does for your agent |
-|---|---|---|
-| `idle_hot_load_seconds` | `600` (10 min) | After a request completes, the slot stays warm. The next request to the same model within 10 min skips cold-load (saves ~30-60s on a 27B GGUF). |
-| `grace_seconds` | `30` | After a request completes, the slot holds for another 30s before transitioning to IDLE_HOT. Within this window, **ACTIVE_MATCH cascade** warm-reuses the slot for same-thread follow-ups (sub-second handoff). |
-| `keep_alive` | client-overridable | If your agent sends Ollama-style `keep_alive: "10m"` or `1800` (seconds), Turbohaul honors it as the IDLE_HOT extension (capped at 30 min). `keep_alive: 0` = unload immediately. `keep_alive: -1` = pin (max cap). Single line in `extra_body` for OpenAI-SDK clients (see Hermes §5 below). |
-| Streaming SSE pass-through | always on | When you send `stream: true`, Turbohaul opens its own `httpx.stream()` to llama-server and pipes raw SSE chunks back. The 12-second keep-alive heartbeat keeps your client socket warm during cold-load. |
-| Tool-call fields | pass through | `tools`, `tool_choice`, `parallel_tool_calls`, `function_call`, `functions` forwarded verbatim to llama-server. Works on any model whose manifest sets `jinja: true`. |
-| Thinking models | reasoning preserved | Qwen3.6, DeepSeek-R1, and similar thinking models get their `<think>...</think>` blocks PLUS structured `reasoning_content` deltas in streaming responses. No client-side merging needed. |
-| Per-thread warm reuse | via `thread_id` | If you include a `thread_id` field in the request body, same-thread follow-ups within the grace window hit ACTIVE_MATCH (warm slot, no re-spawn). Many OpenAI-SDK clients can pass arbitrary fields via `extra_body`. |
-| Safety guardrails | always on | Pre-spawn VRAM/RAM/CPU/IO-wait checks refuse to spawn into an OOM or IO-stuck host (returns HTTP 503 + `Retry-After` rather than crashing the box). |
+| Behavior                   | Default             | What it does for your agent                                                                                                                                                                                                                                                                   |
+| -------------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `idle_hot_load_seconds`    | `600` (10 min)      | After a request completes, the slot stays warm. The next request to the same model within 10 min skips cold-load (saves ~30-60s on a 27B GGUF).                                                                                                                                               |
+| `grace_seconds`            | `30`                | After a request completes, the slot holds for another 30s before transitioning to IDLE_HOT. Within this window, **ACTIVE_MATCH cascade** warm-reuses the slot for same-thread follow-ups (sub-second handoff).                                                                                |
+| `keep_alive`               | client-overridable  | If your agent sends Ollama-style `keep_alive: "10m"` or `1800` (seconds), Turbohaul honors it as the IDLE_HOT extension (capped at 30 min). `keep_alive: 0` = unload immediately. `keep_alive: -1` = pin (max cap). Single line in `extra_body` for OpenAI-SDK clients (see Hermes §5 below). |
+| Streaming SSE pass-through | always on           | When you send `stream: true`, Turbohaul opens its own `httpx.stream()` to llama-server and pipes raw SSE chunks back. The 12-second keep-alive heartbeat keeps your client socket warm during cold-load.                                                                                      |
+| Tool-call fields           | pass through        | `tools`, `tool_choice`, `parallel_tool_calls`, `function_call`, `functions` forwarded verbatim to llama-server. Works on any model whose manifest sets `jinja: true`.                                                                                                                         |
+| Thinking models            | reasoning preserved | Qwen3.6, DeepSeek-R1, and similar thinking models get their `<think>...</think>` blocks PLUS structured `reasoning_content` deltas in streaming responses. No client-side merging needed.                                                                                                     |
+| Per-thread warm reuse      | via `thread_id`     | If you include a `thread_id` field in the request body, same-thread follow-ups within the grace window hit ACTIVE_MATCH (warm slot, no re-spawn). Many OpenAI-SDK clients can pass arbitrary fields via `extra_body`.                                                                         |
+| Safety guardrails          | always on           | Pre-spawn VRAM/RAM/CPU/IO-wait checks refuse to spawn into an OOM or IO-stuck host (returns HTTP 503 + `Retry-After` rather than crashing the box).                                                                                                                                           |
 
 If your agent gets a 503 with `Retry-After`, that's a safety refusal — back off and retry; nothing's broken.
 
@@ -52,26 +52,26 @@ If your agent gets a 503 with `Retry-After`, that's a safety refusal — back of
 
 ```yaml
 model:
-  default: qwen3.6-27b-dense           # any model whose manifest you've loaded into Turbohaul
-  max_tokens: 8192                     # >= 2000 recommended for thinking models so chain-of-thought has room
+  default: qwen3.6-27b-dense # any model whose manifest you've loaded into Turbohaul
+  max_tokens: 8192 # >= 2000 recommended for thinking models so chain-of-thought has room
   provider: custom
   base_url: http://<turbohaul-host>:11401/v1
   api_key: dummy
 
 providers:
   custom:
-    request_timeout_seconds: 7200      # Hermes-side socket timeout; 2h is generous
+    request_timeout_seconds: 7200 # Hermes-side socket timeout; 2h is generous
     stale_timeout_seconds: 7200
     base_url: http://<turbohaul-host>:11401/v1
     api_key: dummy
-    api_mode: openai                   # speaks /v1/chat/completions
-    streaming: false                   # informational; Hermes' OpenAI SDK chat path always sends stream=true anyway
+    api_mode: openai # speaks /v1/chat/completions
+    streaming: false # informational; Hermes' OpenAI SDK chat path always sends stream=true anyway
 
 agent:
-  max_turns: 40                        # up to 40 tool-call turns per agent run
+  max_turns: 40 # up to 40 tool-call turns per agent run
   gateway_timeout: 7200
-  api_max_retries: 240                 # 240 * 30s = 2h ceiling; combine with inject_30s_retry_2h_cap.py
-  reasoning_effort: low                # Hermes-internal planning verbosity (NOT a Turbohaul knob)
+  api_max_retries: 240 # 240 * 30s = 2h ceiling; combine with inject_30s_retry_2h_cap.py
+  reasoning_effort: low # Hermes-internal planning verbosity (NOT a Turbohaul knob)
 ```
 
 **Important nuance about `streaming: false`**: Hermes' OpenAI Python SDK chat-completions code path **always emits `stream: true` on the wire** (the `streaming: false` config flag is for Hermes' display layer, not the request body). Turbohaul handles this correctly — the streaming path is the validated multi-tool-call code path.
@@ -285,11 +285,12 @@ llama_server_flags:
   cache_type_v: q4_0
   n_predict: -1
   reasoning: auto
-  reasoning_budget: 500          # caps thinking depth — tune 200-2000 for tool-loop speed
-  jinja: true                    # REQUIRED for tool_calls + Qwen3 thinking-block preservation
+  reasoning_budget: 500 # caps thinking depth — tune 200-2000 for tool-loop speed
+  jinja: true # REQUIRED for tool_calls + Qwen3 thinking-block preservation
 ```
 
 The **`jinja: true`** flag is load-bearing for two things:
+
 - `tool_calls` only work when llama-server uses the Jinja chat-template branch
 - Qwen3-class thinking models only preserve `<think>` blocks in the response under `--jinja`
 
@@ -385,17 +386,17 @@ Expect: at least one chunk with `delta.tool_calls = [{...}]` containing `functio
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Every turn takes 30-60s wall | `thread_id` not being forwarded | Use `extra_body: {"thread_id": "..."}` in OpenAI SDK; same in langchain `model_kwargs`. |
-| "Slot did not reach ACTIVE within 600s" | (Should not happen in v0.2.2 Wave 4b.7+) | Upgrade to ≥ `de0602e`. This was a pre-Round-8 bug in the ACTIVE_MATCH streaming path. |
-| HTTP 503 with `Retry-After` | Safety guardrail refused spawn (host OOM / IO-stuck) | Wait and retry; the `Retry-After` header tells you how long. |
-| HTTP 502 with `upstream_status` | llama-server returned an error (context overflow, malformed payload) | Check `upstream_body` in the response; usually means your prompt exceeded the model's `ctx_size`. |
-| HTTP 504 | llama-server timed out generating | Reduce `max_tokens` or check that the model isn't stuck in a thinking loop (lower `reasoning_budget`). |
-| Tool calls never fire (model just describes the tool instead) | Manifest missing `jinja: true` | Add `jinja: true` to the model's manifest under `llama_server_flags`. Restart container. |
-| Streaming hangs at start, no chunks | Client doesn't accept SSE Content-Type | Set `Accept: text/event-stream` header, or use a real SSE library (sseclient-py, eventsource). |
-| Hermes pane stuck "pondering..." | Inter-turn slot didn't promote via ACTIVE_MATCH | Make sure your model's manifest has `reasoning_budget` capped (recommend 500 for tool-loops). |
-| `tools` field rejected with HTTP 400 | Old Turbohaul version pre-Wave-4b-light | Upgrade to ≥ `9df6513`. |
+| Symptom                                                       | Likely cause                                                         | Fix                                                                                                    |
+| ------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Every turn takes 30-60s wall                                  | `thread_id` not being forwarded                                      | Use `extra_body: {"thread_id": "..."}` in OpenAI SDK; same in langchain `model_kwargs`.                |
+| "Slot did not reach ACTIVE within 600s"                       | (Should not happen in v0.2.2 Wave 4b.7+)                             | Upgrade to ≥ `de0602e`. This was a pre-Round-8 bug in the ACTIVE_MATCH streaming path.                 |
+| HTTP 503 with `Retry-After`                                   | Safety guardrail refused spawn (host OOM / IO-stuck)                 | Wait and retry; the `Retry-After` header tells you how long.                                           |
+| HTTP 502 with `upstream_status`                               | llama-server returned an error (context overflow, malformed payload) | Check `upstream_body` in the response; usually means your prompt exceeded the model's `ctx_size`.      |
+| HTTP 504                                                      | llama-server timed out generating                                    | Reduce `max_tokens` or check that the model isn't stuck in a thinking loop (lower `reasoning_budget`). |
+| Tool calls never fire (model just describes the tool instead) | Manifest missing `jinja: true`                                       | Add `jinja: true` to the model's manifest under `llama_server_flags`. Restart container.               |
+| Streaming hangs at start, no chunks                           | Client doesn't accept SSE Content-Type                               | Set `Accept: text/event-stream` header, or use a real SSE library (sseclient-py, eventsource).         |
+| Hermes pane stuck "pondering..."                              | Inter-turn slot didn't promote via ACTIVE_MATCH                      | Make sure your model's manifest has `reasoning_budget` capped (recommend 500 for tool-loops).          |
+| `tools` field rejected with HTTP 400                          | Old Turbohaul version pre-Wave-4b-light                              | Upgrade to ≥ `9df6513`.                                                                                |
 
 If the issue isn't here, check `docker logs turbohaul-demo` for the wrapper-side view and `/api/status` for the current slot state.
 
@@ -422,4 +423,4 @@ To save you from chasing things that aren't supported:
 
 ---
 
-*This doc is the contract between Turbohaul and the agents that use it. If you find a wire-shape detail that's not documented here, that's a doc bug — open an issue.*
+_This doc is the contract between Turbohaul and the agents that use it. If you find a wire-shape detail that's not documented here, that's a doc bug — open an issue._

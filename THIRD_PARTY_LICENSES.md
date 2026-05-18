@@ -6,6 +6,7 @@ The image and source tree include the following third-party components.
 ## Runtime backend
 
 ### llama.cpp (Tom's TurboQuant fork)
+
 - **Project:** llama.cpp (https://github.com/ggerganov/llama.cpp)
 - **Fork:** Tom's TurboQuant fork — selectable-quantization inference fork
 - **License:** MIT
@@ -15,30 +16,30 @@ The image and source tree include the following third-party components.
 
 ## Python dependencies (PyPI, MIT/BSD/Apache 2.0)
 
-| Package | License | Purpose |
-|---|---|---|
-| fastapi | MIT | HTTP framework |
-| uvicorn[standard] | BSD-3-Clause | ASGI server |
-| pydantic | MIT | Config + schema validation |
-| pydantic-settings | MIT | Env-driven settings |
-| pyyaml | MIT | YAML config loader |
-| aiosqlite | MIT | Async SQLite for state |
-| httpx | BSD-3-Clause | HTTP client (pull URLs / llama-server completion proxy) |
-| websockets | BSD-3-Clause | WebSocket /ws/state |
-| structlog | Apache-2.0 / MIT | Logging |
+| Package           | License          | Purpose                                                 |
+| ----------------- | ---------------- | ------------------------------------------------------- |
+| fastapi           | MIT              | HTTP framework                                          |
+| uvicorn[standard] | BSD-3-Clause     | ASGI server                                             |
+| pydantic          | MIT              | Config + schema validation                              |
+| pydantic-settings | MIT              | Env-driven settings                                     |
+| pyyaml            | MIT              | YAML config loader                                      |
+| aiosqlite         | MIT              | Async SQLite for state                                  |
+| httpx             | BSD-3-Clause     | HTTP client (pull URLs / llama-server completion proxy) |
+| websockets        | BSD-3-Clause     | WebSocket /ws/state                                     |
+| structlog         | Apache-2.0 / MIT | Logging                                                 |
 
 ## Frontend dependencies (npm, MIT)
 
-| Package | License | Purpose |
-|---|---|---|
-| react / react-dom | MIT | UI runtime |
-| react-router-dom | MIT | Client-side routing |
-| vite | MIT | Build tool + dev server |
-| @vitejs/plugin-react | MIT | React + Vite integration |
-| typescript | Apache-2.0 | Type system |
-| tailwindcss | MIT | Styling |
-| autoprefixer | MIT | CSS post-processor |
-| postcss | MIT | CSS pipeline |
+| Package              | License    | Purpose                  |
+| -------------------- | ---------- | ------------------------ |
+| react / react-dom    | MIT        | UI runtime               |
+| react-router-dom     | MIT        | Client-side routing      |
+| vite                 | MIT        | Build tool + dev server  |
+| @vitejs/plugin-react | MIT        | React + Vite integration |
+| typescript           | Apache-2.0 | Type system              |
+| tailwindcss          | MIT        | Styling                  |
+| autoprefixer         | MIT        | CSS post-processor       |
+| postcss              | MIT        | CSS pipeline             |
 
 ## API surface
 

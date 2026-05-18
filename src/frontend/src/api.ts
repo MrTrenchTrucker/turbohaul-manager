@@ -1,14 +1,14 @@
 export type SlotState =
-  | 'IDLE_COLD'
-  | 'PRE_LOADING'
-  | 'LOADING'
-  | 'READY'
-  | 'ACTIVE'
-  | 'GRACE'
-  | 'GRACE_BUSY'
-  | 'POPPED'
-  | 'IDLE_HOT'
-  | 'LOADING_FAIL';
+  | "IDLE_COLD"
+  | "PRE_LOADING"
+  | "LOADING"
+  | "READY"
+  | "ACTIVE"
+  | "GRACE"
+  | "GRACE_BUSY"
+  | "POPPED"
+  | "IDLE_HOT"
+  | "LOADING_FAIL";
 
 export interface ActiveInfo {
   slot_id: string;
@@ -114,7 +114,7 @@ export interface ManifestSaveResult {
   restart_required: boolean;
 }
 
-const BASE = '';
+const BASE = "";
 
 async function getJSON<T>(path: string): Promise<T> {
   const r = await fetch(`${BASE}${path}`);
@@ -122,16 +122,16 @@ async function getJSON<T>(path: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
-export const getStatus = () => getJSON<StatusSnapshot>('/status');
-export const getTags = () => getJSON<{ models: ModelTag[] }>('/api/tags');
-export const getVersion = () => getJSON<VersionInfo>('/api/version');
-export const getConfig = () => getJSON<Record<string, unknown>>('/api/config');
+export const getStatus = () => getJSON<StatusSnapshot>("/status");
+export const getTags = () => getJSON<{ models: ModelTag[] }>("/api/tags");
+export const getVersion = () => getJSON<VersionInfo>("/api/version");
+export const getConfig = () => getJSON<Record<string, unknown>>("/api/config");
 
 // Wave 2 manifest CRUD with ETag handling
 export async function getManifest(tag: string): Promise<ManifestWithEtag> {
   const r = await fetch(`${BASE}/api/manifests/${encodeURIComponent(tag)}`);
   if (!r.ok) throw new Error(`GET /api/manifests/${tag} ${r.status}`);
-  const etag = r.headers.get('etag') || '';
+  const etag = r.headers.get("etag") || "";
   const manifest = (await r.json()) as Manifest;
   return { manifest, etag };
 }
@@ -141,29 +141,29 @@ export async function putManifest(
   manifest: Manifest,
   ifMatch: string | null,
 ): Promise<ManifestSaveResult> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (ifMatch) headers['If-Match'] = ifMatch;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (ifMatch) headers["If-Match"] = ifMatch;
   const r = await fetch(`${BASE}/api/manifests/${encodeURIComponent(tag)}`, {
-    method: 'PUT',
+    method: "PUT",
     headers,
     body: JSON.stringify(manifest),
   });
   if (!r.ok) {
-    let detail = '';
+    let detail = "";
     try {
       const b = await r.json();
-      detail = (b as { detail?: string }).detail || '';
+      detail = (b as { detail?: string }).detail || "";
     } catch {
       // ignore
     }
-    throw new Error(`PUT /api/manifests/${tag} ${r.status}${detail ? ` — ${detail}` : ''}`);
+    throw new Error(`PUT /api/manifests/${tag} ${r.status}${detail ? ` — ${detail}` : ""}`);
   }
   return (await r.json()) as ManifestSaveResult;
 }
 
 export async function deleteManifestApi(tag: string): Promise<void> {
   const r = await fetch(`${BASE}/api/manifests/${encodeURIComponent(tag)}`, {
-    method: 'DELETE',
+    method: "DELETE",
   });
   if (!r.ok) throw new Error(`DELETE /api/manifests/${tag} ${r.status}`);
 }

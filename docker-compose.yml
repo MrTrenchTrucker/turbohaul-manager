@@ -10,13 +10,13 @@ services:
     container_name: turbohaul-manager
     restart: unless-stopped
     ports:
-      - "127.0.0.1:11401:11401"  # fleet-internal v0.2 §3.2; remove 127.0.0.1: prefix only with explicit network policy
+      - "127.0.0.1:11401:11401" # fleet-internal v0.2 §3.2; remove 127.0.0.1: prefix only with explicit network policy
     volumes:
       - turbohaul-state:/var/lib/turbohaul
       - ${LLAMA_SERVER_HOST_PATH:-./bin/llama-server}:/opt/turbohaul/bin/llama-server:ro
       - ./turbohaul.yaml:/etc/turbohaul/turbohaul.yaml:ro
     environment:
-      TURBOHAUL_ALLOW_PUBLIC_BIND: "1"  # required for container -> host port mapping
+      TURBOHAUL_ALLOW_PUBLIC_BIND: "1" # required for container -> host port mapping
       TURBOHAUL_LOG_LEVEL: "info"
       # HF_API_KEY:  # set in .env if pulling private HF models
     # Uncomment for NVIDIA GPU access (Tom's Fork uses CUDA).

@@ -69,7 +69,7 @@
   - [ ] Config view (main yaml editor + per-model yaml editor with model selector; monaco-editor or codemirror)
   - [ ] Logs view (tail llama-server stderr per slot)
   - [ ] Build output to /opt/turbohaul/ui_dist
-  - [ ] FastAPI static mount /ui/* + SPA route fallback
+  - [ ] FastAPI static mount /ui/\* + SPA route fallback
   - [ ] Restart-required field flagging on yaml save
 
 - [ ] **Phase 6 — Dockerfile + smoke + ship** (~1-2 days)
@@ -84,23 +84,22 @@
 
 ## Decision log
 
-| Date | Decision | Rationale |
-|---|---|---|
-| 2026-05-16 | Project name: Turbohaul-Manager | Cmdr approved |
-| 2026-05-16 | Port 11401 (parallel to old 11400) | Soak period before cutover |
-| 2026-05-16 | Subprocess-per-slot (Option A) | Matches current arch; simpler; debuggable |
-| 2026-05-16 | Unified queue (not per-model) | 1-at-a-time on CONTAK-01; fairness moot |
-| 2026-05-16 | thread_id semantic for follow-ups | Ollama already has the concept |
-| 2026-05-16 | Two-tier: unbounded acceptance buffer + capped staging queue | Cmdr directive — receive always, stage only when room |
-| 2026-05-16 | Per-model yaml separate from main config | Cmdr directive — flags are per-model |
-| 2026-05-16 | FE + BE both edit yaml | Cmdr directive — match exactly |
-| 2026-05-16 | React + Vite + FastAPI static mount /ui/* | Single-port deploy; matches Logbook fleet pattern |
-| 2026-05-16 | Subprocess `llama-server` from Tom's Fork (vendored binary in image) | Build it ourselves, don't depend on external image |
-| 2026-05-16 | License: all upstream MIT → ship THIRD_PARTY_LICENSES + README attribution | RBSRS audit GO-WITH-MOD 8.5/10 |
+| Date       | Decision                                                                   | Rationale                                             |
+| ---------- | -------------------------------------------------------------------------- | ----------------------------------------------------- |
+| 2026-05-16 | Project name: Turbohaul-Manager                                            | Cmdr approved                                         |
+| 2026-05-16 | Port 11401 (parallel to old 11400)                                         | Soak period before cutover                            |
+| 2026-05-16 | Subprocess-per-slot (Option A)                                             | Matches current arch; simpler; debuggable             |
+| 2026-05-16 | Unified queue (not per-model)                                              | 1-at-a-time on CONTAK-01; fairness moot               |
+| 2026-05-16 | thread_id semantic for follow-ups                                          | Ollama already has the concept                        |
+| 2026-05-16 | Two-tier: unbounded acceptance buffer + capped staging queue               | Cmdr directive — receive always, stage only when room |
+| 2026-05-16 | Per-model yaml separate from main config                                   | Cmdr directive — flags are per-model                  |
+| 2026-05-16 | FE + BE both edit yaml                                                     | Cmdr directive — match exactly                        |
+| 2026-05-16 | React + Vite + FastAPI static mount /ui/\*                                 | Single-port deploy; matches Logbook fleet pattern     |
+| 2026-05-16 | Subprocess `llama-server` from Tom's Fork (vendored binary in image)       | Build it ourselves, don't depend on external image    |
+| 2026-05-16 | License: all upstream MIT → ship THIRD_PARTY_LICENSES + README attribution | RBSRS audit GO-WITH-MOD 8.5/10                        |
 
 ## Open questions for Cmdr
 
 - v1 license for Turbohaul-Manager itself: proprietary (closed) or open-source (which license: MIT, Apache 2.0, ours)? Phase 6 closeout.
 - Default `STAGING_QUEUE_DEPTH` = 100. Is that right for CONTAK-01? More? Less?
 - BYOI fleet-wide audit (Phase 6) — also covers GEAR/advisor/Logbook hard-coded 11400 references. Need to confirm scope when we get there.
-

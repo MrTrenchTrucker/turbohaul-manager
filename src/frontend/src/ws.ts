@@ -15,7 +15,7 @@ export function subscribeWsState(handler: WsHandler): WsSubscription {
 
   const connect = () => {
     if (stopped) return;
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${window.location.host}/ws/state`;
     ws = new WebSocket(url);
     ws.onopen = () => {

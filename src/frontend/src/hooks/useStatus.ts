@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { StatusSnapshot } from '../api';
-import { getStatus } from '../api';
-import { subscribeWsState } from '../ws';
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { StatusSnapshot } from "../api";
+import { getStatus } from "../api";
+import { subscribeWsState } from "../ws";
 
 export interface UseStatusResult {
   data: StatusSnapshot | null;

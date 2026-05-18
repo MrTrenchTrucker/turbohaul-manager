@@ -1,12 +1,12 @@
-import { Routes, Route, Link, useLocation } from 'react-router-dom';
-import type { ReactNode } from 'react';
-import Dashboard from './components/Dashboard';
-import Queue from './components/Queue';
-import Blob from './components/Blob';
-import Config from './components/Config';
-import Logs from './components/Logs';
-import Settings from './components/Settings';
-import Models from './components/Models';
+import { Routes, Route, Link, useLocation } from "react-router-dom";
+import type { ReactNode } from "react";
+import Dashboard from "./components/Dashboard";
+import Queue from "./components/Queue";
+import Blob from "./components/Blob";
+import Config from "./components/Config";
+import Logs from "./components/Logs";
+import Settings from "./components/Settings";
+import Models from "./components/Models";
 
 function Layout({ children }: { children: ReactNode }) {
   const loc = useLocation();
@@ -15,8 +15,8 @@ function Layout({ children }: { children: ReactNode }) {
       to={path}
       className={
         loc.pathname === path
-          ? 'px-4 py-2 rounded-md text-sm font-medium bg-slate-700 text-white'
-          : 'px-4 py-2 rounded-md text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800'
+          ? "px-4 py-2 rounded-md text-sm font-medium bg-slate-700 text-white"
+          : "px-4 py-2 rounded-md text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800"
       }
     >
       {label}
@@ -28,13 +28,13 @@ function Layout({ children }: { children: ReactNode }) {
         <div className="flex items-center justify-between">
           <h1 className="text-lg font-bold tracking-tight">Turbohaul Manager</h1>
           <nav className="flex gap-2">
-            {tab('/', 'Dashboard')}
-            {tab('/models', 'Models')}
-            {tab('/queue', 'Queue')}
-            {tab('/blob', 'Blob')}
-            {tab('/config', 'Config')}
-            {tab('/logs', 'Logs')}
-            {tab('/settings', 'Settings')}
+            {tab("/", "Dashboard")}
+            {tab("/models", "Models")}
+            {tab("/queue", "Queue")}
+            {tab("/blob", "Blob")}
+            {tab("/config", "Config")}
+            {tab("/logs", "Logs")}
+            {tab("/settings", "Settings")}
           </nav>
         </div>
       </header>

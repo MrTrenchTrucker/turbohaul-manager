@@ -12,45 +12,45 @@ third-party components, all under MIT or MIT-compatible permissive licenses.
 
 ## Python runtime dependencies (per pyproject.toml)
 
-| Package           | License        | MIT-compatible |
-|-------------------|----------------|----------------|
-| fastapi           | MIT            | yes            |
-| uvicorn           | BSD-3-Clause   | yes            |
-| pydantic          | MIT            | yes            |
-| pydantic-settings | MIT            | yes            |
-| pyyaml            | MIT            | yes            |
-| aiosqlite         | MIT            | yes            |
-| httpx             | BSD-3-Clause   | yes            |
-| websockets        | BSD-3-Clause   | yes            |
-| structlog         | MIT / Apache-2.0 dual | yes     |
-| starlette (via FastAPI) | BSD-3-Clause | yes      |
+| Package                 | License               | MIT-compatible |
+| ----------------------- | --------------------- | -------------- |
+| fastapi                 | MIT                   | yes            |
+| uvicorn                 | BSD-3-Clause          | yes            |
+| pydantic                | MIT                   | yes            |
+| pydantic-settings       | MIT                   | yes            |
+| pyyaml                  | MIT                   | yes            |
+| aiosqlite               | MIT                   | yes            |
+| httpx                   | BSD-3-Clause          | yes            |
+| websockets              | BSD-3-Clause          | yes            |
+| structlog               | MIT / Apache-2.0 dual | yes            |
+| starlette (via FastAPI) | BSD-3-Clause          | yes            |
 
 ## Frontend dependencies (per src/frontend/package.json)
 
-| Package                | License      | MIT-compatible |
-|------------------------|--------------|----------------|
-| react / react-dom      | MIT          | yes            |
-| react-router-dom       | MIT          | yes            |
-| vite                   | MIT          | yes            |
-| @vitejs/plugin-react   | MIT          | yes            |
-| tailwindcss            | MIT          | yes            |
-| typescript             | Apache-2.0   | yes            |
-| autoprefixer           | MIT          | yes            |
-| postcss                | MIT          | yes            |
-| @types/react           | MIT          | yes            |
-| @types/react-dom       | MIT          | yes            |
+| Package              | License    | MIT-compatible |
+| -------------------- | ---------- | -------------- |
+| react / react-dom    | MIT        | yes            |
+| react-router-dom     | MIT        | yes            |
+| vite                 | MIT        | yes            |
+| @vitejs/plugin-react | MIT        | yes            |
+| tailwindcss          | MIT        | yes            |
+| typescript           | Apache-2.0 | yes            |
+| autoprefixer         | MIT        | yes            |
+| postcss              | MIT        | yes            |
+| @types/react         | MIT        | yes            |
+| @types/react-dom     | MIT        | yes            |
 
 ## Dev-only dependencies
 
-| Package           | License | MIT-compatible |
-|-------------------|---------|----------------|
-| pytest            | MIT     | yes            |
-| pytest-asyncio    | Apache-2.0 | yes         |
-| pytest-cov        | MIT     | yes            |
-| pytest-mock       | MIT     | yes            |
-| ruff              | MIT     | yes            |
-| setuptools        | MIT     | yes            |
-| wheel             | MIT     | yes            |
+| Package        | License    | MIT-compatible |
+| -------------- | ---------- | -------------- |
+| pytest         | MIT        | yes            |
+| pytest-asyncio | Apache-2.0 | yes            |
+| pytest-cov     | MIT        | yes            |
+| pytest-mock    | MIT        | yes            |
+| ruff           | MIT        | yes            |
+| setuptools     | MIT        | yes            |
+| wheel          | MIT        | yes            |
 
 ## Verification method
 

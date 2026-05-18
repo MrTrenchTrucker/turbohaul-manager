@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
-import type { VersionInfo } from '../api';
-import { getVersion } from '../api';
+import { useEffect, useState } from "react";
+import type { VersionInfo } from "../api";
+import { getVersion } from "../api";
 
 export default function Settings() {
   const [ver, setVer] = useState<VersionInfo | null>(null);
@@ -43,16 +43,15 @@ export default function Settings() {
       <div>
         <h2 className="text-xl font-semibold text-slate-200 mb-4">Licenses + attribution</h2>
         <div className="rounded-lg border border-slate-700 bg-slate-950 p-4 text-sm text-slate-400 space-y-2">
+          <p>Turbohaul-Manager v0.2 — MIT-licensed wrapper around the inference engine.</p>
           <p>
-            Turbohaul-Manager v0.2 — MIT-licensed wrapper around the inference engine.
-          </p>
-          <p>
-            Inference backend: <span className="font-mono text-slate-300">llama-server</span>{' '}
-            built from Tom&apos;s TurboQuant fork of llama.cpp (MIT).
+            Inference backend: <span className="font-mono text-slate-300">llama-server</span> built
+            from Tom&apos;s TurboQuant fork of llama.cpp (MIT).
           </p>
           <p>
             See <span className="font-mono text-slate-300">THIRD_PARTY_LICENSES</span> in the
-            container at <span className="font-mono text-slate-300">/usr/share/doc/turbohaul/</span>.
+            container at <span className="font-mono text-slate-300">/usr/share/doc/turbohaul/</span>
+            .
           </p>
         </div>
       </div>

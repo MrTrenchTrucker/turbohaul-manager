@@ -6,6 +6,7 @@ This file records the humans and named AI agents who shaped it.
 ## Project Lead
 
 **MrTrench** -- Commander, architect, operator, kernel.
+
 - Founder + sole human contributor on v0.2.1.
 - Owns CONTAK-01 (the hardware: Ryzen 9 9900X, 64 GiB DDR5, RTX PRO 4000 Blackwell, TrueNAS SCALE).
 - Authored the design intent for the FIFO + grace + IDLE_HOT + model-swap state machine

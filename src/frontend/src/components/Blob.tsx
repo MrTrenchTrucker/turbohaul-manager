@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
-import type { ModelTag } from '../api';
-import { getTags } from '../api';
+import { useCallback, useEffect, useState } from "react";
+import type { ModelTag } from "../api";
+import { getTags } from "../api";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -9,20 +9,20 @@ function formatBytes(n: number): string {
   return `${(n / 1024 ** 3).toFixed(2)} GB`;
 }
 
-type PullSource = 'url' | 'hf' | 'import';
+type PullSource = "url" | "hf" | "import";
 
 async function postJSON(path: string, body: unknown): Promise<Response> {
   return fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
 }
 
 async function deleteJSON(path: string, body: unknown): Promise<Response> {
   return fetch(path, {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
 }
@@ -33,15 +33,15 @@ export default function Blob() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
 
-  const [source, setSource] = useState<PullSource>('url');
-  const [pullUrl, setPullUrl] = useState('');
-  const [pullSha, setPullSha] = useState('');
-  const [pullTag, setPullTag] = useState('');
-  const [hfRepo, setHfRepo] = useState('');
-  const [hfFile, setHfFile] = useState('');
-  const [hfTag, setHfTag] = useState('');
-  const [importPath, setImportPath] = useState('');
-  const [importTag, setImportTag] = useState('');
+  const [source, setSource] = useState<PullSource>("url");
+  const [pullUrl, setPullUrl] = useState("");
+  const [pullSha, setPullSha] = useState("");
+  const [pullTag, setPullTag] = useState("");
+  const [hfRepo, setHfRepo] = useState("");
+  const [hfFile, setHfFile] = useState("");
+  const [hfTag, setHfTag] = useState("");
+  const [importPath, setImportPath] = useState("");
+  const [importTag, setImportTag] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -62,20 +62,20 @@ export default function Blob() {
     setStatus(null);
     try {
       let r: Response;
-      if (source === 'url') {
-        r = await postJSON('/api/pull-url', {
+      if (source === "url") {
+        r = await postJSON("/api/pull-url", {
           url: pullUrl,
           expected_sha256: pullSha || undefined,
           tag: pullTag || undefined,
         });
-      } else if (source === 'hf') {
-        r = await postJSON('/api/pull-hf', {
+      } else if (source === "hf") {
+        r = await postJSON("/api/pull-hf", {
           repo: hfRepo,
           file: hfFile,
           tag: hfTag || undefined,
         });
       } else {
-        r = await postJSON('/api/import', {
+        r = await postJSON("/api/import", {
           path: importPath,
           tag: importTag || undefined,
         });
@@ -95,7 +95,7 @@ export default function Blob() {
       if (!window.confirm(`Delete blob ${digest.slice(0, 16)}…?`)) return;
       setBusy(true);
       try {
-        const r = await deleteJSON('/api/delete', { digest });
+        const r = await deleteJSON("/api/delete", { digest });
         setStatus(`DELETE HTTP ${r.status}: ${(await r.text()).slice(0, 300)}`);
         await refresh();
       } catch (e) {
@@ -120,15 +120,13 @@ export default function Blob() {
             Refresh
           </button>
         </div>
-        {error && (
-          <div className="text-amber-400 text-sm mb-3">
-            ⚠ {error.message}
-          </div>
-        )}
+        {error && <div className="text-amber-400 text-sm mb-3">⚠ {error.message}</div>}
         {tags === null ? (
           <div className="text-slate-500 text-sm italic">Loading…</div>
         ) : tags.length === 0 ? (
-          <div className="text-slate-500 text-sm italic">No models installed yet. Pull one below.</div>
+          <div className="text-slate-500 text-sm italic">
+            No models installed yet. Pull one below.
+          </div>
         ) : (
           <div className="rounded-lg border border-slate-700 bg-slate-950 overflow-hidden">
             <table className="w-full text-sm">
@@ -146,10 +144,8 @@ export default function Blob() {
                   <tr key={m.digest} className="text-slate-300">
                     <td className="px-4 py-2 font-mono">{m.name}</td>
                     <td className="px-4 py-2 font-mono text-right">{formatBytes(m.size)}</td>
-                    <td className="px-4 py-2 font-mono text-slate-500">
-                      {m.digest.slice(0, 16)}…
-                    </td>
-                    <td className="px-4 py-2 text-slate-500">{m.modified_at ?? '—'}</td>
+                    <td className="px-4 py-2 font-mono text-slate-500">{m.digest.slice(0, 16)}…</td>
+                    <td className="px-4 py-2 text-slate-500">{m.modified_at ?? "—"}</td>
                     <td className="px-4 py-2 text-right">
                       <button
                         className="px-2 py-1 rounded-md bg-rose-900/40 text-rose-300 text-xs hover:bg-rose-900/60"
@@ -171,39 +167,74 @@ export default function Blob() {
         <h2 className="text-xl font-semibold text-slate-200 mb-4">Pull model</h2>
         <div className="rounded-lg border border-slate-700 bg-slate-950 p-4">
           <div className="flex gap-2 mb-4">
-            {(['url', 'hf', 'import'] as const).map((s) => (
+            {(["url", "hf", "import"] as const).map((s) => (
               <button
                 key={s}
                 onClick={() => setSource(s)}
                 className={
                   source === s
-                    ? 'px-3 py-1 rounded-md bg-emerald-700 text-white text-sm'
-                    : 'px-3 py-1 rounded-md bg-slate-800 text-slate-400 text-sm hover:bg-slate-700'
+                    ? "px-3 py-1 rounded-md bg-emerald-700 text-white text-sm"
+                    : "px-3 py-1 rounded-md bg-slate-800 text-slate-400 text-sm hover:bg-slate-700"
                 }
               >
-                {s === 'url' ? 'URL' : s === 'hf' ? 'HuggingFace' : 'Local import'}
+                {s === "url" ? "URL" : s === "hf" ? "HuggingFace" : "Local import"}
               </button>
             ))}
           </div>
 
-          {source === 'url' && (
+          {source === "url" && (
             <div className="space-y-2">
-              <Field label="URL (https only)" value={pullUrl} onChange={setPullUrl} placeholder="https://..." />
-              <Field label="Expected sha256 (optional)" value={pullSha} onChange={setPullSha} placeholder="hex 64 chars" />
-              <Field label="Tag (optional)" value={pullTag} onChange={setPullTag} placeholder="e.g. my-model:8b" />
+              <Field
+                label="URL (https only)"
+                value={pullUrl}
+                onChange={setPullUrl}
+                placeholder="https://..."
+              />
+              <Field
+                label="Expected sha256 (optional)"
+                value={pullSha}
+                onChange={setPullSha}
+                placeholder="hex 64 chars"
+              />
+              <Field
+                label="Tag (optional)"
+                value={pullTag}
+                onChange={setPullTag}
+                placeholder="e.g. my-model:8b"
+              />
             </div>
           )}
-          {source === 'hf' && (
+          {source === "hf" && (
             <div className="space-y-2">
               <Field label="HF repo" value={hfRepo} onChange={setHfRepo} placeholder="owner/repo" />
-              <Field label="File in repo" value={hfFile} onChange={setHfFile} placeholder="model-q4.gguf" />
-              <Field label="Tag (optional)" value={hfTag} onChange={setHfTag} placeholder="e.g. my-model:8b" />
+              <Field
+                label="File in repo"
+                value={hfFile}
+                onChange={setHfFile}
+                placeholder="model-q4.gguf"
+              />
+              <Field
+                label="Tag (optional)"
+                value={hfTag}
+                onChange={setHfTag}
+                placeholder="e.g. my-model:8b"
+              />
             </div>
           )}
-          {source === 'import' && (
+          {source === "import" && (
             <div className="space-y-2">
-              <Field label="Absolute path (must be under import_allowed_root)" value={importPath} onChange={setImportPath} placeholder="/var/lib/turbohaul/import-staging/foo.gguf" />
-              <Field label="Tag (optional)" value={importTag} onChange={setImportTag} placeholder="e.g. my-model:8b" />
+              <Field
+                label="Absolute path (must be under import_allowed_root)"
+                value={importPath}
+                onChange={setImportPath}
+                placeholder="/var/lib/turbohaul/import-staging/foo.gguf"
+              />
+              <Field
+                label="Tag (optional)"
+                value={importTag}
+                onChange={setImportTag}
+                placeholder="e.g. my-model:8b"
+              />
             </div>
           )}
 
@@ -213,7 +244,7 @@ export default function Blob() {
               disabled={busy}
               className="px-4 py-2 rounded-md bg-emerald-700 text-white text-sm font-medium hover:bg-emerald-600 disabled:bg-slate-700"
             >
-              {busy ? 'Working…' : `Run ${source}`}
+              {busy ? "Working…" : `Run ${source}`}
             </button>
           </div>
         </div>
@@ -221,7 +252,7 @@ export default function Blob() {
 
       {status && (
         <pre className="rounded-lg border border-slate-700 bg-slate-950 p-3 text-xs text-slate-300 whitespace-pre-wrap break-all">
-{status}
+          {status}
         </pre>
       )}
     </div>

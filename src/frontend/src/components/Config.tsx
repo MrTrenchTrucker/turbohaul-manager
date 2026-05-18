@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
-import { getConfig } from '../api';
+import { useCallback, useEffect, useState } from "react";
+import { getConfig } from "../api";
 
 interface ConfigShape {
   server: Record<string, unknown>;
@@ -13,7 +13,7 @@ interface ConfigShape {
 export default function Config() {
   const [cfg, setCfg] = useState<ConfigShape | null>(null);
   const [error, setError] = useState<Error | null>(null);
-  const [editText, setEditText] = useState('');
+  const [editText, setEditText] = useState("");
   const [editError, setEditError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
@@ -23,9 +23,7 @@ export default function Config() {
       const raw = await getConfig();
       const shaped = raw as unknown as ConfigShape;
       setCfg(shaped);
-      setEditText(
-        JSON.stringify({ queue: shaped.queue, pull: shaped.pull }, null, 2),
-      );
+      setEditText(JSON.stringify({ queue: shaped.queue, pull: shaped.pull }, null, 2));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e : new Error(String(e)));
@@ -48,9 +46,9 @@ export default function Config() {
     }
     setBusy(true);
     try {
-      const r = await fetch('/api/config', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+      const r = await fetch("/api/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(parsed),
       });
       const text = await r.text();
@@ -85,8 +83,8 @@ export default function Config() {
       <div>
         <h2 className="text-xl font-semibold text-slate-200 mb-4">Runtime config (editable)</h2>
         <div className="text-sm text-slate-500 mb-3">
-          Editing queue + pull settings. Submit JSON with the keys you want to change. Only
-          runtime fields are accepted; including boot fields will return 403.
+          Editing queue + pull settings. Submit JSON with the keys you want to change. Only runtime
+          fields are accepted; including boot fields will return 403.
         </div>
         <div className="rounded-lg border border-slate-700 bg-slate-950 p-4">
           <textarea
@@ -95,16 +93,14 @@ export default function Config() {
             spellCheck={false}
             className="w-full h-96 rounded-md bg-slate-900 border border-slate-700 px-3 py-2 text-sm font-mono text-slate-200 focus:outline-none focus:ring-1 focus:ring-emerald-600"
           />
-          {editError && (
-            <div className="mt-2 text-sm text-rose-400">⚠ {editError}</div>
-          )}
+          {editError && <div className="mt-2 text-sm text-rose-400">⚠ {editError}</div>}
           <div className="mt-3 flex gap-2">
             <button
               onClick={() => void runPut()}
               disabled={busy}
               className="px-4 py-2 rounded-md bg-emerald-700 text-white text-sm font-medium hover:bg-emerald-600 disabled:bg-slate-700"
             >
-              {busy ? 'Saving…' : 'Apply'}
+              {busy ? "Saving…" : "Apply"}
             </button>
             <button
               onClick={() => void refresh()}
@@ -119,14 +115,14 @@ export default function Config() {
 
       {status && (
         <pre className="rounded-lg border border-slate-700 bg-slate-950 p-3 text-xs text-slate-300 whitespace-pre-wrap break-all">
-{status}
+          {status}
         </pre>
       )}
 
       <div className="rounded-lg border border-slate-700 bg-slate-950 p-4 text-sm text-slate-400">
-        <strong className="text-slate-300">Per-model manifest editor:</strong> deferred to a
-        polish wave. /api/manifests CRUD + ETag/If-Match concurrency are wired on the BE;
-        W20+ adds a model-picker UI that consumes them.
+        <strong className="text-slate-300">Per-model manifest editor:</strong> deferred to a polish
+        wave. /api/manifests CRUD + ETag/If-Match concurrency are wired on the BE; W20+ adds a
+        model-picker UI that consumes them.
       </div>
     </div>
   );
@@ -137,7 +133,7 @@ function ReadOnlySection({ title, data }: { title: string; data: Record<string, 
     <div className="mb-4 last:mb-0">
       <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">{title}</div>
       <pre className="text-xs font-mono text-slate-400 bg-slate-900 rounded-md p-2 overflow-x-auto">
-{JSON.stringify(data, null, 2)}
+        {JSON.stringify(data, null, 2)}
       </pre>
     </div>
   );

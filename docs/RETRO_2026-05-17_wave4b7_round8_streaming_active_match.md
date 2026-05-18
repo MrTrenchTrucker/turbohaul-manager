@@ -1,4 +1,5 @@
 ## Retrospective: Wave 4b.7 — Round 8 Streaming ACTIVE_MATCH Fix
+
 **Date:** 2026-05-17
 **DAG Branches Explored:** 3 hypotheses (H1 event/state divergence, H2 route-level-deadline-vs-ACTIVE_MATCH, H3 Hermes streaming flag drift)
 **Branch Failures:** 0 (single iteration to success)
@@ -20,11 +21,11 @@
 
 ### Branch Hypothesis Log (none were "failures" — all three converged to H1)
 
-| Hypothesis | Status | What Eliminated/Confirmed It |
-|---|---|---|
-| **H1**: ACTIVE_MATCH path missing `stream_ready_event.set()` → matched slot's event never set → route hangs 600s | **CONFIRMED** | Direct code read: grep showed only ONE `.set()` site (manager.py:776, anchor only) and ONE `.wait()` site (chat_completion.py:376, route). ACTIVE_MATCH branch had ZERO `is_streaming` check. Audit DB confirmed slots transitioning ACTIVE in 1s while route hung. |
-| **H2**: Route-level 600s deadline ignores ACTIVE_MATCH semantics | Dissolved into H1 | The deadline timer IS the symptom mechanism, but H1 is the cause (event is never set, so deadline always fires). H2 would have been a separate bug if the event WAS set but the deadline still misfired — not the case here. |
-| **H3**: Hermes `streaming: false` config drift — Hermes actually sending stream=true | Partially true but orthogonal | Hermes' OpenAI Python SDK defaults to stream=true on chat completions for SSE thinking-content support. Hermes config's `providers.<id>.streaming: false` appears to be cosmetic/non-enforcing on this code path. BUT this is not the bug — it's a Hermes-side config-truth issue. Even with stream=true (which Turbohaul correctly handles), the ACTIVE_MATCH branch was broken. |
+| Hypothesis                                                                                                       | Status                        | What Eliminated/Confirmed It                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **H1**: ACTIVE_MATCH path missing `stream_ready_event.set()` → matched slot's event never set → route hangs 600s | **CONFIRMED**                 | Direct code read: grep showed only ONE `.set()` site (manager.py:776, anchor only) and ONE `.wait()` site (chat_completion.py:376, route). ACTIVE_MATCH branch had ZERO `is_streaming` check. Audit DB confirmed slots transitioning ACTIVE in 1s while route hung.                                                                                                               |
+| **H2**: Route-level 600s deadline ignores ACTIVE_MATCH semantics                                                 | Dissolved into H1             | The deadline timer IS the symptom mechanism, but H1 is the cause (event is never set, so deadline always fires). H2 would have been a separate bug if the event WAS set but the deadline still misfired — not the case here.                                                                                                                                                      |
+| **H3**: Hermes `streaming: false` config drift — Hermes actually sending stream=true                             | Partially true but orthogonal | Hermes' OpenAI Python SDK defaults to stream=true on chat completions for SSE thinking-content support. Hermes config's `providers.<id>.streaming: false` appears to be cosmetic/non-enforcing on this code path. BUT this is not the bug — it's a Hermes-side config-truth issue. Even with stream=true (which Turbohaul correctly handles), the ACTIVE_MATCH branch was broken. |
 
 **Pattern:** A bug isolated to ONE code path can mimic several different higher-level hypotheses. Code-read discrimination beats hypothesis ranking from logs alone.
 
@@ -33,14 +34,15 @@
 ### Branch Failure Log (zero this cycle)
 
 | Branch | Failure Cause | Prevention Rule |
-|---|---|---|
-| (none) | (none) | (none) |
+| ------ | ------------- | --------------- |
+| (none) | (none)        | (none)          |
 
 ---
 
 ### Process Notes
 
 #### What worked well
+
 1. **DAG-first discipline** — Cmdr's 22:13Z directive mandated DAG SOP → GitNexus → SCOUT → fix → smoke loop. Following it strictly meant we triangulated from code + audit + advisor BEFORE writing a line.
 2. **SCOUT Conv 8 parallel consult** — Advisor's Mode D quarantine doc + msg 47 endorsement landed the same hypothesis my code-read converged on. Independent corroboration in <10min.
 3. **RBSRS dual-gate (Failure Predictor + Simplicity Advocate)** — Failure Predictor #16 caught CRIT-1 TOCTOU race that would have made the fix intermittent (only ~25% of slot pickups timing-window-overlap). Simplicity Advocate #15 reshaped the fix to dissolve CRIT-1 entirely via predicate change, saving ~15 LoC and avoiding a defensive refactor in `submit()` that would have widened blast-radius.
@@ -48,6 +50,7 @@
 5. **Single-iteration smoke** — pytest 71/71 + RELAY HANDS 5/5 first time. The triangulation paid off in zero rework.
 
 #### What was suboptimal
+
 1. **Stale GitNexus index** — Required re-indexing on Wave 3+ symbols (`_complete_fn`, `submit_for_streaming`, `stream_ready_event` all "not found"). Re-index kicked off in background but probes couldn't wait. Recommendation: re-index after every Forgejo push (or once-daily cron).
 2. **SCOUT subprocess "Argument list too long" errors** — Conv 8 has 50+ msgs now with embedded code blocks. Multiple advisor responses came back as `[SCOUT ERROR: subprocess spawn failed: [Errno 7] Argument list too long]`. RELAY filed RC-03FC1B for SCOUT auto-compression; shelved by Cmdr.
 3. **Two false-start bash heredocs** — Python inside `bash -c` inside `py -c` inside `ssh exec_command` is fragile. Spent ~5min debugging quoting. Eventually moved to write-script-to-file + sftp + exec pattern, which is bulletproof. Lesson: NEVER nest 3 levels of heredoc-style quoting — write the inner script to a file.
@@ -84,11 +87,12 @@
 
 - **Pre-fix smoke target catalog**: maintain a list of "minimal commands that exercise each FSM branch" so future fixes can run a 30s sanity smoke (per branch) without firing a full HANDS dispatch.
 - **Audit-DB query helper**: bake `audit_query.py` into the container's `/opt/venv/bin/` so any agent can `docker exec turbohaul-demo audit_query` and see last N events. The escape-quote-hell pattern of inline sqlite queries cost time today.
-- **ACTIVE_MATCH-streaming integration test**: add `test_streaming_active_match_warm_reuse_passes_handle` to `tests/test_worker_loop.py`. The unit-test bar is met (71/71) but the *integration* path (streaming submit → grace → matched-streaming-submit → ACTIVE_MATCH → handoff) wasn't asserted in pytest. Smoke caught it; tests should too. Filing as follow-on RC.
+- **ACTIVE_MATCH-streaming integration test**: add `test_streaming_active_match_warm_reuse_passes_handle` to `tests/test_worker_loop.py`. The unit-test bar is met (71/71) but the _integration_ path (streaming submit → grace → matched-streaming-submit → ACTIVE_MATCH → handoff) wasn't asserted in pytest. Smoke caught it; tests should too. Filing as follow-on RC.
 
 ---
 
 ### Cross-references
+
 - Predecessor retro: `RETRO_2026-05-17_wave4b5_4b6_multi_turn_persistence.md`
 - SCOUT consult: Conv 8 session `36eec780-f4ff-4783-a050-98b4a46cac87` thread `5689213f-a1ce-4b6e-b1ab-8e6e6fd4c668` msg 41 (PL question) ↔ msg 47 (Advisor endorsement)
 - RBSRS scoring: Failure Predictor #16 task entry (red-hat) + Simplicity Advocate #15 task entry (human-thinker)
@@ -97,4 +101,4 @@
 
 ---
 
-*Generated 2026-05-17 by PL Claude per Cmdr 23:38Z directive "110% retrospective SOP, Commit to Forgejo".*
+_Generated 2026-05-17 by PL Claude per Cmdr 23:38Z directive "110% retrospective SOP, Commit to Forgejo"._

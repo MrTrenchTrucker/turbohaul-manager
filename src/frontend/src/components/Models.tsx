@@ -1,25 +1,19 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
-import {
-  getTags,
-  getManifest,
-  putManifest,
-  type ModelTag,
-  type Manifest,
-} from '../api';
+import { useEffect, useState, useCallback, useMemo } from "react";
+import { getTags, getManifest, putManifest, type ModelTag, type Manifest } from "../api";
 import {
   FLAGS_SCHEMA,
   CATEGORY_ORDER,
   getFlagsByCategory,
   type FlagSpec,
   type FlagCategory,
-} from '../flagsSchema';
+} from "../flagsSchema";
 
 // Wave 2 v2 Models tab — comprehensive structured editor mirroring BE
 // SAFE_LLAMA_FLAGS exactly. Per Cmdr directive "FE needs to match BE
 // exactly". ~80 flags grouped by category. Primary flags featured at top.
 
 function fmtBytes(n?: number): string {
-  if (!n) return '—';
+  if (!n) return "—";
   const gb = n / 1e9;
   if (gb >= 1) return `${gb.toFixed(2)} GB`;
   const mb = n / 1e6;
@@ -27,7 +21,7 @@ function fmtBytes(n?: number): string {
 }
 
 function fmtCtx(n?: number): string {
-  if (!n) return '—';
+  if (!n) return "—";
   if (n >= 1024) return `${(n / 1024).toFixed(0)}K`;
   return String(n);
 }
@@ -48,11 +42,11 @@ function FlagInput({
   onToggle: (en: boolean) => void;
 }) {
   const inputBase =
-    'w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono text-xs disabled:opacity-40';
+    "w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono text-xs disabled:opacity-40";
 
   let widget: React.ReactNode;
   switch (spec.type) {
-    case 'int':
+    case "int":
       widget = (
         <input
           type="number"
@@ -60,13 +54,13 @@ function FlagInput({
           max={spec.bounds?.[1]}
           step={1}
           disabled={!enabled}
-          value={typeof value === 'number' ? value : (spec.default as number) ?? 0}
-          onChange={(e) => onChange(parseInt(e.target.value || '0', 10))}
+          value={typeof value === "number" ? value : ((spec.default as number) ?? 0)}
+          onChange={(e) => onChange(parseInt(e.target.value || "0", 10))}
           className={inputBase}
         />
       );
       break;
-    case 'float':
+    case "float":
       widget = (
         <input
           type="number"
@@ -74,56 +68,60 @@ function FlagInput({
           max={spec.bounds?.[1]}
           step={0.01}
           disabled={!enabled}
-          value={typeof value === 'number' ? value : (spec.default as number) ?? 0}
-          onChange={(e) => onChange(parseFloat(e.target.value || '0'))}
+          value={typeof value === "number" ? value : ((spec.default as number) ?? 0)}
+          onChange={(e) => onChange(parseFloat(e.target.value || "0"))}
           className={inputBase}
         />
       );
       break;
-    case 'bool':
+    case "bool":
       widget = (
         <input
           type="checkbox"
           disabled={!enabled}
-          checked={typeof value === 'boolean' ? value : (spec.default as boolean) ?? false}
+          checked={typeof value === "boolean" ? value : ((spec.default as boolean) ?? false)}
           onChange={(e) => onChange(e.target.checked)}
           className="h-4 w-4 accent-emerald-500"
         />
       );
       break;
-    case 'enum-string':
+    case "enum-string":
       widget = (
         <select
           disabled={!enabled}
-          value={(value as string) ?? (spec.default as string) ?? ''}
+          value={(value as string) ?? (spec.default as string) ?? ""}
           onChange={(e) => onChange(e.target.value)}
           className={inputBase}
         >
           {spec.enumValues?.map((opt) => (
-            <option key={opt} value={opt}>{opt}</option>
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
           ))}
         </select>
       );
       break;
-    case 'int-or-string': {
-      const isStr = typeof value === 'string';
+    case "int-or-string": {
+      const isStr = typeof value === "string";
       widget = (
         <div className="flex gap-1">
           <select
             disabled={!enabled}
-            value={isStr ? (value as string) : '__int__'}
+            value={isStr ? (value as string) : "__int__"}
             onChange={(e) => {
-              if (e.target.value === '__int__') {
-                onChange(spec.default as number ?? 0);
+              if (e.target.value === "__int__") {
+                onChange((spec.default as number) ?? 0);
               } else {
                 onChange(e.target.value);
               }
             }}
-            className={inputBase + ' w-24'}
+            className={inputBase + " w-24"}
           >
             <option value="__int__">int…</option>
             {spec.enumValues?.map((opt) => (
-              <option key={opt} value={opt}>{opt}</option>
+              <option key={opt} value={opt}>
+                {opt}
+              </option>
             ))}
           </select>
           {!isStr && (
@@ -132,8 +130,8 @@ function FlagInput({
               min={spec.bounds?.[0]}
               max={spec.bounds?.[1]}
               disabled={!enabled}
-              value={typeof value === 'number' ? value : (spec.default as number) ?? 0}
-              onChange={(e) => onChange(parseInt(e.target.value || '0', 10))}
+              value={typeof value === "number" ? value : ((spec.default as number) ?? 0)}
+              onChange={(e) => onChange(parseInt(e.target.value || "0", 10))}
               className={inputBase}
             />
           )}
@@ -141,16 +139,16 @@ function FlagInput({
       );
       break;
     }
-    case 'bool-or-enum': {
+    case "bool-or-enum": {
       const v = value ?? spec.default;
       widget = (
         <select
           disabled={!enabled}
-          value={typeof v === 'boolean' ? (v ? '__true__' : '__false__') : String(v)}
+          value={typeof v === "boolean" ? (v ? "__true__" : "__false__") : String(v)}
           onChange={(e) => {
             const s = e.target.value;
-            if (s === '__true__') onChange(true);
-            else if (s === '__false__') onChange(false);
+            if (s === "__true__") onChange(true);
+            else if (s === "__false__") onChange(false);
             else onChange(s);
           }}
           className={inputBase}
@@ -158,25 +156,25 @@ function FlagInput({
           <option value="__true__">true (legacy bool)</option>
           <option value="__false__">false (legacy bool)</option>
           {spec.enumValues?.map((opt) => (
-            <option key={opt} value={opt}>{opt}</option>
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
           ))}
         </select>
       );
       break;
     }
-    case 'chat-template':
+    case "chat-template":
       widget = (
         <div className="flex flex-col gap-1">
           <select
             disabled={!enabled}
             value={
-              spec.enumValues?.includes((value as string) ?? '')
-                ? (value as string)
-                : '__custom__'
+              spec.enumValues?.includes((value as string) ?? "") ? (value as string) : "__custom__"
             }
             onChange={(e) => {
-              if (e.target.value === '__custom__') {
-                onChange('');
+              if (e.target.value === "__custom__") {
+                onChange("");
               } else {
                 onChange(e.target.value);
               }
@@ -185,27 +183,29 @@ function FlagInput({
           >
             <option value="__custom__">— custom string —</option>
             {spec.enumValues?.map((opt) => (
-              <option key={opt} value={opt}>{opt}</option>
+              <option key={opt} value={opt}>
+                {opt}
+              </option>
             ))}
           </select>
           <input
             type="text"
             disabled={!enabled}
             placeholder="Custom template name (no Jinja {% or {{ )"
-            value={(value as string) ?? ''}
+            value={(value as string) ?? ""}
             onChange={(e) => onChange(e.target.value)}
             className={inputBase}
           />
         </div>
       );
       break;
-    case 'string':
+    case "string":
     default:
       widget = (
         <input
           type="text"
           disabled={!enabled}
-          value={(value as string) ?? ''}
+          value={(value as string) ?? ""}
           onChange={(e) => onChange(e.target.value)}
           className={inputBase}
         />
@@ -220,10 +220,14 @@ function FlagInput({
         checked={enabled}
         onChange={(e) => onToggle(e.target.checked)}
         className="h-3.5 w-3.5 accent-slate-500"
-        title={enabled ? 'Flag SET in manifest — click to omit (use llama-server default)' : 'Flag OMITTED — click to SET'}
+        title={
+          enabled
+            ? "Flag SET in manifest — click to omit (use llama-server default)"
+            : "Flag OMITTED — click to SET"
+        }
       />
       <div className="flex flex-col">
-        <span className={`text-xs font-mono ${enabled ? 'text-slate-100' : 'text-slate-500'}`}>
+        <span className={`text-xs font-mono ${enabled ? "text-slate-100" : "text-slate-500"}`}>
           {spec.name}
         </span>
         <span className="text-[10px] text-slate-500 leading-tight">{spec.hint}</span>
@@ -259,16 +263,14 @@ function CategorySection({
         className="w-full px-3 py-2 flex justify-between items-center hover:bg-slate-800/50"
       >
         <span className="text-sm font-semibold text-slate-200">
-          {open ? '▼' : '▶'} {cat}
+          {open ? "▼" : "▶"} {cat}
           {setCount > 0 && (
             <span className="ml-2 text-[10px] text-emerald-400 font-mono">
               {setCount}/{flags.length} set
             </span>
           )}
           {setCount === 0 && (
-            <span className="ml-2 text-[10px] text-slate-600 font-mono">
-              0/{flags.length}
-            </span>
+            <span className="ml-2 text-[10px] text-slate-600 font-mono">0/{flags.length}</span>
           )}
         </span>
       </button>
@@ -300,14 +302,14 @@ function ModelEditor({
   onSaved: () => void;
 }) {
   const [manifest, setManifest] = useState<Manifest | null>(null);
-  const [etag, setEtag] = useState<string>('');
+  const [etag, setEtag] = useState<string>("");
   const [flagValues, setFlagValues] = useState<Record<string, FlagValue>>({});
   const [enabledFlags, setEnabledFlags] = useState<Set<string>>(new Set());
-  const [rawJson, setRawJson] = useState<string>('');
+  const [rawJson, setRawJson] = useState<string>("");
   const [rawMode, setRawMode] = useState<boolean>(false);
   const [saving, setSaving] = useState<boolean>(false);
-  const [err, setErr] = useState<string>('');
-  const [ok, setOk] = useState<string>('');
+  const [err, setErr] = useState<string>("");
+  const [ok, setOk] = useState<string>("");
 
   useEffect(() => {
     (async () => {
@@ -328,8 +330,8 @@ function ModelEditor({
   const onSave = useCallback(async () => {
     if (!manifest) return;
     setSaving(true);
-    setErr('');
-    setOk('');
+    setErr("");
+    setOk("");
     try {
       let toSave: Manifest;
       if (rawMode) {
@@ -343,7 +345,7 @@ function ModelEditor({
         const newFlags: Record<string, unknown> = {};
         enabledFlags.forEach((name) => {
           const v = flagValues[name];
-          if (v !== undefined && v !== '' && v !== null) {
+          if (v !== undefined && v !== "" && v !== null) {
             newFlags[name] = v;
           }
         });
@@ -359,7 +361,7 @@ function ModelEditor({
       const res = await putManifest(tag, toSave, etag);
       setOk(
         `Saved revision ${res.revision}.${
-          res.restart_required ? ' Restart required.' : ' Hot-reload on next stage.'
+          res.restart_required ? " Restart required." : " Hot-reload on next stage."
         }`,
       );
       const { manifest: m2, etag: e2 } = await getManifest(tag);
@@ -408,10 +410,12 @@ function ModelEditor({
       <div className="rounded-lg border border-slate-700 bg-slate-900 p-4">
         <div className="flex items-center justify-between">
           <h3 className="text-base font-semibold text-slate-100">Editing: {tag}</h3>
-          <button onClick={onClose} className="text-slate-400 hover:text-white text-sm">close</button>
+          <button onClick={onClose} className="text-slate-400 hover:text-white text-sm">
+            close
+          </button>
         </div>
         <p className="text-sm text-slate-400 mt-3">
-          {err ? <span className="text-red-400">{err}</span> : 'Loading...'}
+          {err ? <span className="text-red-400">{err}</span> : "Loading..."}
         </p>
       </div>
     );
@@ -425,7 +429,8 @@ function ModelEditor({
             Editing: {manifest.display_name || manifest.model_tag}
           </h3>
           <p className="text-xs text-slate-400 font-mono">
-            tag={manifest.model_tag} · rev={manifest.revision} · etag={etag} · {enabledFlags.size}/{FLAGS_SCHEMA.length} flags set
+            tag={manifest.model_tag} · rev={manifest.revision} · etag={etag} · {enabledFlags.size}/
+            {FLAGS_SCHEMA.length} flags set
           </p>
         </div>
         <div className="flex gap-2 items-center">
@@ -433,15 +438,17 @@ function ModelEditor({
             onClick={() => setRawMode((v) => !v)}
             className="px-3 py-1 rounded text-xs font-medium border border-slate-600 text-slate-300 hover:text-white hover:border-slate-400"
           >
-            {rawMode ? '← Structured' : 'Raw JSON →'}
+            {rawMode ? "← Structured" : "Raw JSON →"}
           </button>
-          <button onClick={onClose} className="text-slate-400 hover:text-white text-sm px-2">close</button>
+          <button onClick={onClose} className="text-slate-400 hover:text-white text-sm px-2">
+            close
+          </button>
           <button
             onClick={onSave}
             disabled={saving}
             className="px-4 py-1.5 rounded text-xs font-semibold bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50"
           >
-            {saving ? 'Saving…' : 'Save manifest'}
+            {saving ? "Saving…" : "Save manifest"}
           </button>
         </div>
       </div>
@@ -460,7 +467,8 @@ function ModelEditor({
       {rawMode ? (
         <div className="space-y-2">
           <p className="text-xs text-slate-400">
-            <span className="text-amber-300 font-semibold">Raw JSON manifest:</span> bypasses structured form; pure server-side validation.
+            <span className="text-amber-300 font-semibold">Raw JSON manifest:</span> bypasses
+            structured form; pure server-side validation.
           </p>
           <textarea
             value={rawJson}
@@ -486,7 +494,7 @@ function ModelEditor({
             ))}
           </div>
 
-          {CATEGORY_ORDER.filter((c) => c !== 'Common').map((cat) => {
+          {CATEGORY_ORDER.filter((c) => c !== "Common").map((cat) => {
             const flagsInCat = getFlagsByCategory(cat);
             if (flagsInCat.length === 0) return null;
             const hasSetInCat = flagsInCat.some((f) => enabledFlags.has(f.name));
@@ -515,7 +523,9 @@ function ModelCard({ m, onEdit }: { m: ModelTag; onEdit: () => void }) {
     <div className="rounded-lg border border-slate-700 bg-slate-900 p-4 flex flex-col gap-2">
       <div className="flex items-baseline justify-between">
         <div>
-          <h3 className="text-base font-semibold text-slate-100">{m.details?.display_name || m.name}</h3>
+          <h3 className="text-base font-semibold text-slate-100">
+            {m.details?.display_name || m.name}
+          </h3>
           <p className="text-xs text-slate-400 font-mono">{m.name}</p>
         </div>
         <button
@@ -525,17 +535,15 @@ function ModelCard({ m, onEdit }: { m: ModelTag; onEdit: () => void }) {
           Edit ✎
         </button>
       </div>
-      {m.details?.description && (
-        <p className="text-xs text-slate-400">{m.details.description}</p>
-      )}
+      {m.details?.description && <p className="text-xs text-slate-400">{m.details.description}</p>}
       <div className="grid grid-cols-2 gap-2 text-xs font-mono pt-1">
         <KV label="size" v={fmtBytes(m.size)} />
         <KV label="ctx" v={fmtCtx(ctx)} />
         <KV label="vram_expected" v={fmtBytes(m.details?.expected_vram_bytes)} />
-        <KV label="rev" v={String(m.revision ?? '?')} />
+        <KV label="rev" v={String(m.revision ?? "?")} />
       </div>
       <p className="text-[10px] text-slate-600 font-mono truncate" title={m.digest}>
-        sha: {m.digest?.replace(/^sha256:/, '').slice(0, 16)}…
+        sha: {m.digest?.replace(/^sha256:/, "").slice(0, 16)}…
       </p>
     </div>
   );
@@ -553,7 +561,7 @@ function KV({ label, v }: { label: string; v: string }) {
 export default function Models() {
   const [models, setModels] = useState<ModelTag[] | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
-  const [err, setErr] = useState<string>('');
+  const [err, setErr] = useState<string>("");
   const [refreshTick, setRefreshTick] = useState<number>(0);
 
   useEffect(() => {
@@ -573,8 +581,11 @@ export default function Models() {
         <div>
           <h2 className="text-xl font-bold text-slate-100">Models</h2>
           <p className="text-sm text-slate-400">
-            Per-model manifest editor — <strong>FE schema mirrors BE SAFE_LLAMA_FLAGS exactly</strong> ({FLAGS_SCHEMA.length} flags · 50+ DENIED_FLAGS path/RCE-class · suffix-pattern forward-defense · numeric bounds · chat_template Jinja-injection rejected).
-            Edits hot-reload on the next stage; no restart required.
+            Per-model manifest editor —{" "}
+            <strong>FE schema mirrors BE SAFE_LLAMA_FLAGS exactly</strong> ({FLAGS_SCHEMA.length}{" "}
+            flags · 50+ DENIED_FLAGS path/RCE-class · suffix-pattern forward-defense · numeric
+            bounds · chat_template Jinja-injection rejected). Edits hot-reload on the next stage; no
+            restart required.
           </p>
         </div>
         <button
@@ -602,7 +613,9 @@ export default function Models() {
       {!models ? (
         <p className="text-sm text-slate-500">Loading models…</p>
       ) : models.length === 0 ? (
-        <p className="text-sm text-slate-500">No models. Use /api/pull or stage GGUFs to populate.</p>
+        <p className="text-sm text-slate-500">
+          No models. Use /api/pull or stage GGUFs to populate.
+        </p>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {models.map((m) => (

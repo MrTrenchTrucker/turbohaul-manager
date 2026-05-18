@@ -6,7 +6,7 @@
 **Forgejo:** http://10.244.136.121:3030/matthew/turbohaul-manager
 **RC:** RC-CF78A6 (driven by PL Claude direct; A0 Admin acceptance is LOGBOOK auto-artifact, no work delegated there).
 
-**Cmdr Mandate 2026-05-16:** *"Go the no-tech-debt route. If you found a much better way for Turbohaul-Manager then do that so long as Turbohaul-Manager does everything we designed. One-stop-shop for local inference using TurboQuant sidecars."*
+**Cmdr Mandate 2026-05-16:** _"Go the no-tech-debt route. If you found a much better way for Turbohaul-Manager then do that so long as Turbohaul-Manager does everything we designed. One-stop-shop for local inference using TurboQuant sidecars."_
 
 v0.2 honors this by baking ALL critique must-fixes into the FOUNDATION, not deferred sections. No "Phase X will fix it later" patterns. Production-quality supervision, security hardening, and operational discipline land in Phase 2 from line one.
 
@@ -15,6 +15,7 @@ v0.2 honors this by baking ALL critique must-fixes into the FOUNDATION, not defe
 ## 1. Mission
 
 A **standalone HTTP inference server** that:
+
 - Mimics the Ollama API surface (`/api/generate`, `/api/chat`, `/v1/chat/completions`, `/api/pull`, `/api/tags`) so any Ollama-aware fleet client can swap us in transparently.
 - Uses **Tom's Fork TurboQuant llama.cpp** (`github.com/TheTom/llama-cpp-turboquant`, branch `feature/turboquant-kv-cache`, MIT, pinned SHA `<TBD-Phase-2>`) as its inference backend — supervised `llama-server` subprocess per active sidecar.
 - Provides **BYOM** (Bring-Your-Own-Model) blob storage. Pull from Ollama registry / HuggingFace (allowlist-pinned) / vetted URL / local-staging import.
@@ -43,6 +44,7 @@ A **standalone HTTP inference server** that:
 **Load-bearing:** Turbohaul-Manager MUST be the **only writer** to GPU 0 on a given host. This is the entire reason this rebuild was justified. Promoted from non-goal to invariant.
 
 Enforcement (Phase 2 baseline):
+
 - At boot, acquire exclusive `fcntl.flock` on `/var/lib/turbohaul/state.sqlite`. If held by another process, refuse to start with explicit error pointing to the existing PID.
 - At boot, scan `nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader` on GPU 0. If foreign `llama-server` processes are present AND not in our state.sqlite reconciliation map, refuse to start (or, with `--adopt-orphans` flag, kill them after Cmdr-grade warning logged).
 - A boot-time orphan reaper scans for `llama-server` children with `parent=1` and port in `runtime.default_port_base` range; reconciles against state.sqlite slot history; kills any unmatched (`SIGTERM` → 5s → `SIGKILL`).
@@ -64,28 +66,28 @@ Enforcement (Phase 2 baseline):
 
 **Initial timing defaults (v0.2 — Devil F3 + Brainstormer must-fix):**
 
-| Constant | v0.1 spec | v0.2 initial default | Rationale |
-|---|---|---|---|
-| `grace_seconds` | 60 | **30** | Conservative. Cmdr originally said "1 minute" — we ship 30 and instrument; if fleet traffic data justifies 60, bump in v0.3 config-only change. |
-| `idle_hot_load_seconds` | 300 | **120** | Conservative. Cmdr originally said "5 minutes" — we ship 120 and instrument; same rationale. |
-| `max_grace_extensions` | (not specified) | **5** | Starvation cap — after 5 consecutive grace-renewals on the same thread, force re-queue at FIFO tail. Prevents a single noisy client from starving the fleet. |
-| `loading_health_timeout_s` | 600 | **600** | Unchanged — cold load of 21GB GGUF can take 5-8min legitimately. |
-| `drained_sigterm_window_s` | 5 | **15 (active slot) / 5 (cold)** | See §10 — 5s on a mid-decode 21GB sidecar leaves CUDA allocator stuck. |
+| Constant                   | v0.1 spec       | v0.2 initial default            | Rationale                                                                                                                                                    |
+| -------------------------- | --------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `grace_seconds`            | 60              | **30**                          | Conservative. Cmdr originally said "1 minute" — we ship 30 and instrument; if fleet traffic data justifies 60, bump in v0.3 config-only change.              |
+| `idle_hot_load_seconds`    | 300             | **120**                         | Conservative. Cmdr originally said "5 minutes" — we ship 120 and instrument; same rationale.                                                                 |
+| `max_grace_extensions`     | (not specified) | **5**                           | Starvation cap — after 5 consecutive grace-renewals on the same thread, force re-queue at FIFO tail. Prevents a single noisy client from starving the fleet. |
+| `loading_health_timeout_s` | 600             | **600**                         | Unchanged — cold load of 21GB GGUF can take 5-8min legitimately.                                                                                             |
+| `drained_sigterm_window_s` | 5               | **15 (active slot) / 5 (cold)** | See §10 — 5s on a mid-decode 21GB sidecar leaves CUDA allocator stuck.                                                                                       |
 
 **Phase 2 deliverable:** instrument current sidecar-manager for 1 week to log time-between-requests-same-thread + time-between-requests-same-model-diff-thread + model-swap-frequency + request-burst-size. Use those measurements to tune defaults in v0.3 (config-only PR, no code change).
 
 ## 5. Phase Plan (v0.2 — reordered per Failure Predictor must-fix)
 
-| Phase | Scope | Status | Time est |
-|---|---|---|---|
-| 0 | Forgejo prep (3 analysis mirrors + new repo) + license audit (RBSRS 8.5/10 all MIT) | ✓ DONE 2026-05-16 | done |
-| 1 | Architecture v0.1 doc + RBSRS critique (4 sub-agents) + v0.2 synthesis (this doc) + Cmdr ✓ | ✓ DONE 2026-05-16 | done |
-| 2 | **Core queue + slot manager + ALL supervision discipline baked in from line one:** state machine + subprocess setsid/killpg + orphan reaper + flag allowlist + tag validation + atomic manifest writes + VRAM-fit pre-check + ETag/If-Match yaml writes + singleton invariant + WS redaction. Pytest unit + integration tests. Port 11401. Bind 127.0.0.1 + ZT IP. | pending | **4-6 days** (was 3-5, +1-2 for baked-in supervision) |
-| 3 | Ollama-compat + OpenAI-compat API surface + `/status` + WebSocket `/ws/state` (redacted) + GET/PUT /api/manifests + GET/PUT /api/config (split mutable/boot fields) + thread_id prefix-hash fallback for naive Ollama clients | pending | 2-3 days |
-| 4 | Blob store (content-addressed + read-only post-rename) + pull endpoints with SSRF guard + import_allowed_root + GGUF-magic check + re-verify-on-stage | pending | 3-5 days |
-| 5 | Frontend React+Vite + CSP + monaco/codemirror sandboxed + WebSocket-live + text-only manifest rendering | pending | 3-4 days |
-| 6 | Dockerfile (pinned Tom's Fork SHA in build-stage) + docker-compose + THIRD_PARTY_LICENSES + README attribution + Phase 6a **shadow mode** soak + cutover runbook + smoke E2E | pending | 1-2 days |
-| 6a | Shadow-mode soak (parallel 11401/11400, traffic teed, delta-logged) — 24-48h before any cutover. Success criteria + rollback runbook documented in §13. | pending | 2-3 days within Phase 6 |
+| Phase | Scope                                                                                                                                                                                                                                                                                                                                                              | Status            | Time est                                              |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------- | ----------------------------------------------------- |
+| 0     | Forgejo prep (3 analysis mirrors + new repo) + license audit (RBSRS 8.5/10 all MIT)                                                                                                                                                                                                                                                                                | ✓ DONE 2026-05-16 | done                                                  |
+| 1     | Architecture v0.1 doc + RBSRS critique (4 sub-agents) + v0.2 synthesis (this doc) + Cmdr ✓                                                                                                                                                                                                                                                                         | ✓ DONE 2026-05-16 | done                                                  |
+| 2     | **Core queue + slot manager + ALL supervision discipline baked in from line one:** state machine + subprocess setsid/killpg + orphan reaper + flag allowlist + tag validation + atomic manifest writes + VRAM-fit pre-check + ETag/If-Match yaml writes + singleton invariant + WS redaction. Pytest unit + integration tests. Port 11401. Bind 127.0.0.1 + ZT IP. | pending           | **4-6 days** (was 3-5, +1-2 for baked-in supervision) |
+| 3     | Ollama-compat + OpenAI-compat API surface + `/status` + WebSocket `/ws/state` (redacted) + GET/PUT /api/manifests + GET/PUT /api/config (split mutable/boot fields) + thread_id prefix-hash fallback for naive Ollama clients                                                                                                                                      | pending           | 2-3 days                                              |
+| 4     | Blob store (content-addressed + read-only post-rename) + pull endpoints with SSRF guard + import_allowed_root + GGUF-magic check + re-verify-on-stage                                                                                                                                                                                                              | pending           | 3-5 days                                              |
+| 5     | Frontend React+Vite + CSP + monaco/codemirror sandboxed + WebSocket-live + text-only manifest rendering                                                                                                                                                                                                                                                            | pending           | 3-4 days                                              |
+| 6     | Dockerfile (pinned Tom's Fork SHA in build-stage) + docker-compose + THIRD_PARTY_LICENSES + README attribution + Phase 6a **shadow mode** soak + cutover runbook + smoke E2E                                                                                                                                                                                       | pending           | 1-2 days                                              |
+| 6a    | Shadow-mode soak (parallel 11401/11400, traffic teed, delta-logged) — 24-48h before any cutover. Success criteria + rollback runbook documented in §13.                                                                                                                                                                                                            | pending           | 2-3 days within Phase 6                               |
 
 Total: ~3-4 weeks calendar (v0.1 said 2-3 weeks; +1 week for hardening). Worth it for no-tech-debt.
 
@@ -142,6 +144,7 @@ COLD-RECOVERY (NEW v0.2)  ──→  on manager boot, scan for orphaned llama-se
 ```
 
 **Failure handling:**
+
 - LOADING-FAIL retry: 2 attempts. On exhaustion, slot recycled + 500 returned to client + audit event `slot_loading_exhausted`.
 - VRAM-clear timeout in POPPED: if `nvidia-smi memory.used` doesn't drop below threshold within 30s, manager logs `vram_clear_failed`, does NOT auto-restage (would compound failure), and surfaces alert. Operator action required.
 - thread_id is a **routing hint, not auth**. Matching key = `(thread_id, source_ip)` pair to bound forge-attack surface. Optional v2 HMAC-signed thread_ids.
@@ -155,20 +158,20 @@ COLD-RECOVERY (NEW v0.2)  ──→  on manager boot, scan for orphaned llama-se
 
 # === BOOT CONFIG (read-only at runtime; restart required to change) ===
 server:
-  host: "127.0.0.1"           # env: TURBOHAUL_HOST  (NEVER 0.0.0.0 default — see §3.2)
-  port: 11401                  # env: TURBOHAUL_PORT
-  allow_public_bind: false     # if true, allows 0.0.0.0 (only with --allow-public-bind CLI flag too)
+  host: "127.0.0.1" # env: TURBOHAUL_HOST  (NEVER 0.0.0.0 default — see §3.2)
+  port: 11401 # env: TURBOHAUL_PORT
+  allow_public_bind: false # if true, allows 0.0.0.0 (only with --allow-public-bind CLI flag too)
 
 storage:
   blob_store_path: /var/lib/turbohaul/blobs
   manifests_path: /var/lib/turbohaul/manifests
-  import_allowed_root: /var/lib/turbohaul/import-staging  # /api/import sandboxed here only
+  import_allowed_root: /var/lib/turbohaul/import-staging # /api/import sandboxed here only
   state_db_path: /var/lib/turbohaul/state.sqlite
 
 runtime:
   llama_server_binary: /opt/turboquant/build/bin/llama-server
-  llama_server_binary_sha256: <PINNED-IN-PHASE-2>   # verified at boot; mismatch = refuse to start
-  default_port_base: 11500     # llama-server child ports allocated from here
+  llama_server_binary_sha256: <PINNED-IN-PHASE-2> # verified at boot; mismatch = refuse to start
+  default_port_base: 11500 # llama-server child ports allocated from here
 
 ui:
   enabled: true
@@ -176,23 +179,23 @@ ui:
 
 # === RUNTIME CONFIG (mutable via PUT /api/config; takes effect on next slot stage or per-field) ===
 queue:
-  max_parallel_sidecars: 1     # env: TURBOHAUL_MAX_PARALLEL
-  staging_queue_depth: 100     # env: TURBOHAUL_STAGING_DEPTH
+  max_parallel_sidecars: 1 # env: TURBOHAUL_MAX_PARALLEL
+  staging_queue_depth: 100 # env: TURBOHAUL_STAGING_DEPTH
   acceptance_buffer_max: 10000 # env: TURBOHAUL_ACCEPT_MAX
-  grace_seconds: 30            # env: TURBOHAUL_GRACE_S
-  idle_hot_load_seconds: 120   # env: TURBOHAUL_IDLE_HOT_S
-  max_grace_extensions: 5      # env: TURBOHAUL_MAX_GRACE_EXT
+  grace_seconds: 30 # env: TURBOHAUL_GRACE_S
+  idle_hot_load_seconds: 120 # env: TURBOHAUL_IDLE_HOT_S
+  max_grace_extensions: 5 # env: TURBOHAUL_MAX_GRACE_EXT
   loading_health_timeout_s: 600
   drained_sigterm_window_active_s: 15
   drained_sigterm_window_cold_s: 5
 
 pull:
-  hf_api_key_env: HF_API_KEY                            # name of env var holding key (NOT value)
-  hf_host_allowlist: ["huggingface.co", "hf.co"]        # exact hosts + subdomains only
+  hf_api_key_env: HF_API_KEY # name of env var holding key (NOT value)
+  hf_host_allowlist: ["huggingface.co", "hf.co"] # exact hosts + subdomains only
   pull_url_https_only: true
   pull_concurrency: 2
   pull_chunk_size_mb: 64
-  per_stream_max_bytes: 107374182400                    # 100 GB hard ceiling per pull stream
+  per_stream_max_bytes: 107374182400 # 100 GB hard ceiling per pull stream
 ```
 
 ### 7.1 Config Write Protection (NEW v0.2 — Security F7 must-fix)
@@ -210,15 +213,15 @@ pull:
 
 ```yaml
 model_tag: qwen3.6-35b-moe
-display_name: "Qwen 3.6 35B-A3B MoE Q4"            # SANITIZED-AS-TEXT-ONLY in FE rendering — see §11.2
+display_name: "Qwen 3.6 35B-A3B MoE Q4" # SANITIZED-AS-TEXT-ONLY in FE rendering — see §11.2
 description: "Active 3B / total 35B sparse MoE. Q4 quant. KV-cache turbo4."
-gguf_blob_sha256: 1a2b3c4d...                       # must match a blob in /var/lib/turbohaul/blobs/sha256/
+gguf_blob_sha256: 1a2b3c4d... # must match a blob in /var/lib/turbohaul/blobs/sha256/
 gguf_size_bytes: 22000000000
 context_size: 131072
-expected_vram_bytes: 22500000000                    # MANDATORY (Phase 2 — was Phase 4 in v0.1)
-revision: 1                                          # auto-incremented on every write; powers ETag/If-Match
+expected_vram_bytes: 22500000000 # MANDATORY (Phase 2 — was Phase 4 in v0.1)
+revision: 1 # auto-incremented on every write; powers ETag/If-Match
 
-llama_server_flags:                                 # CLOSED ALLOWLIST per v0.2 §8.1
+llama_server_flags: # CLOSED ALLOWLIST per v0.2 §8.1
   # Performance + memory layout
   ctx_size: 131072
   n_gpu_layers: 999
@@ -261,29 +264,30 @@ prompt_template:
 
 ## 9. API Surface (v0.2 — runtime-mutable PUT semantics + thread_id prefix-hash fallback)
 
-| Method + Path | Ollama-shape? | OpenAI-shape? | Purpose | v0.2 changes |
-|---|---|---|---|---|
-| `POST /api/generate` | ✓ | | Single-turn (Ollama) | Optional thread_id; auto-derive from prompt-prefix-hash for naive Ollama clients |
-| `POST /api/chat` | ✓ | | Multi-turn w/ thread_id | Same auto-derive fallback |
-| `POST /v1/chat/completions` | | ✓ | OpenAI | Same |
-| `POST /v1/completions` | | ✓ | OpenAI | Same |
-| `GET /api/tags` | ✓ | | List models | |
-| `GET /api/show` | ✓ | | Model details | Returns sanitized manifest (display_name + description AS TEXT — no HTML; see §11.2) |
-| `GET /api/version` | ✓ | | Version | Returns `{"version": "1.0.0", "backend": "turboquant-llama-cpp@<pinned-sha>", "api_compat": "ollama-superset", "User-Agent": "Turbohaul-Manager/1.0.0 (Ollama-compatible)"}` |
-| `POST /api/pull` | ✓ | | Pull from Ollama registry | Subject to §9.1 SSRF guard |
-| `POST /api/pull-hf` | (ext) | | HuggingFace pull | §9.1 — hostname must match `hf_host_allowlist` |
-| `POST /api/pull-url` | (ext) | | Arbitrary URL pull | §9.1 — https-only + DNS-pin + private-IP blocklist |
-| `POST /api/import` | (ext) | | Local-file import | §9.2 — path must be under `import_allowed_root`; GGUF magic check |
-| `DELETE /api/delete` | ✓ | | Remove model | |
-| `GET /status` | (ext) | | Queue + active + grace + idle state | Schema in §9.3 |
-| `GET /api/manifests/{tag}` | (ext) | | Get per-model yaml | Returns `ETag: "<revision>"` header |
-| `PUT /api/manifests/{tag}` | (ext) | | Write per-model yaml | Requires `If-Match: "<revision>"`; 412 on mismatch; flags allowlist enforced |
-| `GET /api/config` | (ext) | | Get top-level yaml | Returns only fields the requester is allowed to see (BootConfig is read-only-visible) |
-| `PUT /api/config` | (ext) | | Write runtime fields only | Boot fields → 403; unknown keys → 400 |
-| `WS /ws/state` | (ext) | | State events (REDACTED) | §11.1 — no prompts, no responses, no stderr |
-| `GET /api/logs/{slot_port}` | (ext) | | Admin-only stderr ring buffer | Separate from /ws/state; future v2 auth-gated |
+| Method + Path               | Ollama-shape? | OpenAI-shape? | Purpose                             | v0.2 changes                                                                                                                                                                 |
+| --------------------------- | ------------- | ------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/generate`        | ✓             |               | Single-turn (Ollama)                | Optional thread_id; auto-derive from prompt-prefix-hash for naive Ollama clients                                                                                             |
+| `POST /api/chat`            | ✓             |               | Multi-turn w/ thread_id             | Same auto-derive fallback                                                                                                                                                    |
+| `POST /v1/chat/completions` |               | ✓             | OpenAI                              | Same                                                                                                                                                                         |
+| `POST /v1/completions`      |               | ✓             | OpenAI                              | Same                                                                                                                                                                         |
+| `GET /api/tags`             | ✓             |               | List models                         |                                                                                                                                                                              |
+| `GET /api/show`             | ✓             |               | Model details                       | Returns sanitized manifest (display_name + description AS TEXT — no HTML; see §11.2)                                                                                         |
+| `GET /api/version`          | ✓             |               | Version                             | Returns `{"version": "1.0.0", "backend": "turboquant-llama-cpp@<pinned-sha>", "api_compat": "ollama-superset", "User-Agent": "Turbohaul-Manager/1.0.0 (Ollama-compatible)"}` |
+| `POST /api/pull`            | ✓             |               | Pull from Ollama registry           | Subject to §9.1 SSRF guard                                                                                                                                                   |
+| `POST /api/pull-hf`         | (ext)         |               | HuggingFace pull                    | §9.1 — hostname must match `hf_host_allowlist`                                                                                                                               |
+| `POST /api/pull-url`        | (ext)         |               | Arbitrary URL pull                  | §9.1 — https-only + DNS-pin + private-IP blocklist                                                                                                                           |
+| `POST /api/import`          | (ext)         |               | Local-file import                   | §9.2 — path must be under `import_allowed_root`; GGUF magic check                                                                                                            |
+| `DELETE /api/delete`        | ✓             |               | Remove model                        |                                                                                                                                                                              |
+| `GET /status`               | (ext)         |               | Queue + active + grace + idle state | Schema in §9.3                                                                                                                                                               |
+| `GET /api/manifests/{tag}`  | (ext)         |               | Get per-model yaml                  | Returns `ETag: "<revision>"` header                                                                                                                                          |
+| `PUT /api/manifests/{tag}`  | (ext)         |               | Write per-model yaml                | Requires `If-Match: "<revision>"`; 412 on mismatch; flags allowlist enforced                                                                                                 |
+| `GET /api/config`           | (ext)         |               | Get top-level yaml                  | Returns only fields the requester is allowed to see (BootConfig is read-only-visible)                                                                                        |
+| `PUT /api/config`           | (ext)         |               | Write runtime fields only           | Boot fields → 403; unknown keys → 400                                                                                                                                        |
+| `WS /ws/state`              | (ext)         |               | State events (REDACTED)             | §11.1 — no prompts, no responses, no stderr                                                                                                                                  |
+| `GET /api/logs/{slot_port}` | (ext)         |               | Admin-only stderr ring buffer       | Separate from /ws/state; future v2 auth-gated                                                                                                                                |
 
 **`thread_id` semantic (v0.2 — Devil F7 fix):**
+
 - All POST endpoints accept optional `thread_id` (string, client-supplied). Fleet clients (Logbook, Secretary, advisors) supply explicit thread_id.
 - **For naive Ollama clients** (Open WebUI, generic Ollama-aware tools) that don't supply thread_id: manager auto-derives thread_id from SHA-256 hash of first N tokens of prompt + model_tag. Same-prefix follow-ups → same thread_id → warm slot. Different prompt → new thread_id → fresh queue entry. This makes the "Ollama compat" claim real, not aspirational. Removes Devil F7 misleading claim.
 
@@ -354,31 +358,37 @@ prompt_template:
 Production-quality supervision baked in from line one (Phase 2):
 
 **Spawn:**
+
 - `subprocess.Popen([binary, '--port', str(slot_port), '-m', gguf_path, '--host', '127.0.0.1', *flag_args], start_new_session=True, env={...sanitized env...})`
 - `start_new_session=True` (Linux `setsid()`) puts the child in its own process group → enables clean group teardown.
 - argv built from list, never shell-string. Each flag value rejected if it contains `\0`, `\n`, leading `-` (unless explicit allowlist entry), shell metacharacters.
 
 **Health-poll:**
+
 - Poll `http://127.0.0.1:<slot_port>/health` every 2s after spawn. ACTIVE on 200.
 - Cold-load timeout `loading_health_timeout_s` (default 600s). On timeout, LOADING-FAIL retry path (§6).
 - Tom's Fork health-contract drift defense: response shape verified — must include expected JSON fields. Schema breakage triggers `loading_health_schema_mismatch` audit event (Failure Predictor M3 must-fix).
 
 **Pop (drained-SIGTERM):**
+
 - For ACTIVE / GRACE / GRACE-BUSY slots: poll `/health?drained=1` (or wait for in-flight stream to complete with bounded `drain_max_s` of 10s); then SIGTERM the process group via `os.killpg(os.getpgid(proc.pid), signal.SIGTERM)`; wait `drained_sigterm_window_active_s` (default 15s); SIGKILL group on timeout.
 - For cold / IDLE_HOT slots: immediate SIGTERM via killpg + `drained_sigterm_window_cold_s` (default 5s) wait + SIGKILL.
 - **VRAM-clear verification:** poll `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits` until `memory.used` drops by at least 90% of `expected_vram_bytes`/MiB OR 30s timeout. Timeout = `vram_clear_failed` audit event; do NOT auto-restage.
 
 **Stdout/stderr:**
+
 - Captured via `asyncio.subprocess` pipes to per-slot ring buffer (last 1000 lines each).
 - **Never broadcast to /ws/state.** Available only via `GET /api/logs/{slot_port}` (admin-only future v2).
 
 **Boot-time reconciliation (COLD-RECOVERY in §6):**
+
 - Scan `/proc/*/status` for `llama-server` processes with `PPid: 1` (orphaned to init).
 - Scan `nvidia-smi --query-compute-apps=pid` for foreign GPU compute processes.
 - For each orphan in `default_port_base` range OR holding GPU memory: cross-reference state.sqlite. If state.sqlite indicates a clean shutdown for that slot OR no record, kill the orphan (SIGTERM 5s → SIGKILL).
 - After reconciliation, manager opens flock on state.sqlite and begins accepting traffic.
 
 **Process supervision under FastAPI reload:**
+
 - uvicorn `--reload` is BANNED in production (per `reference_uvicorn_no_reload_logbook_backend_20260515.md` lesson). Production uses `docker restart turbohaul-manager` for code changes.
 - On manager SIGTERM (graceful shutdown): atexit handler + signal handler iterates child slots, calls drained-SIGTERM on each, waits up to 60s for VRAM clear, then exits.
 
@@ -390,14 +400,14 @@ Production-quality supervision baked in from line one (Phase 2):
 
 **Views:**
 
-| View | Path | Purpose |
-|---|---|---|
-| Dashboard | `/ui/` | Active sidecar (tokens/sec, n_decoded/n_predict, thread_id-first-8), queue depth gauge, throughput chart |
-| Queue | `/ui/queue` | FIFO list with positions, model_tags, status, thread_id-first-8, ETAs |
-| Blob | `/ui/blob` | Installed models w/ sizes; Pull (Ollama/HF/URL) — submit form goes through §9.1; Import (path under import_allowed_root); Delete |
-| Config | `/ui/config` | Main yaml editor + per-model yaml editor (monaco-editor sandboxed). PUT goes through §7.1 / §8.1. ETag-aware UX (412 = "reload + re-apply" banner). Restart-required field flagging. |
-| Logs | `/ui/logs/{slot_port}` | Admin-only stderr tail via GET /api/logs/{slot_port} |
-| Settings | `/ui/settings` | About, version, links to LICENSE + THIRD_PARTY_LICENSES |
+| View      | Path                   | Purpose                                                                                                                                                                              |
+| --------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Dashboard | `/ui/`                 | Active sidecar (tokens/sec, n_decoded/n_predict, thread_id-first-8), queue depth gauge, throughput chart                                                                             |
+| Queue     | `/ui/queue`            | FIFO list with positions, model_tags, status, thread_id-first-8, ETAs                                                                                                                |
+| Blob      | `/ui/blob`             | Installed models w/ sizes; Pull (Ollama/HF/URL) — submit form goes through §9.1; Import (path under import_allowed_root); Delete                                                     |
+| Config    | `/ui/config`           | Main yaml editor + per-model yaml editor (monaco-editor sandboxed). PUT goes through §7.1 / §8.1. ETag-aware UX (412 = "reload + re-apply" banner). Restart-required field flagging. |
+| Logs      | `/ui/logs/{slot_port}` | Admin-only stderr tail via GET /api/logs/{slot_port}                                                                                                                                 |
+| Settings  | `/ui/settings`         | About, version, links to LICENSE + THIRD_PARTY_LICENSES                                                                                                                              |
 
 ### 11.1 WebSocket Redaction Policy (NEW v0.2 — Security F6 must-fix)
 
@@ -414,14 +424,14 @@ Production-quality supervision baked in from line one (Phase 2):
 
 - ALL manifest-sourced strings rendered as **text content only** (React `{value}` — never `dangerouslySetInnerHTML`).
 - `display_name`, `description`, `chat_template`, `model_tag`, `prompt_template.system_default` — TEXT, never HTML/JSX/Markdown-with-HTML.
-- **CSP header on /ui/* responses:**
+- **CSP header on /ui/\* responses:**
   ```
   Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:11401 ws://127.0.0.1:11401; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'
   ```
   (no `unsafe-eval`, no external CDN, no inline scripts.)
 - monaco-editor / codemirror **self-hosted** (no CDN). Subresource Integrity hashes pinned. Editor configured `readOnly: false` for editing but no `eval` extensions enabled.
 - SPA wildcard fallback returns `index.html` ONLY for paths matching `^/ui/[^?#]*$` — paths with `..`, `?`, `#`, or matching `^/api/`, `^/ws/`, `^/status` are NOT SPA-fallback'd.
-- `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: same-origin` headers on /ui/* responses.
+- `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: same-origin` headers on /ui/\* responses.
 
 ## 12. Storage Layout
 
@@ -486,6 +496,7 @@ Production-quality supervision baked in from line one (Phase 2):
 - Our Turbohaul-Manager = **TBD** (Cmdr decides at Phase 6 — proprietary or open-source)
 
 **MODs from RBSRS license audit (8.5/10):**
+
 1. `THIRD_PARTY_LICENSES` file in Docker image with upstream MIT verbatim
 2. README attribution: `"Inference backend: llama-server built from Tom's TurboQuant fork of llama.cpp (MIT). Ollama-compatible HTTP API surface."`
 3. Trademark hygiene: "Ollama-compatible" only (nominative fair use)
@@ -493,24 +504,24 @@ Production-quality supervision baked in from line one (Phase 2):
 
 ## 15. Closed Risks (was "Open follow-ons" in v0.1 — now resolved in v0.2)
 
-| v0.1 open item | v0.2 status |
-|---|---|
-| VRAM-fit gating deferred to Phase 4 | ✓ MOVED to Phase 2 baseline + `expected_vram_bytes` MANDATORY in manifest |
-| LOADING failure retry undefined | ✓ §6 LOADING-FAIL bounded retry (2 attempts) |
-| Manifest write atomicity deferred to Phase 3 | ✓ §8.2 — MOVED to Phase 2 + ETag/If-Match concurrency |
-| "1-min grace + 5-min idle hot-load defaults" untested numbers | ✓ §4 — conservative 30s/120s initial; instrument current manager 1 week → tune in v0.3 |
-| Per-model VRAM concurrency (multi-model on >24GB hosts) | Future v1.1 — out of scope for v1 ship |
-| BYOI fleet-wide audit (hard-coded 11400 references) | Phase 6 deliverable; cross-check `secretary_providers.yaml`, GEAR config, advisor config |
+| v0.1 open item                                                | v0.2 status                                                                              |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| VRAM-fit gating deferred to Phase 4                           | ✓ MOVED to Phase 2 baseline + `expected_vram_bytes` MANDATORY in manifest                |
+| LOADING failure retry undefined                               | ✓ §6 LOADING-FAIL bounded retry (2 attempts)                                             |
+| Manifest write atomicity deferred to Phase 3                  | ✓ §8.2 — MOVED to Phase 2 + ETag/If-Match concurrency                                    |
+| "1-min grace + 5-min idle hot-load defaults" untested numbers | ✓ §4 — conservative 30s/120s initial; instrument current manager 1 week → tune in v0.3   |
+| Per-model VRAM concurrency (multi-model on >24GB hosts)       | Future v1.1 — out of scope for v1 ship                                                   |
+| BYOI fleet-wide audit (hard-coded 11400 references)           | Phase 6 deliverable; cross-check `secretary_providers.yaml`, GEAR config, advisor config |
 
 ## 16. RBSRS Sub-Agent Records
 
-| Phase | Domain | Role | Mode | Outcome | Verdict | Task ID | Date |
-|---|---|---|---|---|---|---|---|
-| 0 | license-audit-inference-stack | Documentation Reader (#4) as Software License Verification Specialist (manual override) | red-hat | 8.5/10 | GO-WITH-MOD | (not /select'd — pre-/select-fix) | 2026-05-16 |
-| 1 | architecture-design-inference-server | Architecture Brainstormer (#12) | human-thinker | 9/10 | GO-WITH-MOD 7.5 | task-20260516170130-6976 | 2026-05-16 |
-| 1 | architecture-design-inference-server | Devil's Advocate (#13) | red-hat | 9/10 | GO-WITH-MOD 7 (lean STOP-AS-IS) | task-20260516170130-2213 | 2026-05-16 |
-| 1 | architecture-design-inference-server | Failure Predictor (#16) | red-hat | 8/10 | GO-WITH-MOD 8 | task-20260516170130-9585 | 2026-05-16 |
-| 1 | architecture-design-inference-server | Security Reviewer (#58) | red-hat | 10/10 | GO-WITH-MOD 9 | task-20260516170130-4886 | 2026-05-16 |
+| Phase | Domain                               | Role                                                                                    | Mode          | Outcome | Verdict                         | Task ID                           | Date       |
+| ----- | ------------------------------------ | --------------------------------------------------------------------------------------- | ------------- | ------- | ------------------------------- | --------------------------------- | ---------- |
+| 0     | license-audit-inference-stack        | Documentation Reader (#4) as Software License Verification Specialist (manual override) | red-hat       | 8.5/10  | GO-WITH-MOD                     | (not /select'd — pre-/select-fix) | 2026-05-16 |
+| 1     | architecture-design-inference-server | Architecture Brainstormer (#12)                                                         | human-thinker | 9/10    | GO-WITH-MOD 7.5                 | task-20260516170130-6976          | 2026-05-16 |
+| 1     | architecture-design-inference-server | Devil's Advocate (#13)                                                                  | red-hat       | 9/10    | GO-WITH-MOD 7 (lean STOP-AS-IS) | task-20260516170130-2213          | 2026-05-16 |
+| 1     | architecture-design-inference-server | Failure Predictor (#16)                                                                 | red-hat       | 8/10    | GO-WITH-MOD 8                   | task-20260516170130-9585          | 2026-05-16 |
+| 1     | architecture-design-inference-server | Security Reviewer (#58)                                                                 | red-hat       | 10/10   | GO-WITH-MOD 9                   | task-20260516170130-4886          | 2026-05-16 |
 
 All 4 Phase 1 critiques converged on GO-WITH-MOD. 19 findings total → 13 v0.2 doc revisions applied below the line + 6 Phase 2 code-level fixes baked into the implementation plan.
 
