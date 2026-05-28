@@ -1,0 +1,36 @@
+# Turbohaul-Manager v0.2 reference docker-compose.
+#
+# Mounts the llama-server binary from the host (built separately from Tom's
+# TurboQuant fork). Run docker compose up -d after setting LLAMA_SERVER_HOST_PATH
+# to the absolute path of your llama-server binary.
+
+services:
+  turbohaul-manager:
+    image: turbohaul-manager:v0.2
+    container_name: turbohaul-manager
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11401:11401"  # internal-network bind per v0.2 §3.2; remove 127.0.0.1: prefix only with explicit network policy
+    volumes:
+      - turbohaul-state:/var/lib/turbohaul
+      - ${LLAMA_SERVER_HOST_PATH:-./bin/llama-server}:/opt/turbohaul/bin/llama-server:ro
+      - ./turbohaul.yaml:/etc/turbohaul/turbohaul.yaml:ro
+    environment:
+      TURBOHAUL_ALLOW_PUBLIC_BIND: "1"  # required for container -> host port mapping
+      TURBOHAUL_LOG_LEVEL: "info"
+      # HF_API_KEY:  # set in .env if pulling private HF models
+    # Uncomment for NVIDIA GPU access (the TurboQuant llama.cpp fork uses CUDA).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    # Alternatively (older docker):
+    #   runtime: nvidia
+    # For ROCm: see docs/AMD_ROCM.md (post-v0.2 polish).
+
+volumes:
+  turbohaul-state:
+    name: turbohaul-state

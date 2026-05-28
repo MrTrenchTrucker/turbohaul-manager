@@ -1,0 +1,99 @@
+# Turbohaul-Manager v0.2-cuda — production variant baking Tom's TurboQuant
+# llama-server. Use this when running on hardware with NVIDIA GPU + the
+# operator wants a single image (no separate llama-server binary mount).
+#
+# Tradeoff vs slim variant (Dockerfile): this image is ~1.5 GB (CUDA libs
+# + llama-server) vs 192 MB. It violates v0.2 §13 supply-chain decoupling
+# in exchange for ops simplicity. Use whichever fits your deployment.
+#
+# Build:
+#   docker build -f Dockerfile.cuda -t turbohaul-manager:v0.2-cuda .
+#
+# Run:
+#   docker run --gpus all -p 127.0.0.1:11401:11401 \
+#     -v ${PWD}/state:/var/lib/turbohaul \
+#     turbohaul-manager:v0.2-cuda
+
+# ----------------------------------------------------------------------------
+# Stage 1: Frontend (same as slim variant)
+# ----------------------------------------------------------------------------
+FROM node:20-alpine AS frontend-build
+WORKDIR /work
+COPY src/frontend/package.json src/frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY src/frontend/. ./
+RUN npm run typecheck && npm run build
+
+# ----------------------------------------------------------------------------
+# Stage 2: llama-server binary extraction
+#
+# We use a prebuilt turboquant-sidecar:v2 image as the binary
+# source. It was compiled with CUDA 12.9 + GGML_CUDA=ON + arch 89;120
+# (Blackwell). This stage is just a reference — Docker pulls the layer
+# but doesn't run it. If the operator wants to compile the TurboQuant llama.cpp fork from
+# source (e.g., for a different GPU arch), replace this stage with a
+# clone+cmake build of github.com/TheTom/llama-cpp-turboquant.
+# ----------------------------------------------------------------------------
+FROM turboquant-sidecar:v2 AS llama-binary
+
+# ----------------------------------------------------------------------------
+# Stage 3: Runtime (CUDA 12.9 + Python 3.11 + turbohaul + bundle + binary)
+# ----------------------------------------------------------------------------
+FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.11 python3.11-venv python3.11-dev \
+      ca-certificates curl procps libgomp1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+ && ln -sf /usr/bin/python3.11 /usr/local/bin/python
+
+# Use a virtualenv to avoid colliding with the system Python 3.10 (Ubuntu 22.04
+# ships pip 22.0.2 against py3.10 which predates --break-system-packages).
+# venv on python3.11 gets a modern pip and isolates turbohaul cleanly.
+RUN python3.11 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+ENV PATH=/opt/venv/bin:${PATH}
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src/turbohaul/ ./src/turbohaul/
+RUN /opt/venv/bin/pip install --no-cache-dir .
+RUN /opt/venv/bin/pip install --no-cache-dir jsonschema==4.21.1
+
+# Copy the pre-compiled llama-server + its shared libraries (Tom's TurboQuant
+# fork from turboquant-sidecar:v2). The binary's RPATH is hardcoded to
+# /opt/turboquant/build/bin/ so we preserve that path inside this image.
+# Then symlink the binary to /opt/turbohaul/bin/llama-server so the yaml
+# config's canonical `llama_server_binary` path keeps pointing at the right
+# place.
+COPY --from=llama-binary /opt/turboquant/build/bin /opt/turboquant/build/bin
+RUN mkdir -p /opt/turbohaul/bin \
+ && ln -sf /opt/turboquant/build/bin/llama-server /opt/turbohaul/bin/llama-server
+
+# Frontend bundle.
+COPY --from=frontend-build /work/dist /opt/turbohaul/ui_dist
+
+# Runtime dirs.
+RUN mkdir -p /var/lib/turbohaul /etc/turbohaul \
+ && chmod 700 /var/lib/turbohaul
+
+# Default config (overridable via bind-mount).
+COPY docker/turbohaul.default.yaml /etc/turbohaul/turbohaul.yaml
+
+# Attribution + license.
+COPY THIRD_PARTY_LICENSES.md /usr/share/doc/turbohaul/THIRD_PARTY_LICENSES.md
+
+EXPOSE 11401
+
+ENV TURBOHAUL_CONFIG_PATH=/etc/turbohaul/turbohaul.yaml \
+    TURBOHAUL_ALLOW_PUBLIC_BIND=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs
+
+HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
+  CMD curl -fsS http://127.0.0.1:11401/health || exit 1
+
+ENTRYPOINT ["turbohaul-manager"]
