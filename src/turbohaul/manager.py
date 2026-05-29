@@ -166,6 +166,9 @@ class TurbohaulManager:
         # fsync stall). Sweeper is OFF the hot path — its sync SQL is fine.
         self._slots_finalized_lifetime: int = 0
         self._last_sweep_iso: str | None = None
+        # Parallel dispatch: count of satellite slots currently running
+        # concurrently against the active llama-server's parallel slots.
+        self._parallel_in_flight: int = 0
         self._sweeper_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
@@ -527,7 +530,7 @@ class TurbohaulManager:
                 "slots_finalized_lifetime": self._slots_finalized_lifetime,
             },
             "parallel_slots": {
-                "used": 1 if self._active_handle else 0,
+                "used": (1 if self._active_handle else 0) + self._parallel_in_flight,
                 "max": self.runtime.queue.max_parallel_sidecars,
             },
         }
@@ -850,6 +853,41 @@ class TurbohaulManager:
             # capture anchor's keep_alive intent for grace→idle decision.
             self._latest_keep_alive_s = (slot.client_meta or {}).get("keep_alive_s")
 
+            # Parallel dispatch: if manifest sets parallel > 1, pop up to
+            # (parallel - 1) additional staged slots and run them concurrently
+            # against the already-loaded llama-server. Extras skip spawn/health
+            # steps; the anchor's llama-server handles all N in parallel.
+            parallel = 1
+            if manifest_found:
+                try:
+                    parallel = int(manifest.llama_server_flags.get("parallel", 1))
+                except (ValueError, TypeError):
+                    parallel = 1
+
+            extra_slots: list[Slot] = []
+            if parallel > 1:
+                # Yield to the event loop once so in-flight HTTP submissions
+                # have a chance to land in the queue before we pop extras.
+                # On the warm-inherit path _process_slot reaches ACTIVE in
+                # microseconds; without this yield the other N-1 requests may
+                # still be inside submit() → enqueue() when we hit pop_next().
+                await asyncio.sleep(0)
+                for _ in range(parallel - 1):
+                    extra = await self.queue.pop_next()
+                    if extra is None:
+                        break
+                    if extra.is_evicted:
+                        self._fail_completion_future(
+                            extra,
+                            SlotEvictedError(
+                                f"slot {extra.slot_id} evicted (parallel pop)"
+                            ),
+                        )
+                        self._eviction_count += 1
+                        self._last_evicted_at_iso = datetime.now(timezone.utc).isoformat()
+                        continue
+                    extra_slots.append(extra)
+
             # Streaming: branch on streaming mode.
             #
             # Non-streaming (existing): await self._complete_fn(slot, handle) to
@@ -899,11 +937,30 @@ class TurbohaulManager:
                 ):
                     slot.completion_future.set_result({"_streamed": True})
             else:
-                # Non-streaming path (existing behaviour, unchanged).
-                # Completion (Phase 3 wires httpx forward; Phase 2 default is noop)
-                result = await self._complete_fn(slot, handle)
-                if slot.completion_future is not None and not slot.completion_future.done():
-                    slot.completion_future.set_result(result)
+                # Non-streaming path.
+                if extra_slots:
+                    # Parallel dispatch: anchor + satellites run concurrently.
+                    self._parallel_in_flight = len(extra_slots)
+                    try:
+                        all_results = await asyncio.gather(
+                            self._complete_fn(slot, handle),
+                            *[self._run_extra_slot(s, handle) for s in extra_slots],
+                            return_exceptions=True,
+                        )
+                    finally:
+                        self._parallel_in_flight = 0
+                    anchor_result = all_results[0]
+                    if isinstance(anchor_result, BaseException):
+                        if slot.completion_future is not None and not slot.completion_future.done():
+                            slot.completion_future.set_exception(anchor_result)
+                    else:
+                        if slot.completion_future is not None and not slot.completion_future.done():
+                            slot.completion_future.set_result(anchor_result)
+                else:
+                    # Single-slot path (unchanged).
+                    result = await self._complete_fn(slot, handle)
+                    if slot.completion_future is not None and not slot.completion_future.done():
+                        slot.completion_future.set_result(result)
 
             # ACTIVE → GRACE
             transition(slot, SlotState.GRACE)
@@ -1214,6 +1271,94 @@ class TurbohaulManager:
             else:
                 # Handle absent or promoted to idle_holder — safe to null.
                 self._active_handle = None
+
+    async def _run_extra_slot(self, slot: Slot, handle: SidecarHandle) -> None:
+        """Run a parallel satellite slot against an already-active llama-server.
+
+        Called via asyncio.gather inside _process_slot when parallel > 1.
+        Skips spawn/health steps (model is already loaded). Goes through its
+        own abbreviated lifecycle: LOADING → ACTIVE → GRACE → POPPED.
+        The anchor slot owns the grace window; satellites go straight to POPPED.
+        """
+        slot.port = handle.port
+        slot.pid = handle.pid
+        try:
+            transition(slot, SlotState.LOADING)
+            await self._audit_async(slot, "stage_to_loading")
+            transition(slot, SlotState.ACTIVE)
+            slot.started_active_at = time.monotonic()
+            await self._audit_async(slot, "active")
+
+            is_streaming = (
+                isinstance(slot.client_meta, dict)
+                and bool(slot.client_meta.get("stream", False))
+                and slot.stream_ready_event is not None
+                and slot.stream_done_event is not None
+            )
+            if is_streaming:
+                slot.stream_handle = handle
+                slot.stream_ready_event.set()
+                try:
+                    await asyncio.wait_for(
+                        slot.stream_done_event.wait(), timeout=3600.0
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "parallel satellite streaming slot %s timed out after 3600s",
+                        slot.slot_id,
+                    )
+                if slot.completion_future is not None and not slot.completion_future.done():
+                    slot.completion_future.set_result({"_streamed": True})
+            else:
+                result = await self._complete_fn(slot, handle)
+                if slot.completion_future is not None and not slot.completion_future.done():
+                    slot.completion_future.set_result(result)
+
+            # Satellite skips the grace window — anchor manages warm reuse.
+            transition(slot, SlotState.GRACE)
+            transition(slot, SlotState.POPPED)
+            await self._audit_async(slot, "parallel_slot_completed")
+            conn = open_state_db(self.boot.storage.state_db_path)
+            try:
+                mark_slot_ended(conn, slot.slot_id, "parallel_completed")
+            finally:
+                conn.close()
+
+        except asyncio.CancelledError:
+            self._fail_completion_future(
+                slot, asyncio.CancelledError("parallel satellite cancelled")
+            )
+            try:
+                if not is_terminal(slot.state):
+                    slot.state = SlotState.COLD
+            except Exception:
+                pass
+            try:
+                conn = open_state_db(self.boot.storage.state_db_path)
+                try:
+                    mark_slot_ended(conn, slot.slot_id, "parallel_cancelled")
+                finally:
+                    conn.close()
+            except Exception:
+                log.exception("parallel satellite cancel cleanup failed for %s", slot.slot_id)
+            raise
+
+        except Exception as exc:
+            self._fail_completion_future(slot, exc)
+            log.exception("parallel satellite slot %s failed", slot.slot_id)
+            try:
+                if not is_terminal(slot.state):
+                    slot.state = SlotState.COLD
+            except Exception:
+                pass
+            try:
+                conn = open_state_db(self.boot.storage.state_db_path)
+                try:
+                    mark_slot_ended(conn, slot.slot_id, "parallel_failed")
+                finally:
+                    conn.close()
+            except Exception:
+                log.exception("parallel satellite error cleanup failed for %s", slot.slot_id)
 
     async def _teardown(self, slot: Slot, reason: str) -> None:
         """Drained SIGTERM the process group → VRAM verify → orphan reap → audit."""

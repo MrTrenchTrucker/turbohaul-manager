@@ -111,6 +111,16 @@ class TurbohaulQueue:
                 self._staging.append(s)
             return self._pop_first_non_evicted_from(self._staging)
 
+    async def pop_next_batch(self, n: int) -> list[Slot]:
+        """Pop up to n slots for parallel dispatch. Returns fewer if queue is shallow."""
+        slots: list[Slot] = []
+        for _ in range(max(0, n)):
+            slot = await self.pop_next()
+            if slot is None:
+                break
+            slots.append(slot)
+        return slots
+
     async def enqueue_head(self, slot: Slot) -> None:
         """Insert at FIFO head — used for ACTIVE-MATCH mid-stream same-thread arrivals (v0.2 §6)."""
         if self._closed:
