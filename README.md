@@ -2,15 +2,17 @@
 
 # Turbohaul-Manager
 
-Ollama-shape inference manager using [Tom's TurboQuant](https://github.com/TheTom/llama-cpp-turboquant) fork of llama.cpp.
+Multi-backend inference manager with support for [llama.cpp](https://github.com/ggerganov/llama.cpp) (NVIDIA GPU via CUDA) and [MLX](https://ml-explore.github.io/mlx/) (Apple Silicon native).
 
-FIFO queue + grace + IDLE_HOT hot-hold + model swap on Nvidia RTX GPU's including Blackwell.
+FIFO queue + grace + IDLE_HOT hot-hold + model swap. Single-slot serial sidecar per model.
+
+**Platforms:** macOS (Apple Silicon, native MLX) · Linux (Docker + NVIDIA GPU, llama.cpp)
 
 ## What it does
 
 - Accepts OpenAI / Ollama-shape `/v1/chat/completions` requests
-- Single-slot serial sidecar (one llama-server child holds the model)
-- **MTP speculative decoding (draft-mtp) composes with TurboQuant turbo2/3/4 KV cache quantization** in a single llama.cpp binary — faster decode without sacrificing the quantized KV-cache memory footprint
+- Single-slot serial sidecar (one inference child holds the model)
+- **Multi-backend:** llama.cpp (CUDA, TurboQuant + MTP) on NVIDIA GPUs · MLX (`mlx_lm.server`) on Apple Silicon
 - ACTIVE_MATCH cascade for same-thread follow-ups within a grace window (warm-process reuse)
 - IDLE_HOT 5-minute warm-hold after grace expires: same-model follow-ups inherit the warm process; different-model swap tears down + spawns new
 - Multiplexed multi-agent serialization on one shared GPU (proven with three concurrent agents — see [docs/MULTI_AGENT_SHARING.md](docs/MULTI_AGENT_SHARING.md))
@@ -18,6 +20,53 @@ FIFO queue + grace + IDLE_HOT hot-hold + model swap on Nvidia RTX GPU's includin
 - Safety guardrails: refuses spawn when VRAM / RAM / CPU / IO-wait would put the host at risk
 
 ## Quick start
+
+### macOS (Apple Silicon, MLX backend)
+
+Requires macOS 15.0+ (Sequoia) and Python 3.11+.
+
+```bash
+# Install
+git clone https://github.com/MrTrenchTrucker/turbohaul-manager.git
+cd turbohaul-manager
+pip install -e ".[mlx]"
+
+# Run
+turbohaul-manager
+
+# Register an MLX model (uses HuggingFace repo ID)
+curl -X PUT http://localhost:11401/api/manifests/qwen3-1.7b \
+  -H "Content-Type: application/yaml" \
+  -d '
+model_tag: qwen3-1.7b
+backend: mlx
+model_repo: mlx-community/Qwen3-1.7B-4B
+mlx_server_flags:
+  max_tokens: 8192
+'
+
+# Inference
+curl http://localhost:11401/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-1.7b","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+MLX models are downloaded from HuggingFace on first use and cached locally (configurable via `mlx_models_dir` in `turbohaul.yaml`). Models use safetensors format — no GGUF blob import needed.
+
+**Local models:** pass the full path as `model_path` instead of `model_repo`. If the model directory doesn't include a `chat_template` in its `tokenizer_config.json`, add `chat_template` to `mlx_server_flags` pointing at the `.jinja` file that ships with the model — otherwise `mlx_lm.server` will attempt a live HuggingFace lookup on every request:
+
+```yaml
+model_tag: vibethinker-1.5b
+backend: mlx
+model_path: /path/to/VibeThinker-1.5B-MLX
+mlx_server_flags:
+  chat_template: /path/to/VibeThinker-1.5B-MLX/chat_template.jinja
+  max_tokens: 8192
+```
+
+Clients always use the short `model_tag` name (e.g., `vibethinker-1.5b`) — Turbohaul rewrites the `model` field in the upstream request to the path the sidecar was started with.
+
+### Docker (NVIDIA GPU, llama.cpp backend)
 
 ```bash
 # Run it (build locally first — see below; no prebuilt registry image is published yet)

@@ -587,7 +587,14 @@ _STREAM_FORWARDED_KNOBS = _COMMON_FORWARDED_KNOBS + _STREAM_ONLY_KNOBS
 
 
 def _build_stream_payload(client_meta: dict, model: str, messages: list) -> dict:
-    """Build the streaming chat-completions payload sent to llama-server."""
+    """Build the streaming chat-completions payload sent to the sidecar.
+
+    ``model`` should be the sidecar-canonical model ID (handle.sidecar_model_id
+    if set, else the client-facing tag). For llama.cpp the field is ignored.
+    For mlx_lm it must match the --model argument the server was started with —
+    mlx_lm uses it as a lookup key and will attempt a HuggingFace fetch if it
+    doesn't recognise the value.
+    """
     payload: dict = {
         "model": model,
         "messages": messages,
@@ -724,7 +731,8 @@ async def _openai_chat_completions_stream(
                 yield b"data: [DONE]\n\n"
                 return
 
-            stream_payload = _build_stream_payload(client_meta, model, messages)
+            sidecar_model = handle.sidecar_model_id or model
+            stream_payload = _build_stream_payload(client_meta, sidecar_model, messages)
             url = f"http://127.0.0.1:{handle.port}/v1/chat/completions"
 
             async with httpx.AsyncClient(timeout=STREAM_TIMEOUT_S) as client:
@@ -1128,6 +1136,10 @@ def make_llama_server_complete_fn(
     http_client_factory=None,
 ):
     """Build a completion_fn that forwards to the active sidecar's port via httpx.
+
+    Works with any backend that exposes an OpenAI-compatible API
+    (llama.cpp, MLX-ML, etc.) — hits ``/v1/chat/completions`` on the
+    assigned port regardless of engine type.
 
     Used by main.py to wire the production completion_fn. Tests typically inject
     a simpler fake instead.

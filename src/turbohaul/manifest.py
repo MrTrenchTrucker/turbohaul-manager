@@ -360,12 +360,12 @@ DENIED_FLAGS: set[str] = {
     "control_vector_scaled",
     "tools",                  # DIRECT RCE — enables exec_shell_command / write_file / edit_file via server API
     "grammar",                # inline BNF — deferred (needs grammar-parser pre-validator)
-    "tensor_split",           # CSV-string with shell-meta risk — deferred to 
+    "tensor_split",           # CSV-string with shell-meta risk — deferred to
     "samplers",               # semi-colon list — deferred (validator needed)
     "dry_sequence_breaker",   # str list — deferred
     "chat_template_kwargs",   # JSON-str — deferred (recursive scalar validator needed)
     "reasoning_budget_message", # str injected mid-stream — deferred (length-cap + ctrl-char strip needed)
-    "fit_target",             # CSV "MiB,MiB" — deferred to 
+    "fit_target",             # CSV "MiB,MiB" — deferred to
 }
 
 
@@ -524,20 +524,39 @@ def _validate_flag_value(key: str, value: Any) -> None:
 
 
 class Manifest(BaseModel):
-    """A single model manifest from /var/lib/turbohaul/manifests/<tag>.yaml."""
+    """A single model manifest from /var/lib/turbohaul/manifests/<tag>.yaml.
+
+    ``backend`` field selects the inference engine:
+    - ``"llama.cpp"`` (default) — llama-server subprocess with GGUF model
+    - ``"mlx"`` — mlx-lm HTTP server (Apple Silicon only)
+
+    MLX models may use ``model_repo`` (HuggingFace repo ID) or
+    ``model_path`` (local directory) instead of ``gguf_blob_sha256``.
+    """
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
+    # === Shared ===
     model_tag: str
     display_name: str = ""
     description: str = ""
-    gguf_blob_sha256: str
-    gguf_size_bytes: int = Field(default=0, ge=0)
     context_size: int = Field(default=2048, ge=1)
-    expected_vram_bytes: int = Field(default=0, ge=0)  # mandatory for VRAM-fit pre-check (v0.2 §10 + §15)
+    expected_vram_bytes: int = Field(default=0, ge=0)
     revision: int = Field(default=1, ge=1)  # ETag value
-    llama_server_flags: dict[str, Any] = Field(default_factory=dict)
     prompt_template: PromptTemplate = Field(default_factory=PromptTemplate)
+
+    # === Backend selection ===
+    backend: str = "llama.cpp"  # "llama.cpp" (default) or "mlx"
+
+    # === llama.cpp ===
+    gguf_blob_sha256: str = ""
+    gguf_size_bytes: int = Field(default=0, ge=0)
+    llama_server_flags: dict[str, Any] = Field(default_factory=dict)
+
+    # === MLX ===
+    model_repo: str = ""  # HuggingFace repo ID (e.g. mlx-community/...)
+    model_path: str = ""  # Local model directory path
+    mlx_server_flags: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("model_tag")
     @classmethod
@@ -548,9 +567,18 @@ class Manifest(BaseModel):
     @field_validator("gguf_blob_sha256")
     @classmethod
     def _sha256_format(cls, v: str) -> str:
-        if not re.fullmatch(r"[0-9a-f]{64}", v):
+        if not (v and re.fullmatch(r"[0-9a-f]{64}", v)):
             raise ManifestValidationError(
                 f"gguf_blob_sha256 must be 64 hex chars; got {v[:32]}... (len={len(v)})"
+            )
+        return v
+
+    @field_validator("backend")
+    @classmethod
+    def _backend_valid(cls, v: str) -> str:
+        if v not in {"llama.cpp", "mlx"}:
+            raise ManifestValidationError(
+                f"backend must be 'llama.cpp' or 'mlx', got {v!r}"
             )
         return v
 
@@ -574,6 +602,34 @@ class Manifest(BaseModel):
                 )
             _validate_flag_value(key, value)
         return v
+
+    @field_validator("mlx_server_flags")
+    @classmethod
+    def _mlx_flags_allowlist(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """Validate MLX flags against the MLX allowlist."""
+        from turbohaul.backends.mlx import SAFE_MLX_FLAGS
+
+        for key, value in v.items():
+            if key not in SAFE_MLX_FLAGS:
+                raise ManifestValidationError(
+                    f"mlx_server_flags.{key} is not in the closed allowlist. "
+                    f"Allowed: {sorted(SAFE_MLX_FLAGS.keys())}"
+                )
+            expected = SAFE_MLX_FLAGS[key]
+            if not isinstance(value, expected):
+                raise ManifestValidationError(
+                    f"mlx_server_flags.{key} expects {expected.__name__}, "
+                    f"got {type(value).__name__}: {value!r}"
+                )
+        return v
+
+    def requires_llama_fields(self) -> bool:
+        """True if this manifest uses llama.cpp backend."""
+        return self.backend == "llama.cpp"
+
+    def requires_mlx_fields(self) -> bool:
+        """True if this manifest uses MLX backend."""
+        return self.backend == "mlx"
 
 
 def _safe_manifest_path(manifests_root: Path, tag: str) -> Path:

@@ -51,13 +51,17 @@ class StorageConfig(BaseModel):
 
 
 class RuntimePathsConfig(BaseModel):
-    """Boot-only: binary path + sha256 pin + child port base."""
+    """Boot-only: binary path + sha256 pin + child port base + MLX paths."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     llama_server_binary: Path
     llama_server_binary_sha256: str = ""  # empty = skip verify (dev only)
     default_port_base: int = Field(default=11500, ge=1024, le=65000)
+
+    # MLX paths (Apple Silicon only; ignored on other platforms)
+    mlx_python_binary: Path | None = None  # None = use sys.executable
+    mlx_models_dir: Path | None = None  # local model storage root for MLX models
 
 
 class UIConfig(BaseModel):

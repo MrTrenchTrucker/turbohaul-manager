@@ -31,6 +31,9 @@ dev = [
     "pytest-mock>=3.14.0",
     "ruff>=0.7.0",
 ]
+mlx = [
+    "mlx-lm>=0.21.0; sys_platform == 'darwin'",
+]
 
 [project.scripts]
 turbohaul-manager = "turbohaul.__main__:main"

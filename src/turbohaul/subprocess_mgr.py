@@ -11,6 +11,9 @@ Health: poll /health every poll_interval_s, default 600s cold-load tolerance.
 Pop: drained-SIGTERM on the whole process group; killpg(SIGKILL) on timeout.
 VRAM verify: nvidia-smi cross-check after POPPED before next stage.
 Binary integrity: sha256 verify at boot (defense-in-depth, v0.2 §7.1).
+
+Note: SidecarHandle is now defined in turbohaul.backends.base and re-exported
+here for backward compatibility. New code should import from turbohaul.backends.
 """
 import asyncio
 import contextlib
@@ -27,6 +30,7 @@ from typing import Any
 
 import httpx
 
+from turbohaul.backends.base import SidecarHandle  # noqa: F401 — re-export
 
 log = logging.getLogger(__name__)
 
@@ -43,24 +47,6 @@ class HealthCheckFailed(RuntimeError):
 
 class SchemaMismatch(RuntimeError):
     """the TurboQuant llama.cpp fork /health response shape changed unexpectedly (M3 defense)."""
-
-
-class SidecarHandle:
-    """Wraps a running llama-server subprocess + its identity."""
-
-    def __init__(self, proc: subprocess.Popen, port: int, model_tag: str) -> None:
-        self.proc = proc
-        self.port = port
-        self.model_tag = model_tag
-        self.spawned_at = time.monotonic()
-        self.activated_at: float | None = None
-
-    @property
-    def pid(self) -> int:
-        return self.proc.pid
-
-    def is_alive(self) -> bool:
-        return self.proc.poll() is None
 
 
 def spawn_sidecar(

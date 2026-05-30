@@ -3,18 +3,23 @@
 Per v0.2 ARCHITECTURE.md - orchestrates the whole lifecycle described in §6 state
 machine. This module ships the foundational interface; the full worker_loop
 streaming implementation lands alongside the API layer that forwards
-to llama-server.
+to the backend server (llama.cpp or MLX).
+
+Backend-agnostic: the manager reads the per-model manifest ``backend`` field
+and dispatches to the appropriate inference engine (llama.cpp or MLX).
 """
 import asyncio
 import contextlib
 import logging
 import os
+import sys
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from turbohaul.backends import LlamaCppBackend, MLXBackend, SidecarHandle, SpawnRequest
 from turbohaul.config import KEEP_ALIVE_MAX_S, BootConfig, RuntimeConfig
 from turbohaul.fsm import LEGAL_TRANSITIONS, InvalidTransition, is_terminal, transition
 from turbohaul.manifest import flags_to_argv, read_manifest
@@ -33,7 +38,6 @@ from turbohaul.state import (
     upsert_slot,
 )
 from turbohaul.subprocess_mgr import (
-    SidecarHandle,
     drained_sigterm,
     open_and_verify_binary,
     spawn_sidecar,
@@ -175,6 +179,8 @@ class TurbohaulManager:
         # second mutating task, re-add it purposefully and wrap the call
         # sites that actually need it.
         self._binary_fd: int | None = None  # Note: TOCTOU-pinned fd
+        # Idle holder + backend tracking (for backend-aware teardown).
+        self._idle_backend: Any = None
         # Event bus for /ws/state subscribers (v0.2 §11.1 redacted)
         self.event_bus = EventBus()
         # Injection points (default = real subprocess_mgr; tests inject mocks)
@@ -189,6 +195,97 @@ class TurbohaulManager:
         """Default no-op completion (Phase 2). Phase 3 wires httpx proxy via DI."""
         await asyncio.sleep(0.001)
         return None
+
+    # === Backend resolution ================================================
+
+    def _resolve_backend(self, manifest: Any) -> Any:
+        """Resolve the backend for a given manifest.
+
+        Returns a backend instance based on the manifest's ``backend`` field.
+        Caches per-type to avoid re-creating instances.
+        """
+        backend_name = getattr(manifest, "backend", "llama.cpp")
+        if not hasattr(self, "_backend_cache"):
+            self._backend_cache: dict[str, Any] = {}
+        if backend_name not in self._backend_cache:
+            if backend_name == "mlx":
+                self._backend_cache[backend_name] = MLXBackend()
+            else:
+                self._backend_cache[backend_name] = LlamaCppBackend()
+        return self._backend_cache[backend_name]
+
+    def _build_spawn_request(self, manifest: Any, port: int) -> SpawnRequest:
+        """Build a SpawnRequest from a manifest + port."""
+        backend_name = getattr(manifest, "backend", "llama.cpp")
+
+        if backend_name == "mlx":
+            from turbohaul.backends.mlx import mlx_flags_to_argv
+
+            # For MLX: model_repo or model_path from manifest.
+            model_repo = getattr(manifest, "model_repo", "")
+            model_path = getattr(manifest, "model_path", "")
+            mlx_flags = getattr(manifest, "mlx_server_flags", {})
+            mlx_argv = mlx_flags_to_argv(mlx_flags)
+
+            # Resolve python binary.
+            python_binary = self.boot.runtime.mlx_python_binary
+            if python_binary is None:
+                python_binary = Path(sys.executable)
+
+            return SpawnRequest(
+                port=port,
+                model_tag=manifest.model_tag,
+                model_repo=model_repo,
+                model_path=Path(model_path) if model_path else None,
+                python_binary=python_binary,
+                mlx_flags=mlx_argv,
+            )
+        else:
+            # llama.cpp: use existing path resolution.
+            argv = flags_to_argv(manifest.llama_server_flags)
+            gguf_path = (
+                self.boot.storage.blob_store_path
+                / "sha256"
+                / manifest.gguf_blob_sha256[:2]
+                / manifest.gguf_blob_sha256
+            )
+            return SpawnRequest(
+                binary=self.boot.runtime.llama_server_binary,
+                gguf_path=gguf_path,
+                port=port,
+                model_tag=manifest.model_tag,
+                argv_flags=argv,
+                binary_fd=self._binary_fd,
+            )
+
+    async def _backend_spawn(
+        self, manifest: Any, port: int,
+    ) -> tuple[Any, SidecarHandle]:
+        """Spawn the backend for a manifest. Returns (backend, handle)."""
+        backend = self._resolve_backend(manifest)
+        req = self._build_spawn_request(manifest, port)
+        handle = backend.spawn(req)
+        return backend, handle
+
+    async def _backend_wait_healthy(
+        self, backend: Any, port: int, timeout_s: float,
+    ) -> bool:
+        """Wait for the backend to become healthy."""
+        return await backend.wait_healthy(
+            port, timeout_s,
+            poll_interval_s=2.0,
+        )
+
+    async def _backend_teardown(
+        self, backend: Any, handle: SidecarHandle, is_active: bool,
+    ) -> tuple[bool, str]:
+        """Teardown the backend process."""
+        return await backend.teardown(
+            handle,
+            drained_window_s=float(self.runtime.queue.drained_sigterm_window_active_s),
+            is_active=is_active,
+            cold_window_s=float(self.runtime.queue.drained_sigterm_window_cold_s),
+        )
 
     async def submit_and_wait(
         self,
@@ -652,6 +749,7 @@ class TurbohaulManager:
             # Build llama-server argv from manifest if available; tolerate missing
             # manifest for testing convenience.
             argv: list[str] = []
+            manifest: Any = None
             manifest_found = True
             try:
                 manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
@@ -728,6 +826,7 @@ class TurbohaulManager:
                 self._idle_handle = None
                 self._idle_model_tag = None
                 self._idle_expires_at = None
+                self._idle_backend = None
                 slot.port = handle.port
                 slot.pid = handle.pid
                 self._active_handle = handle
@@ -821,21 +920,36 @@ class TurbohaulManager:
                             ),
                         )
                         return
-                handle = self._spawn(
-                    self.boot.runtime.llama_server_binary,
-                    gguf_path,
-                    port,
-                    slot.model_tag,
-                    argv,
-                    binary_fd=self._binary_fd,
-                )
-                slot.port = handle.port
-                slot.pid = handle.pid
-                self._active_handle = handle
-                # LOADING → ACTIVE (or LOADING_FAIL → POPPED)
-                healthy = await self._wait_healthy(
-                    port, self.runtime.queue.loading_health_timeout_s
-                )
+                # === Backend-aware spawn ===
+                # Determine backend from manifest and spawn accordingly.
+                # Fall back to legacy llama.cpp path if manifest missing.
+                if manifest_found:
+                    backend, handle = await self._backend_spawn(manifest, port)
+                    slot.port = handle.port
+                    slot.pid = handle.pid
+                    self._active_handle = handle
+                    # Health check through the backend
+                    healthy = await self._backend_wait_healthy(
+                        backend, port, self.runtime.queue.loading_health_timeout_s,
+                    )
+                    # Store backend reference on slot for later teardown
+                    slot._backend = backend
+                else:
+                    # Legacy path: no manifest → spawn with missing.gguf
+                    handle = self._spawn(
+                        self.boot.runtime.llama_server_binary,
+                        gguf_path,
+                        port,
+                        slot.model_tag,
+                        argv,
+                        binary_fd=self._binary_fd,
+                    )
+                    slot.port = handle.port
+                    slot.pid = handle.pid
+                    self._active_handle = handle
+                    healthy = await self._wait_healthy(
+                        port, self.runtime.queue.loading_health_timeout_s
+                    )
             if not healthy:
                 transition(slot, SlotState.LOADING_FAIL)
                 await self._audit_async(slot, "loading_fail_health_timeout")
@@ -1119,6 +1233,8 @@ class TurbohaulManager:
                 self._idle_handle = self._active_handle
                 self._idle_model_tag = slot.model_tag
                 self._idle_expires_at = time.monotonic() + idle_seconds
+                # Track backend for idle holder teardown.
+                self._idle_backend = getattr(slot, "_backend", None)
                 await self._audit_event_only_async(
                     slot.slot_id,
                     "idle_hot_enter",
@@ -1186,18 +1302,27 @@ class TurbohaulManager:
             ):
                 sigterm_ok = False
                 try:
-                    await asyncio.shield(
-                        self._sigterm(
-                            handle_to_reap,
-                            drained_window_s=float(
-                                self.runtime.queue.drained_sigterm_window_active_s
-                            ),
-                            is_active=False,
-                            cold_window_s=float(
-                                self.runtime.queue.drained_sigterm_window_cold_s
-                            ),
+                    # Backend-aware defensive sigterm.
+                    backend = getattr(slot, "_backend", None)
+                    if backend is not None:
+                        await asyncio.shield(
+                            self._backend_teardown(
+                                backend, handle_to_reap, is_active=False,
+                            )
                         )
-                    )
+                    else:
+                        await asyncio.shield(
+                            self._sigterm(
+                                handle_to_reap,
+                                drained_window_s=float(
+                                    self.runtime.queue.drained_sigterm_window_active_s
+                                ),
+                                is_active=False,
+                                cold_window_s=float(
+                                    self.runtime.queue.drained_sigterm_window_cold_s
+                                ),
+                            )
+                        )
                     sigterm_ok = True
                 except Exception:
                     log.exception(
@@ -1218,12 +1343,19 @@ class TurbohaulManager:
     async def _teardown(self, slot: Slot, reason: str) -> None:
         """Drained SIGTERM the process group → VRAM verify → orphan reap → audit."""
         if self._active_handle is not None:
-            ok, status = await self._sigterm(
-                self._active_handle,
-                drained_window_s=float(self.runtime.queue.drained_sigterm_window_active_s),
-                is_active=False,
-                cold_window_s=float(self.runtime.queue.drained_sigterm_window_cold_s),
-            )
+            # Backend-aware teardown: use the slot's backend if available.
+            backend = getattr(slot, "_backend", None)
+            if backend is not None:
+                ok, status = await self._backend_teardown(
+                    backend, self._active_handle, is_active=False,
+                )
+            else:
+                ok, status = await self._sigterm(
+                    self._active_handle,
+                    drained_window_s=float(self.runtime.queue.drained_sigterm_window_active_s),
+                    is_active=False,
+                    cold_window_s=float(self.runtime.queue.drained_sigterm_window_cold_s),
+                )
             # Fix: dynamic expected_drop_mib derived from manifest
             # expected_vram_bytes. Was hardcoded 1024 MiB — let a 921 MiB
             # drop "verify clear" while 17 GiB qwen35b still resident.
@@ -1304,19 +1436,27 @@ class TurbohaulManager:
             return
         held = self._idle_handle
         model_tag = self._idle_model_tag
+        idle_backend = self._idle_backend
         self._idle_handle = None
         self._idle_model_tag = None
         self._idle_expires_at = None
-        ok, status = await self._sigterm(
-            held,
-            drained_window_s=float(
-                self.runtime.queue.drained_sigterm_window_active_s
-            ),
-            is_active=False,
-            cold_window_s=float(
-                self.runtime.queue.drained_sigterm_window_cold_s
-            ),
-        )
+        self._idle_backend = None
+        # Backend-aware idle teardown.
+        if idle_backend is not None:
+            ok, status = await self._backend_teardown(
+                idle_backend, held, is_active=False,
+            )
+        else:
+            ok, status = await self._sigterm(
+                held,
+                drained_window_s=float(
+                    self.runtime.queue.drained_sigterm_window_active_s
+                ),
+                is_active=False,
+                cold_window_s=float(
+                    self.runtime.queue.drained_sigterm_window_cold_s
+                ),
+            )
         # Fix: dynamic expected_drop_mib for idle holder teardown.
         expected_drop_mib = self._compute_expected_drop_mib(
             model_tag or ""

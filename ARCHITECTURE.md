@@ -552,4 +552,86 @@ Two scope-reduction alternatives were raised during design review and rejected i
 
 ---
 
+## 18. Multi-Backend Architecture (MLX Support)
+
+Turbohaul-Manager supports multiple inference backends behind a unified interface.
+The per-model manifest `backend` field selects the inference engine.
+
+### 18.1 Supported Backends
+
+| Backend | Engine | Platform | Manifest field |
+|---|---|---|---|
+| `llama.cpp` (default) | TurboQuant llama.cpp fork | Linux/macOS (CUDA/Metal/Vulkan) | `gguf_blob_sha256`, `llama_server_flags` |
+| `mlx` | mlx-lm (`mlx_lm.server`) | macOS Apple Silicon only | `model_repo`, `model_path`, `mlx_server_flags` |
+
+### 18.2 Backend Package Structure
+
+```
+src/turbohaul/backends/
+├── __init__.py        # Exports: LlamaCppBackend, MLXBackend, SidecarHandle, SpawnRequest
+├── base.py            # BackendInterface (ABC), SidecarHandle, SpawnRequest
+├── llamacpp.py        # llama.cpp subprocess backend (llama-server)
+└── mlx.py             # MLX subprocess backend (mlx_lm.server)
+```
+
+### 18.3 Backend Interface
+
+Every backend implements the `BackendInterface` (ABC in `backends/base.py`):
+
+- `name` — String identifier (e.g. `"mlx"`, `"llama.cpp"`)
+- `spawn(req: SpawnRequest) -> SidecarHandle` — Start the backend subprocess
+- `wait_healthy(port, timeout_s, poll_interval_s) -> bool` — Wait for readiness
+- `teardown(handle, drained_window_s, is_active, cold_window_s) -> tuple[bool, str]` — Graceful shutdown
+
+### 18.4 MLX Backend Details
+
+**How it works:** Spawns `python -m mlx_lm.server` as a supervised subprocess.
+The MLX server exposes an OpenAI-compatible API at `http://127.0.0.1:<port>/v1/chat/completions`
+and a health check at `http://127.0.0.1:<port>/v1/models`.
+
+**Model source:** MLX models use either:
+- `model_repo`: HuggingFace repo ID (e.g. `mlx-community/Llama-3.2-1B-Instruct-4bit`)
+- `model_path`: Local directory containing the MLX model
+
+**Installation:** `pip install turbohaul-manager[mlx]` (macOS arm64 only, via `mlx-lm>=0.21.0`)
+
+**Platform check:** The MLX backend refuses to start if:
+- `platform.system() != "Darwin"` (requires macOS)
+- `platform.machine() != "arm64"` (requires Apple Silicon)
+
+### 18.5 MLX Manifest Example
+
+```yaml
+model_tag: llama-3.2-1b
+backend: mlx
+model_repo: mlx-community/Llama-3.2-1B-Instruct-4bit
+context_size: 2048
+mlx_server_flags:
+  verbose: true
+  maxtokens: 2048
+```
+
+### 18.6 Backend Resolution Flow
+
+1. Request arrives with `model_tag`
+2. Manager reads manifest for that tag
+3. Manifest `backend` field selects engine (`"llama.cpp"` or `"mlx"`)
+4. `_resolve_backend()` returns cached backend instance
+5. `_build_spawn_request()` constructs engine-specific spawn request
+6. Backend's `spawn()` starts subprocess
+7. Completion proxy routes to `http://127.0.0.1:<port>/v1/chat/completions` (same for all backends)
+
+### 18.7 SidecarHandle Unification
+
+`SidecarHandle` is defined in `backends/base.py` and re-exported from `subprocess_mgr.py`
+for backward compatibility. Both backends return the same type, so the manager's
+worker_loop handles any backend uniformly.
+
+### 18.8 Config Changes
+
+- `runtime.mlx_python_binary`: Path to Python binary for MLX server (default: `sys.executable`)
+- `runtime.mlx_model_cache_path`: MLX model cache directory (default: `~/.cache/mlx`)
+
+---
+
 **End of v0.2 design lock.** All Phase 1 findings addressed (doc revisions + implementation-baseline shifts). Ready for Phase 2 implementation start (4-6 days estimate, no tech debt).

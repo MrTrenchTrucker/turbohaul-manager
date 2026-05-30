@@ -33,6 +33,8 @@ storage:
 runtime:
   llama_server_binary: /opt/turboquant/build/bin/llama-server
   llama_server_binary_sha256: ""
+  mlx_python_binary: /usr/bin/python3
+  mlx_models_dir: /tmp/mlx_models
   default_port_base: 11500
 ui:
   enabled: false

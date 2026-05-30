@@ -87,6 +87,7 @@ class Slot:
     # (correct loop). Non-HTTP callers (BootInventory, internal probes) pass None.
     disconnect_event: Optional[asyncio.Event] = None
     is_evicted: bool = False  # set by pop_*_non_evicted_from when caller-disconnected
+    _backend: Any = None  # Inference backend instance (for teardown)
 
     @classmethod
     def new(
