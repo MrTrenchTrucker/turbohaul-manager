@@ -95,11 +95,18 @@ class MLXBackend(BackendInterface):
             req.port, req.model_tag, python,
         )
 
+        # Inherit environment but clear PYTHONPATH to prevent turbohaul
+        # source modules from shadowing stdlib (e.g. turbohaul.queue →
+        # shadowing queue module, breaking huggingface_hub imports).
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
 
         return SidecarHandle(

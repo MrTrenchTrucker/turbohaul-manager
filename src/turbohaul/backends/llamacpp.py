@@ -63,11 +63,17 @@ class LlamaCppBackend(BackendInterface):
             req.port, req.model_tag, "yes" if req.binary_fd is not None else "no",
         )
 
+        # Inherit environment but clear PYTHONPATH to prevent turbohaul
+        # source modules from shadowing stdlib in child processes.
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
             pass_fds=pass_fds,
         )
 

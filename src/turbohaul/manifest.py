@@ -567,7 +567,8 @@ class Manifest(BaseModel):
     @field_validator("gguf_blob_sha256")
     @classmethod
     def _sha256_format(cls, v: str) -> str:
-        if not (v and re.fullmatch(r"[0-9a-f]{64}", v)):
+        # Empty string is valid for MLX models (no GGUF blob)
+        if v and not re.fullmatch(r"[0-9a-f]{64}", v):
             raise ManifestValidationError(
                 f"gguf_blob_sha256 must be 64 hex chars; got {v[:32]}... (len={len(v)})"
             )

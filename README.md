@@ -25,16 +25,53 @@ FIFO queue + grace + IDLE_HOT hot-hold + model swap. Single-slot serial sidecar 
 
 Requires macOS 15.0+ (Sequoia) and Python 3.11+.
 
+**Option 1: Local development (recommended)**
+
 ```bash
-# Install
+# Clone the repo
 git clone https://github.com/MrTrenchTrucker/turbohaul-manager.git
 cd turbohaul-manager
-pip install -e ".[mlx]"
 
-# Run
-turbohaul-manager
+# Install dependencies (mlx-lm for MLX backend)
+pip install mlx-lm
 
-# Register an MLX model (uses HuggingFace repo ID)
+# Run with the launcher script (easiest)
+./turbohaul-launcher.sh
+
+# Or run directly with Python
+python -m turbohaul.__main__ --config ~/.turbohaul/turbohaul.yaml
+```
+
+**Option 2: Install as console script**
+
+```bash
+# Install the package (creates turbohaul-manager CLI)
+pip install -e .
+
+# Run it
+turbohaul-manager --config ~/.turbohaul/turbohaul.yaml
+```
+
+**Option 3: Copy launcher to ~/bin (permanent)**
+
+```bash
+# Install mlx-lm first (conda is often faster on macOS)
+conda install -c conda-forge mlx-lm
+
+# Or via pip
+pip install mlx-lm
+
+# Copy launcher to your bin directory
+cp turbohaul-launcher.sh ~/bin/turbohaul
+chmod +x ~/bin/turbohaul
+
+# Run it
+turbohaul --config ~/.turbohaul/turbohaul.yaml
+```
+
+**Register an MLX model (uses HuggingFace repo ID):**
+
+```bash
 curl -X PUT http://localhost:11401/api/manifests/qwen3-1.7b \
   -H "Content-Type: application/yaml" \
   -d '
@@ -44,8 +81,11 @@ model_repo: mlx-community/Qwen3-1.7B-4B
 mlx_server_flags:
   max_tokens: 8192
 '
+```
 
-# Inference
+**Inference:**
+
+```bash
 curl http://localhost:11401/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3-1.7b","messages":[{"role":"user","content":"Hello"}]}'
