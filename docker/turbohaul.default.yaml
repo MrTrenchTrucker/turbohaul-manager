@@ -1,0 +1,45 @@
+# Default turbohaul.yaml shipped inside the v0.2 image.
+# Override by bind-mounting your own at /etc/turbohaul/turbohaul.yaml.
+
+server:
+  host: 127.0.0.1  # validator-enforced default; uvicorn binds 0.0.0.0 only when
+                   # --allow-public-bind / TURBOHAUL_ALLOW_PUBLIC_BIND=1 is set.
+                   # See v0.2 §3.2.
+  port: 11401
+  allow_public_bind: false
+
+storage:
+  blob_store_path: /var/lib/turbohaul/blobs
+  manifests_path: /var/lib/turbohaul/manifests
+  import_allowed_root: /var/lib/turbohaul/import-staging
+  state_db_path: /var/lib/turbohaul/state.sqlite
+
+runtime:
+  llama_server_binary: /opt/turbohaul/bin/llama-server
+  llama_server_binary_sha256: ""  # empty = skip verify (dev). Pin in production.
+  default_port_base: 11500
+
+ui:
+  enabled: true
+  static_path: /opt/turbohaul/ui_dist
+
+queue:
+  max_parallel_sidecars: 1
+  staging_queue_depth: 100
+  acceptance_buffer_max: 10000
+  grace_seconds: 30
+  idle_hot_load_seconds: 120
+  max_grace_extensions: 5
+  loading_health_timeout_s: 600
+  drained_sigterm_window_active_s: 15
+  drained_sigterm_window_cold_s: 5
+
+pull:
+  hf_api_key_env: HF_API_KEY
+  hf_host_allowlist:
+    - huggingface.co
+    - hf.co
+  pull_url_https_only: true
+  pull_concurrency: 2
+  pull_chunk_size_mb: 64
+  per_stream_max_bytes: 107374182400  # 100 GiB

@@ -1,0 +1,118 @@
+# Turbohaul-Manager v0.2-cuda-multi — broad-architecture variant.
+# Compiles Tom's TurboQuant llama-server FROM SOURCE with CUDA arches covering
+# Turing through Blackwell (sm_75 / sm_80 / sm_86 / sm_89 / sm_90 / sm_120).
+# One image, works on ~99% of CUDA-capable consumer/prosumer NVIDIA cards
+# 2018+ (GTX 16-series and later).
+#
+# Build time: ~30-40 min on this hardware (NVCC compile for 6 architectures).
+# Image size: slightly larger than :v0.2-cuda (extra compiled kernels).
+#
+# Build:
+#   docker build -f Dockerfile.cuda-multi -t turbohaul-manager:v0.2-cuda-multi .
+
+# ----------------------------------------------------------------------------
+# Stage 1: Frontend (same as slim + :v0.2-cuda)
+# ----------------------------------------------------------------------------
+FROM node:20-alpine AS frontend-build
+WORKDIR /work
+COPY src/frontend/package.json src/frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY src/frontend/. ./
+RUN npm run typecheck && npm run build
+
+# ----------------------------------------------------------------------------
+# Stage 2: Compile Tom's TurboQuant llama-server from source for 6 GPU arches.
+# Recipe mirrors turboquant-sidecar:v1's build with CUDA_ARCHITECTURES expanded.
+# ----------------------------------------------------------------------------
+FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS llama-binary
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git cmake build-essential ca-certificates curl pkg-config \
+      libcurl4-openssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+RUN git clone https://github.com/TheTom/llama-cpp-turboquant.git turboquant \
+ && cd turboquant \
+ && git checkout feature/turboquant-kv-cache \
+ && git log -1 --format='%H %s' > /opt/build_commit.txt
+
+WORKDIR /opt/turboquant
+
+# CUDA stubs symlink dance — needed so cmake's link step against libcuda.so
+# can succeed at build time (real libcuda.so.1 is injected by host driver
+# at runtime via NVIDIA Container Toolkit).
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+ && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1 \
+ && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so \
+ && ldconfig \
+ && cmake -B build \
+      -DGGML_CUDA=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120" \
+      -DGGML_CUDA_FA=ON \
+      -DGGML_CUDA_FA_ALL_QUANTS=ON \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+      -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+ && cmake --build build --config Release -j$(nproc) \
+      --target llama-server \
+ && strip /opt/turboquant/build/bin/llama-server || true
+
+# ----------------------------------------------------------------------------
+# Stage 3: Runtime (CUDA 12.9 runtime + Python 3.11 + Turbohaul)
+# ----------------------------------------------------------------------------
+FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.11 python3.11-venv python3.11-dev \
+      ca-certificates curl procps libgomp1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+ && ln -sf /usr/bin/python3.11 /usr/local/bin/python
+
+# venv on python3.11 -> modern pip, clean isolation from system py3.10.
+RUN python3.11 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+ENV PATH=/opt/venv/bin:${PATH}
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src/turbohaul/ ./src/turbohaul/
+RUN /opt/venv/bin/pip install --no-cache-dir .
+RUN /opt/venv/bin/pip install --no-cache-dir jsonschema==4.21.1
+
+# Copy the compiled llama-server + its .so libs from stage 2.
+# Preserve /opt/turboquant/build/bin so the hardcoded RPATH resolves.
+COPY --from=llama-binary /opt/turboquant/build/bin /opt/turboquant/build/bin
+COPY --from=llama-binary /opt/build_commit.txt /opt/build_commit.txt
+RUN mkdir -p /opt/turbohaul/bin \
+ && ln -sf /opt/turboquant/build/bin/llama-server /opt/turbohaul/bin/llama-server
+
+# Frontend bundle.
+COPY --from=frontend-build /work/dist /opt/turbohaul/ui_dist
+
+# Runtime dirs.
+RUN mkdir -p /var/lib/turbohaul /etc/turbohaul \
+ && chmod 700 /var/lib/turbohaul
+
+COPY docker/turbohaul.default.yaml /etc/turbohaul/turbohaul.yaml
+COPY THIRD_PARTY_LICENSES.md /usr/share/doc/turbohaul/THIRD_PARTY_LICENSES.md
+
+EXPOSE 11401
+
+ENV TURBOHAUL_CONFIG_PATH=/etc/turbohaul/turbohaul.yaml \
+    TURBOHAUL_ALLOW_PUBLIC_BIND=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs
+
+HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
+  CMD curl -fsS http://127.0.0.1:11401/health || exit 1
+
+ENTRYPOINT ["turbohaul-manager"]

@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific runtime state (never commit)
+/var/lib/turbohaul/
+*.sqlite
+*.sqlite-journal
+*.gguf
+
+# Build artifacts
+/opt/turbohaul/
+/etc/turbohaul/
+ui_dist/
+
+# Local config overrides
+turbohaul.local.yaml
+docker_build.*
+cuda_build.*
+# Build artifacts (broad-arch CUDA build attempts)
+cuda_multi.*
