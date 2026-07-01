@@ -29,7 +29,7 @@ services:
     #           capabilities: [gpu]
     # Alternatively (older docker):
     #   runtime: nvidia
-    # For ROCm: see docs/AMD_ROCM.md (post-v0.2 polish).
+    # For AMD ROCm: use docker-compose.rocm.yml or see docs/AMD_ROCM.md.
 
 volumes:
   turbohaul-state:

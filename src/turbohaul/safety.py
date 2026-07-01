@@ -15,16 +15,14 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from turbohaul.gpu_backend import get_backend
+
 
 log = logging.getLogger(__name__)
-
-_NVIDIA_SMI_PATH = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
 
 
 @dataclass(frozen=True)
@@ -131,32 +129,15 @@ def check_iowait(max_percent: float, sample_window_s: float = 0.4) -> GateResult
 
 
 def _read_free_vram_all_mib() -> list[int] | None:
-    """Free MiB for EVERY CUDA device (one entry per GPU, index order).
+    """Free MiB for EVERY GPU device (one entry per GPU, index order).
 
-    None if nvidia-smi is unavailable. Querying all rows (no ``-i 0``) makes the
-    VRAM gates GPU-count agnostic: 1 card -> a 1-element list (identical to the
-    legacy GPU0-only probe); N cards -> N elements so a layer-split model can be
-    budgeted against the AGGREGATE free VRAM across all cards.
+    None if GPU backend is unavailable. Querying all rows makes the
+    VRAM gates GPU-count agnostic: 1 card -> a 1-element list; N cards -> N elements.
     """
-    try:
-        out = subprocess.check_output(
-            [
-                _NVIDIA_SMI_PATH,
-                "--query-gpu=memory.free",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+    backend = get_backend()
+    if backend is None:
         return None
-    vals: list[int] = []
-    for line in out.strip().splitlines():
-        try:
-            vals.append(int(line.strip().split(",")[0].strip()))
-        except (ValueError, IndexError):
-            continue
-    return vals or None
+    return backend.get_gpu_free_mib()
 
 
 def _read_free_vram_mib() -> int | None:
@@ -166,29 +147,14 @@ def _read_free_vram_mib() -> int | None:
 
 
 def _read_total_vram_all_mib() -> list[int] | None:
-    """Total VRAM MiB for EVERY CUDA device (one entry per GPU, index order).
+    """Total VRAM MiB for EVERY GPU device (one entry per GPU, index order).
 
-    Boot-time read — total VRAM doesn't change at runtime.
+    Boot-time read -- total VRAM doesn't change at runtime.
     """
-    try:
-        out = subprocess.check_output(
-            [
-                _NVIDIA_SMI_PATH,
-                "--query-gpu=memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+    backend = get_backend()
+    if backend is None:
         return None
-    vals: list[int] = []
-    for line in out.strip().splitlines():
-        try:
-            vals.append(int(line.strip().split(",")[0].strip()))
-        except (ValueError, IndexError):
-            continue
-    return vals or None
+    return backend.get_gpu_total_mib()
 
 
 def _vram_budget(split_mode: str = "layer", main_gpu: int = 0):

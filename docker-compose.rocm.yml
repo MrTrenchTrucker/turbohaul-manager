@@ -1,0 +1,55 @@
+# Turbohaul-Manager ROCm Docker Compose for AMD GPUs.
+#
+# Usage:
+#   docker compose -f docker-compose.rocm.yml up -d
+#
+# Native Linux (with /dev/kfd):
+#   Requires host with ROCm installed and /dev/kfd + /dev/dri available.
+#
+# WSL2 with ROCDXG:
+#   Uses /dev/dxg for GPU passthrough. Requires:
+#   - AMD Adrenalin 26.2.2+ driver on Windows
+#   - Windows SDK 10.0.26100.0 on Windows
+#   - restart WSL after installing
+
+services:
+  turbohaul-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+    container_name: turbohaul-manager
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11401:11401"
+    volumes:
+      - turbohaul-state:/var/lib/turbohaul
+      - ${LLAMA_SERVER_HOST_PATH:-./bin/llama-server}:/opt/turbohaul/bin/llama-server:ro
+      - ${TURBOHAUL_CONFIG:-./turbohaul.yaml}:/etc/turbohaul/turbohaul.yaml:ro
+    environment:
+      TURBOHAUL_ALLOW_PUBLIC_BIND: "1"
+      TURBOHAUL_LOG_LEVEL: "info"
+      TURBOHAUL_RUNTIME__GPU_BACKEND: "rocm"
+      # ROCm WSL2 environment variables
+      HSA_OVERRIDE_GFX_VERSION: "${HSA_OVERRIDE_GFX_VERSION:-11.0.1}"
+      HSA_ENABLE_DXG_DETECTION: "1"
+      LD_LIBRARY_PATH: "/opt/rocm/lib:/usr/lib/wsl/lib"
+    devices:
+      # Native Linux:
+      # - /dev/kfd
+      # - /dev/dri
+      # WSL2 ROCDXG:
+      - /dev/dxg
+    group_add:
+      - video
+      - render
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: amdgpu
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  turbohaul-state:
+    name: turbohaul-state

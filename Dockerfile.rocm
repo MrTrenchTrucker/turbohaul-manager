@@ -1,0 +1,84 @@
+# Turbohaul-Manager v0.5.0-rocm — production variant for AMD ROCm GPUs.
+# Builds llama.cpp with HIP/ROCm support and bundles it with turbohaul-manager.
+#
+# Build:
+#   docker build -f Dockerfile.rocm -t turbohaul-manager:v0.5-rocm .
+#
+# Run (native Linux with /dev/kfd):
+#   docker run --device /dev/kfd --device /dev/dri \
+#     --group-add video --group-add render \
+#     -p 127.0.0.1:11401:11401 \
+#     turbohaul-manager:v0.5-rocm
+#
+# Run (WSL2 with ROCDXG):
+#   docker run --device=/dev/dxg \
+#     -p 127.0.0.1:11401:11401 \
+#     turbohaul-manager:v0.5-rocm
+
+# ----------------------------------------------------------------------------
+# Stage 1: llama.cpp ROCm build
+# ----------------------------------------------------------------------------
+FROM rocm/rocm-terminal:6.2 AS llama-build
+
+ARG BUILD_JOBS=8
+ARG ROCM_ARCH="gfx1101"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git cmake build-essential python3 python3-pip \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /llama.cpp
+
+WORKDIR /llama.cpp
+RUN cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=${ROCM_ARCH} \
+ && cmake --build build -j${BUILD_JOBS}
+
+# Verify the binary was built
+RUN test -f build/bin/llama-server
+
+# ----------------------------------------------------------------------------
+# Stage 2: Runtime (ROCm + Python 3 + turbohaul)
+# ----------------------------------------------------------------------------
+FROM rocm/rocm-terminal:6.2 AS runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-venv python3-pip \
+      ca-certificates curl procps libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+ENV PATH=/opt/venv/bin:${PATH}
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src/turbohaul/ ./src/turbohaul/
+RUN /opt/venv/bin/pip install --no-cache-dir .
+
+# Copy llama-server binary from ROCm build stage.
+COPY --from=llama-build /llama.cpp/build/bin/llama-server /opt/turbohaul/bin/llama-server
+
+# Default config.
+RUN mkdir -p /var/lib/turbohaul /etc/turbohaul \
+ && chmod 700 /var/lib/turbohaul
+
+COPY docker/turbohaul.default.yaml /etc/turbohaul/turbohaul.yaml
+
+# Attribution.
+COPY THIRD_PARTY_LICENSES.md /usr/share/doc/turbohaul/THIRD_PARTY_LICENSES.md
+
+EXPOSE 11401
+
+ENV TURBOHAUL_CONFIG_PATH=/etc/turbohaul/turbohaul.yaml \
+    TURBOHAUL_ALLOW_PUBLIC_BIND=1 \
+    TURBOHAUL_RUNTIME__GPU_BACKEND=rocm \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
+  CMD curl -fsS http://127.0.0.1:11401/health || exit 1
+
+ENTRYPOINT ["turbohaul-manager"]
+CMD ["--allow-public-bind", "--log-level", "info"]

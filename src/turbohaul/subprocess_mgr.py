@@ -18,7 +18,6 @@ import hashlib
 import logging
 import os
 import signal
-import shutil
 import subprocess
 import time
 from collections.abc import Callable
@@ -27,14 +26,10 @@ from typing import Any
 
 import httpx
 
+from turbohaul.gpu_backend import get_backend
+
 
 log = logging.getLogger(__name__)
-
-
-# Resolve nvidia-smi to absolute path at module load so a
-# later PATH-poisoning attempt (env injection, attacker-controlled $PATH
-# entry) cannot redirect the lookup at run time.
-_NVIDIA_SMI_PATH = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
 
 
 class HealthCheckFailed(RuntimeError):
@@ -216,16 +211,13 @@ async def wait_until_healthy(
 
 
 def _default_nvidia_smi_runner() -> str:
-    return subprocess.check_output(
-        [
-            _NVIDIA_SMI_PATH,
-            "--query-gpu=memory.used",
-            "--format=csv,noheader,nounits",
-            "-i", "0",
-        ],
-        text=True,
-        timeout=5,
-    )
+    backend = get_backend()
+    if backend is None:
+        raise FileNotFoundError("no GPU backend available")
+    used = backend.get_gpu_used_mib()
+    if used is None:
+        raise FileNotFoundError("GPU backend returned no data")
+    return str(used)
 
 
 def get_gpu_memory_used_mib(
@@ -334,16 +326,16 @@ async def verify_vram_cleared(
     timeout_s: float = 30.0,
     poll_interval_s: float = 1.0,
 ) -> tuple[bool, int | None]:
-    """After POPPED, poll until VRAM drops by ≥90% of expected.
+    """After POPPED, poll until VRAM drops by >= 90% of expected.
 
     Defends against the CUDA-allocator-stuck failure mode (VRAM not released).
 
     Returns (cleared_ok, current_used_mib).
-    nvidia_smi_runner=None and unavailable → returns (True, None) (dev tolerance).
+    GPU backend unavailable -> returns (True, None) (dev tolerance).
     """
     initial = get_gpu_memory_used_mib(nvidia_smi_runner)
     if initial is None:
-        return True, None  # nvidia-smi unavailable — trust the kill (dev mode)
+        return True, None  # GPU probe unavailable -- trust the kill (dev mode)
     target = max(0, initial - int(expected_drop_mib * 0.9))
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:

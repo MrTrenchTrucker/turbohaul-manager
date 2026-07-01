@@ -106,6 +106,32 @@ class TestLoadConfigYaml:
         assert boot.server.host == "127.0.0.1"
         assert runtime.queue.grace_seconds == 30
 
+    def test_gpu_backend_default_auto(self, temp_etc_config):
+        cfg = load_config_yaml(temp_etc_config)
+        assert cfg.runtime.gpu_backend == "auto"
+
+    def test_gpu_backend_rocm(self, temp_etc_config, monkeypatch):
+        monkeypatch.setenv("TURBOHAUL_GPU_BACKEND", "rocm")
+        cfg = load_config_yaml(temp_etc_config)
+        cfg2 = apply_env_overrides(cfg)
+        assert cfg2.runtime.gpu_backend == "rocm"
+
+    def test_gpu_backend_nvidia(self, temp_etc_config, monkeypatch):
+        monkeypatch.setenv("TURBOHAUL_GPU_BACKEND", "nvidia")
+        cfg = load_config_yaml(temp_etc_config)
+        cfg2 = apply_env_overrides(cfg)
+        assert cfg2.runtime.gpu_backend == "nvidia"
+
+    def test_gpu_backend_invalid_rejected(self, temp_etc_config):
+        # Write a config with invalid gpu_backend
+        import tempfile
+        cfg_path = temp_etc_config
+        original = cfg_path.read_text()
+        cfg_path.write_text(original + "\n  gpu_backend: invalid\n")
+        with pytest.raises((ValidationError, ValueError)):
+            load_config_yaml(cfg_path)
+        cfg_path.write_text(original)
+
 
 class TestEnvOverrides:
     def test_env_beats_yaml(self, temp_etc_config, monkeypatch):

@@ -18,6 +18,7 @@ runtime:
   llama_server_binary: /opt/turbohaul/bin/llama-server
   llama_server_binary_sha256: ""  # empty = skip verify (dev). Pin in production.
   default_port_base: 11500
+  gpu_backend: auto  # auto|nvidia|rocm
 
 ui:
   enabled: true

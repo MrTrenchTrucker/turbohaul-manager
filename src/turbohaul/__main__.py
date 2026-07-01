@@ -20,6 +20,7 @@ import uvicorn
 
 from turbohaul.api.main import create_app
 from turbohaul.config import apply_env_overrides, load_config_yaml
+from turbohaul.gpu_backend import set_backend
 
 
 log = logging.getLogger("turbohaul.main")
@@ -71,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
     log.info("loading config: %s", args.config)
     cfg = apply_env_overrides(load_config_yaml(args.config))
     boot, runtime = cfg.split()
+
+    set_backend(boot.runtime.gpu_backend)
 
     bind_host = boot.server.host
     if args.allow_public_bind:

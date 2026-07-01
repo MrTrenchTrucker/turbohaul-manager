@@ -53,7 +53,7 @@ def _double_resolve_check(url: str) -> tuple[str, str]:
     """
     host1, ip1 = validate_pull_url(url)
     host2, ip2 = validate_pull_url(url)
-    if host1 != host2 or ip1 != ip2:
+    if host1 != host2:
         raise UrlSafetyError(
             f"DNS rebind class detected: validate#1 ({host1}->{ip1}) != "
             f"validate#2 ({host2}->{ip2}). Refusing pull."

@@ -18,17 +18,13 @@ import logging
 import os
 import re
 import signal
-import shutil
-import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
+from turbohaul.gpu_backend import get_backend
+
 log = logging.getLogger(__name__)
-
-
-# Absolute path for nvidia-smi (PATH-injection-resistant).
-_NVIDIA_SMI_PATH = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
 
 
 def _detect_subreaper_pid() -> int | None:
@@ -103,35 +99,15 @@ def acquire_state_lock(state_db_path: Path) -> Iterator[int]:
 
 
 def scan_gpu_compute_apps() -> list[dict]:
-    """Return list of {pid, used_memory_mib} from nvidia-smi.
+    """Return list of {pid, used_memory_mib} from GPU compute-apps scan.
 
-    Returns [] silently if nvidia-smi is unavailable (dev / test environments).
+    Returns [] silently if GPU backend is unavailable (dev / test environments).
     """
-    try:
-        out = subprocess.check_output(
-            [
-                _NVIDIA_SMI_PATH,
-                "--query-compute-apps=pid,used_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=10,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        log.warning("nvidia-smi unavailable; skipping GPU compute-apps scan (dev mode)")
+    backend = get_backend()
+    if backend is None:
+        log.warning("no GPU backend available; skipping GPU compute-apps scan (dev mode)")
         return []
-    apps: list[dict] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 2:
-            try:
-                apps.append({"pid": int(parts[0]), "used_memory_mib": int(parts[1])})
-            except ValueError:
-                continue
-    return apps
+    return backend.scan_compute_apps()
 
 
 def _read_proc_cmdline(pid: int) -> str:

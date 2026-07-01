@@ -1,0 +1,62 @@
+# Turbohaul-Manager v0.5.0-rocm-test — lightweight test image for ROCm.
+# Does NOT bundle llama-server; mounts it at runtime. Suitable for CI and
+# integration testing with a separate llama-server binary.
+#
+# Build:
+#   docker build -f Dockerfile.rocm-test -t turbohaul-manager:rocm-test .
+#
+# Run (WSL2 with ROCDXG):
+#   docker run -d --name turbohaul-rocm \
+#     --device=/dev/dxg \
+#     -p 11401:11401 turbohaul-manager:rocm-test
+#
+# Run (native Linux with /dev/kfd):
+#   docker run -d --name turbohaul-rocm \
+#     --device /dev/kfd --device /dev/dri \
+#     --group-add video --group-add render \
+#     -p 11401:11401 turbohaul-manager:rocm-test
+
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-venv python3-pip \
+      ca-certificates curl procps \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+ENV PATH=/opt/venv/bin:${PATH}
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src/turbohaul/ ./src/turbohaul/
+RUN /opt/venv/bin/pip install --no-cache-dir .
+
+RUN mkdir -p /var/lib/turbohaul/blobs /var/lib/turbohaul/manifests \
+    /var/lib/turbohaul/import-staging /var/lib/turbohaul/state.sqlite \
+    /etc/turbohaul /opt/turbohaul/bin
+
+RUN touch /var/lib/turbohaul/state.sqlite \
+ && chown -R root:root /var/lib/turbohaul
+
+# Default config with host: 127.0.0.1 (pydantic validator requirement)
+COPY docker/turbohaul.default.yaml /etc/turbohaul/turbohaul.yaml
+
+COPY THIRD_PARTY_LICENSES.md /usr/share/doc/turbohaul/THIRD_PARTY_LICENSES.md
+
+EXPOSE 11401
+
+ENV TURBOHAUL_CONFIG_PATH=/etc/turbohaul/turbohaul.yaml \
+    TURBOHAUL_ALLOW_PUBLIC_BIND=1 \
+    TURBOHAUL_RUNTIME__GPU_BACKEND=rocm \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
+  CMD curl -fsS http://127.0.0.1:11401/health || exit 1
+
+ENTRYPOINT ["turbohaul-manager"]
+CMD ["--allow-public-bind", "--log-level", "info"]

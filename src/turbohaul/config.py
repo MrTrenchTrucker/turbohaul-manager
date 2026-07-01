@@ -58,6 +58,14 @@ class RuntimePathsConfig(BaseModel):
     llama_server_binary: Path
     llama_server_binary_sha256: str = ""  # empty = skip verify (dev only)
     default_port_base: int = Field(default=11500, ge=1024, le=65000)
+    gpu_backend: str = "auto"  # "auto" | "nvidia" | "rocm"
+
+    @field_validator("gpu_backend")
+    @classmethod
+    def _validate_gpu_backend(cls, v: str) -> str:
+        if v not in ("auto", "nvidia", "rocm"):
+            raise ValueError(f"gpu_backend must be 'auto', 'nvidia', or 'rocm'; got '{v}'")
+        return v
 
 
 class UIConfig(BaseModel):
@@ -211,6 +219,7 @@ _ENV_MAP: dict[str, tuple[str, str, type]] = {
     "TURBOHAUL_MAX_GRACE_EXT": ("queue", "max_grace_extensions", int),
     "TURBOHAUL_MAX_CONSECUTIVE_SAME_MODEL": ("queue", "max_consecutive_same_model", int),
     "TURBOHAUL_MAX_OTHER_MODEL_WAIT_S": ("queue", "max_other_model_wait_s", float),
+    "TURBOHAUL_GPU_BACKEND": ("runtime", "gpu_backend", str),
 }
 
 
