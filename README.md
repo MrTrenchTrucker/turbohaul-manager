@@ -25,7 +25,7 @@ FIFO queue + grace + IDLE_HOT hot-hold + model swap on Nvidia RTX GPU's includin
 docker run --gpus all -p 11401:11401 \
     -v $(pwd)/state:/var/lib/turbohaul \
     -v $(pwd)/models:/var/lib/turbohaul/import-staging \
-    ghcr.io/MrTrenchTrucker/turbohaul-manager:v0.6.0
+    ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0
 
 # Or build locally (broad NVIDIA arch support: Turing through Blackwell)
 git clone https://github.com/MrTrenchTrucker/turbohaul-manager.git
@@ -99,7 +99,7 @@ npm required. A prebuilt runnable image is published on the GitHub Container Reg
 ```bash
 docker run --gpus all -p 127.0.0.1:11401:11401 \
   -v "$PWD/state:/var/lib/turbohaul" \
-  ghcr.io/MrTrenchTrucker/turbohaul-manager:v0.6.0
+  ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0
 ```
 
 ### Build from source, fully offline (needs the CUDA base image once)

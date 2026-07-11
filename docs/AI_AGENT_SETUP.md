@@ -381,7 +381,7 @@ docker run -d --name turbohaul \
   -v $(pwd)/models:/var/lib/turbohaul/import-staging \
   -e TURBOHAUL_IDLE_HOT_SECONDS=600 \
   -e TURBOHAUL_GRACE_SECONDS=30 \
-  ghcr.io/MrTrenchTrucker/turbohaul-manager:v0.2.3
+  ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0
 ```
 
 Defaults are reasonable; you only need env-overrides if you want different timing.

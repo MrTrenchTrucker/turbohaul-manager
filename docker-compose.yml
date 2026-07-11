@@ -6,7 +6,7 @@
 
 services:
   turbohaul-manager:
-    image: ghcr.io/MrTrenchTrucker/turbohaul-manager:v0.6.0
+    image: ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0
     container_name: turbohaul-manager
     restart: unless-stopped
     ports:
