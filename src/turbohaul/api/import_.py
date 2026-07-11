@@ -1,11 +1,12 @@
-"""Import + delete endpoints per v0.2 §9.2 + §12.1.
+"""Import + delete endpoints.
 
 POST /api/import — local file → blob store. Path MUST be under import_allowed_root.
 DELETE /api/delete — remove blob by sha256 (Ollama-compat shape).
 
-Security: import_allowed_root sandbox + O_NOFOLLOW + GGUF magic
+Security hardening: import_allowed_root sandbox + O_NOFOLLOW + GGUF magic
 check + denylist of system paths. Path-traversal + symlink escape REJECTED.
 """
+import asyncio
 import logging
 import os
 import secrets
@@ -69,7 +70,7 @@ def _validate_import_path(import_allowed_root: Path, candidate: str) -> Path:
     target = Path(candidate)
     if target.is_symlink():
         raise ImportSafetyError(
-            f"path {candidate} is a symlink (rejected per v0.2 §9.2)"
+            f"path {candidate} is a symlink (rejected)"
         )
 
     resolved = target.resolve(strict=False)
@@ -134,7 +135,12 @@ async def import_local(payload: dict, request: Request) -> dict:
     )
 
     try:
-        sha, bytes_written = write_stream_atomic(
+        # write_stream_atomic drives the sync _stream_local_file generator
+        # (blocking os.read) + does the atomic write + os.fsync — run it in a thread
+        # so it doesn't block the event loop. The helper
+        # stays a sync generator; only this call site is wrapped.
+        sha, bytes_written = await asyncio.to_thread(
+            write_stream_atomic,
             mgr.boot.storage.blob_store_path,
             _stream_local_file(safe_path),
             expected_sha256=expected_sha256,

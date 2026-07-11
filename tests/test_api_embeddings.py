@@ -114,23 +114,23 @@ def app_test(tmp_path, monkeypatch):
 # Case 1
 def test_happy_single(app_test):
     app, client, manifests_root = app_test
-    _write_manifest(manifests_root, "qwen-emb", embeddings_enabled=True)
-    r = client.post("/v1/embeddings", json={"model": "qwen-emb", "input": "hello"})
+    _write_manifest(manifests_root, "emb-model", embeddings_enabled=True)
+    r = client.post("/v1/embeddings", json={"model": "emb-model", "input": "hello"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["object"] == "list"
     assert len(body["data"]) == 1
     assert body["data"][0]["object"] == "embedding"
     assert body["data"][0]["index"] == 0
-    assert body["model"] == "qwen-emb"
+    assert body["model"] == "emb-model"
 
 
 # Case 2
 def test_happy_batch_2(app_test):
     app, client, manifests_root = app_test
-    _write_manifest(manifests_root, "qwen-emb", embeddings_enabled=True)
+    _write_manifest(manifests_root, "emb-model", embeddings_enabled=True)
     r = client.post(
-        "/v1/embeddings", json={"model": "qwen-emb", "input": ["a", "b"]},
+        "/v1/embeddings", json={"model": "emb-model", "input": ["a", "b"]},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -153,10 +153,10 @@ def test_capability_refuse(app_test):
 # Case 4
 def test_413_oversize_batch(app_test):
     app, client, manifests_root = app_test
-    _write_manifest(manifests_root, "qwen-emb", embeddings_enabled=True)
+    _write_manifest(manifests_root, "emb-model", embeddings_enabled=True)
     r = client.post(
         "/v1/embeddings",
-        json={"model": "qwen-emb", "input": ["x"] * 65},
+        json={"model": "emb-model", "input": ["x"] * 65},
     )
     assert r.status_code == 413
     detail = r.json()["detail"]
@@ -166,10 +166,10 @@ def test_413_oversize_batch(app_test):
 # Case 5
 def test_400_base64(app_test):
     app, client, manifests_root = app_test
-    _write_manifest(manifests_root, "qwen-emb", embeddings_enabled=True)
+    _write_manifest(manifests_root, "emb-model", embeddings_enabled=True)
     r = client.post(
         "/v1/embeddings",
-        json={"model": "qwen-emb", "input": "x", "encoding_format": "base64"},
+        json={"model": "emb-model", "input": "x", "encoding_format": "base64"},
     )
     assert r.status_code == 400
     detail = r.json()["detail"]
@@ -181,10 +181,10 @@ def test_400_base64(app_test):
 # Case 6
 def test_400_dimensions(app_test):
     app, client, manifests_root = app_test
-    _write_manifest(manifests_root, "qwen-emb", embeddings_enabled=True)
+    _write_manifest(manifests_root, "emb-model", embeddings_enabled=True)
     r = client.post(
         "/v1/embeddings",
-        json={"model": "qwen-emb", "input": "x", "dimensions": 512},
+        json={"model": "emb-model", "input": "x", "dimensions": 512},
     )
     assert r.status_code == 400
     detail = r.json()["detail"]

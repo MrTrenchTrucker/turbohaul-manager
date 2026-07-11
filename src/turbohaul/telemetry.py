@@ -1,8 +1,8 @@
 """Flap/degradation telemetry — persistent JSONL log + read endpoint.
 
-An OBSERVE-ONLY logging/telemetry subsystem that captures,
-with timestamps, the signals needed to diagnose the "flapping over time"
-degradation in Turbohaul Manager's single-residency gateway.
+An OBSERVE-ONLY logging/telemetry subsystem that captures, with timestamps,
+the signals needed to diagnose the "flapping over time" degradation in
+Turbohaul Manager's single-residency gateway.
 
 Design principles:
   - MUST NOT change inference behavior or break /status

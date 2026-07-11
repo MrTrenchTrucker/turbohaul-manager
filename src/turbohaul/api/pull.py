@@ -1,8 +1,8 @@
-"""Pull endpoints per v0.2 ARCHITECTURE.md §9 + §9.1 + §12.1.
+"""Pull endpoints per ARCHITECTURE.md.
 
 POST /api/pull-url — arbitrary https URL (SSRF guard enforced)
 POST /api/pull-hf — HuggingFace allowlist + HF_API_KEY injection ONLY to allowlisted hosts
-POST /api/pull — Ollama registry (501 stub; Phase 5+ implements manifest+layer protocol)
+POST /api/pull — Ollama registry (501 stub; not yet implemented — manifest+layer protocol)
 
 All streaming pulls land via write_stream_atomic_async with per_stream_max_bytes
 ceiling. Progress events emit to /ws/state via mgr.event_bus.
@@ -35,21 +35,21 @@ def _default_http_client_factory(timeout_s: float = 600.0):
 def _double_resolve_check(url: str) -> tuple[str, str]:
     """Validate URL + resolve TWICE; raise if (host, ip) differs across calls.
 
-    DNS rebind mitigation: the canonical fix is a custom
-    httpx.AsyncHTTPTransport that connects to the pre-resolved IP and pins
-    SNI to the original hostname — a planned follow-on. This interim fix
-    catches the obvious rebind pattern where the attacker-DNS returns a
-    public IP at validate time and an internal IP at connect time: we
-    resolve back-to-back and refuse the connection if the two resolutions
-    diverge. Race window shrinks from "long enough for httpx to do its own
-    connect-time DNS" down to "two synchronous resolver calls apart" —
-    microseconds vs milliseconds. Defense-in-depth with the SSRF guard's
-    RFC1918/NAT64/IPv4-compat blocks (which catch internal-IP rebinds even
-    if they win the race).
+    CRITICAL DNS rebind mitigation: the canonical fix is a
+    custom httpx.AsyncHTTPTransport that connects to the pre-resolved IP and
+    pins SNI to the original hostname — that's the v0.2.2 follow-on. This
+    interim fix catches the obvious rebind pattern where the attacker-DNS
+    returns a public IP at validate time and an internal IP at connect time:
+    we resolve back-to-back and refuse the connection if the two
+    resolutions diverge. Race window shrinks from "long enough for httpx to
+    do its own connect-time DNS" down to "two synchronous resolver calls
+    apart" — microseconds vs milliseconds. Defense-in-depth with the SSRF
+    guard's RFC1918/NAT64/IPv4-compat blocks (which catch internal-IP
+    rebinds even if they win the race).
 
-    Multi-record blindspot: validate_pull_url checks the first A record
-    only. By running it twice, we also catch round-robin DNS where validate
-    sees one record and httpx would see another.
+    Multi-record blindspot: validate_pull_url checks the
+    first A record only. By running it twice, we also catch round-robin DNS
+    where validate sees one record and httpx would see another.
     """
     host1, ip1 = validate_pull_url(url)
     host2, ip2 = validate_pull_url(url)
@@ -237,8 +237,8 @@ async def pull_hf(payload: dict, request: Request) -> dict:
     if not is_hf_host(host, allowlist):
         raise HTTPException(
             status_code=403,
-            detail=f"host {host} not in hf_host_allowlist "
-            "(HF_API_KEY only sent to allowlisted hosts)",
+            detail=f"host {host} not in hf_host_allowlist (security - "
+            "HF_API_KEY only sent to allowlisted hosts)",
         )
 
     hf_key_env = mgr.runtime.pull.hf_api_key_env
@@ -315,7 +315,7 @@ async def pull_ollama_registry(payload: dict, request: Request) -> dict:
     """Ollama registry pull - 501 stub for v1.
 
     The Ollama registry uses a custom manifest+layer protocol (similar to Docker).
-    Phase 5+ implements this; for v1 use /api/pull-hf for HF or /api/pull-url for arbitrary.
+    Not yet implemented; for v1 use /api/pull-hf for HF or /api/pull-url for arbitrary.
     """
     raise HTTPException(
         status_code=501,

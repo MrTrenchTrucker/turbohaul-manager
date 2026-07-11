@@ -1,4 +1,4 @@
-"""Content-addressed blob storage per v0.2 ARCHITECTURE.md §12 + §12.1.
+"""Content-addressed blob storage.
 
 Hardening against blob TOCTOU + disk-fill DoS:
   1. Stream to incoming/<random>.tmp with per-stream byte ceiling enforced
@@ -235,7 +235,7 @@ def blob_exists(blobs_root: Path, sha256: str) -> bool:
 
 
 def verify_blob_on_stage(blobs_root: Path, expected_sha256: str) -> bool:
-    """Re-verify blob hash at stage time. Defends against TOCTOU swap (v0.2 §12.1).
+    """Re-verify blob hash at stage time. Defends against TOCTOU swap.
 
     Returns True on success. Raises BlobIntegrityFailure if hash differs.
     """
@@ -258,8 +258,8 @@ def delete_blob(blobs_root: Path, sha256: str) -> bool:
     """Delete a blob. Returns True if existed + removed.
 
     Note: unlink does not require write permission on the file (POSIX
-    only checks write on the parent dir); the prior chmod 0o400 -> 0o600
-    created a needless tamper window.
+    only checks write on the parent dir); a prior chmod 0o400 -> 0o600
+    would create a needless tamper window.
     """
     path = blob_path(blobs_root, sha256)
     if not path.exists():

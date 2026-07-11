@@ -1,0 +1,6 @@
+FROM nvcr.io/nvidia/cuda:12.9.1-devel-ubuntu22.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential ca-certificates curl pkg-config libcurl4-openssl-dev && rm -rf /var/lib/apt/lists/*
+COPY . /opt/turboquant
+WORKDIR /opt/turboquant
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1 && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so && ldconfig && cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="89;120" -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" && cmake --build build --config Release -j$(nproc) --target llama-server llama-bench llama-cli && ls -la build/bin/

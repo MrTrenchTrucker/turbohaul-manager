@@ -1,4 +1,4 @@
-"""Tests for blob_store - content-addressed storage + lifecycle (v0.2 §12.1)."""
+"""Tests for blob_store - content-addressed storage + lifecycle."""
 import hashlib
 import os
 

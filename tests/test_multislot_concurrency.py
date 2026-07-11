@@ -331,7 +331,8 @@ class TestVramGate:
     async def test_footprint_cpu_moe_trusts_measured_expected_vram(self, tmp_path):
         # _read_model_footprint: a cpu-moe (n_cpu_moe) manifest with a measured
         # expected_vram LOWER than gguf+kv must reserve the MEASURED value, not the
-        # over-counted max(expected, gguf+kv). (live-E2E 35b reserve-gate regression.)
+        # over-counted max(expected, gguf+kv). (guards the reserve-gate for a large
+        # MoE model whose measured footprint is below its gguf+kv upper bound.)
         import yaml
         boot, runtime = _boot_runtime_multislot(tmp_path)
         p = boot.storage.manifests_path / "cm.yaml"
@@ -530,7 +531,7 @@ class TestSpawnFail:
     async def test_health_timeout_reaps_no_leak(self, tmp_path):
         """Health-timeout => the spawned sidecar IS reaped (sigterm) + the resident
         is deregistered + booting_pid cleared (no PID/VRAM leak). The 8 routing
-        tests use fake_health=True, so this guards the reaper fix."""
+        tests use fake_health=True, so this guards the high-severity leak fix."""
         boot, runtime = _boot_runtime_multislot(
             tmp_path, max_parallel_sidecars=2, idle_hot_load_seconds=0
         )
@@ -733,7 +734,7 @@ class TestCancelDuringLoading:
 
         monkeypatch.setattr("turbohaul.manager.os.kill", rec_kill)
 
-        # polish #4: _reap_booting_pid now waitpid-checks ownership BEFORE signalling.
+        # _reap_booting_pid now waitpid-checks ownership BEFORE signalling.
         # The fake pid 93777 isn't a real child, so report it ALIVE at the pre-check
         # (so SIGTERM fires) then exited (so the reap returns) without a 3s grace spin.
         wp_calls = [0]
@@ -789,8 +790,8 @@ class TestCancelDuringLoading:
 
 
 # ============================================================================
-# Per-resident live monitor + status residents[]/vram[] +
-# shutdown-sweep + 2 follow-ups (waitpid reap, bg_tasks drain).
+# P1e: per-resident live monitor + status residents[]/vram[] +
+# shutdown-sweep + 2 folded follow-ups (waitpid reap, bg_tasks drain).
 # ============================================================================
 class _FakeResp:
     def __init__(self, payload):
@@ -798,6 +799,9 @@ class _FakeResp:
 
     def json(self):
         return self._payload
+
+    def raise_for_status(self):
+        pass
 
 
 class _FakeSlotsClient:
@@ -840,7 +844,7 @@ def _slots_processing(n_decoded=10, max_tokens=100, stream=True):
 
 class TestStatusResidentsVram:
     async def test_residents_and_vram_in_snapshot(self, tmp_path):
-        """status_snapshot emits residents[] (per live model) + vram[] (cached)
+        """P1e: status_snapshot emits residents[] (per live model) + vram[] (cached)
         while keeping the `generation` back-compat alias. Await-free + lock-free."""
         boot, runtime = _boot_runtime_multislot(tmp_path, idle_hot_load_seconds=120)
         _seed_manifest(boot, "m1", split_mode="none", main_gpu=0)
@@ -891,7 +895,7 @@ class TestStatusResidentsVram:
 
 class TestLiveSupervisor:
     async def test_supervisor_writes_per_resident_generations(self, tmp_path):
-        """ONE supervisor tick polls EVERY live resident's /slots and writes a
+        """P1e: ONE supervisor tick polls EVERY live resident's /slots and writes a
         per-model generation into live_generations, mirrors the primary into the
         live_generation alias, and refreshes the per-GPU VRAM cache."""
         boot, runtime = _boot_runtime_multislot(tmp_path, idle_hot_load_seconds=120)
@@ -928,7 +932,7 @@ class TestLiveSupervisor:
                 await mgr.shutdown()
 
     async def test_supervisor_gcs_vanished_resident(self, tmp_path):
-        """when a resident vanishes (evicted/dead), the supervisor GCs its poller
+        """P1e: when a resident vanishes (evicted/dead), the supervisor GCs its poller
         (closing the httpx client) AND its live_generations entry — no leak."""
         boot, runtime = _boot_runtime_multislot(tmp_path)
         mgr = _mk(boot, runtime, **_mocks([]))
@@ -945,7 +949,7 @@ class TestLiveSupervisor:
         await mgr.shutdown()
 
     async def test_supervisor_poll_error_is_transitioning_not_crash(self, tmp_path):
-        """forced failure path: a /slots GET that RAISES must yield a
+        """P1e (forced failure path): a /slots GET that RAISES must yield a
         'transitioning' generation, never crash the supervisor tick (pure observer)."""
         boot, runtime = _boot_runtime_multislot(tmp_path, idle_hot_load_seconds=120)
         _seed_manifest(boot, "m1", split_mode="none", main_gpu=0)
@@ -972,7 +976,7 @@ class TestLiveSupervisor:
                 await mgr.shutdown()
 
     async def test_poll_skips_write_if_resident_evicted_midpoll(self, tmp_path):
-        """forced path: a resident that goes DEAD DURING the /slots await
+        """Forced path: a resident that goes DEAD DURING the /slots await
         must NOT get a ZOMBIE generation written — _poll_one re-checks liveness after
         the poll. poll_once's re-validate catches a handle SWAP but not a same-handle
         DEAD transition, so this is the gap that needed the explicit liveness re-check."""
@@ -1006,7 +1010,7 @@ class TestLiveSupervisor:
 
 class TestResidentPollerRevalidate:
     async def test_poll_once_revalidates_spawn_seq_swap(self, tmp_path):
-        """poll_once must REJECT a stale /slots reading if the resident's
+        """P1e: poll_once must REJECT a stale /slots reading if the resident's
         spawn_seq advanced across the await (fixed-port sidecar reuse) -> the gen is
         'transitioning', never gen-A's tok/s attributed to gen-B."""
         boot, runtime = _boot_runtime_multislot(tmp_path, idle_hot_load_seconds=120)
@@ -1037,9 +1041,9 @@ class TestResidentPollerRevalidate:
 
 class TestReapBootingPidWaitpid:
     async def test_reap_alive_then_sigterm_reaps(self, tmp_path, monkeypatch):
-        """an ALIVE booting child is SIGTERM'd, then waitpid-reaped
+        """An ALIVE booting child is SIGTERM'd, then waitpid-reaped
         when it exits (so it doesn't linger as a zombie holding the PID). No SIGKILL
-        when SIGTERM is honored. The pre-signal waitpid (polish #4) reports it ALIVE
+        when SIGTERM is honored. The pre-signal waitpid reports it ALIVE
         first, then 'exited' after the SIGTERM."""
         boot, runtime = _boot_runtime_multislot(tmp_path)
         mgr = _mk(boot, runtime, **_mocks([]))
@@ -1062,7 +1066,7 @@ class TestReapBootingPidWaitpid:
         await mgr.shutdown()
 
     async def test_reap_not_our_child_never_signals(self, tmp_path, monkeypatch):
-        """Polish #4 PID-RECYCLE GUARD: if the pre-signal waitpid raises ECHILD (the pid
+        """PID-RECYCLE GUARD: if the pre-signal waitpid raises ECHILD (the pid
         is no longer OUR child — already reaped, possibly recycled to a foreign process)
         we must NOT fire SIGTERM/SIGKILL at it. Zero signals."""
         boot, runtime = _boot_runtime_multislot(tmp_path)
@@ -1135,7 +1139,7 @@ class TestShutdownSweep:
         assert done == [True], "in-flight bg task drained (awaited), not dropped"
 
     async def test_shutdown_cancels_supervisor_and_reaps_active_driver(self, tmp_path):
-        """shutdown-sweep: OBSERVERS cancelled first, then the DRIVERS — an ACTIVE
+        """P1e shutdown-sweep: OBSERVERS cancelled first, then the DRIVERS — an ACTIVE
         resident's driver is cancelled and its sidecar reaped (sigterm) with the
         resident deregistered (no leak)."""
         boot, runtime = _boot_runtime_multislot(tmp_path, idle_hot_load_seconds=120)
@@ -1161,7 +1165,7 @@ class TestShutdownSweep:
             await asyncio.wait_for(f1, timeout=2)
 
     async def test_shutdown_parallelizes_driver_teardowns(self, tmp_path):
-        """Polish #3: the sweep awaits driver teardowns via asyncio.gather (PARALLEL),
+        """The sweep awaits driver teardowns via asyncio.gather (PARALLEL),
         not a sequential for-await — so N slow-SIGTERM sidecars don't serialize to N x
         the per-driver reap window. Proven deterministically: a sequential await would
         only ever have ONE sigterm in flight; gather has both (>=2)."""
@@ -1249,7 +1253,7 @@ class TestSupervisorRunLoop:
     async def test_run_loop_ticks_then_cancel_closes_clients(self, tmp_path):
         """The supervisor run() LOOP (not just _tick) writes per-resident gens ~1Hz
         and, on cancel, its finally _close_all closes EVERY per-resident httpx client
-        (the observer-leak guard)."""
+        (the observer-leak guard that a resource-lifecycle review demands)."""
         boot, runtime = _boot_runtime_multislot(tmp_path, idle_hot_load_seconds=120)
         _seed_manifest(boot, "m1", split_mode="none", main_gpu=0)
         gate = asyncio.Event()
@@ -1290,7 +1294,7 @@ class TestSupervisorRunLoop:
 
 class TestCreateAppCapGate:
     """The load-bearing monitor wiring in create_app() (api/main.py) had NO direct
-    test (the one real coverage gap).
+    test (a pre-release review flagged this as the one real coverage gap).
     Asserts cap<=1 wires the legacy single LiveSlotsPoller (byte-identical) and cap>=2
     wires the LiveResidentsSupervisor. Sync test (drives the FastAPI lifespan via
     TestClient, which starts/cancels the monitor tasks)."""
@@ -1325,3 +1329,211 @@ class TestCreateAppCapGate:
             mgr = app.state.manager
             assert mgr._live_supervisor_task is not None, "cap>=2 wires the supervisor"
             assert mgr._live_poller_task is None, "cap>=2 does NOT wire the legacy poller"
+
+
+class TestIdleSaveRework:
+    """Verify the idle-holder teardown reroutes through _save_slot_kv
+    with thread_id_override and admission_ctx_len_override, and that the engine
+    POST uses 'filename' (not 'thread_id') and metadata prompt_len reflects
+    admission_ctx_len."""
+
+    async def test_idle_holder_teardown_posts_filename_not_thread_id(self, tmp_path):
+            """When _teardown_idle_holder runs, it calls _save_slot_kv which POSTs
+            {'filename': '...'} to the engine, NOT {'thread_id': '...'}."""
+            boot, runtime = _boot_runtime_multislot(
+                tmp_path, max_parallel_sidecars=2, idle_hot_load_seconds=1
+            )
+            _seed_manifest(boot, "m1", split_mode="none", main_gpu=0)
+            _seed_manifest(boot, "m2", split_mode="none", main_gpu=1)
+
+            post_payloads = []
+
+            pid = [90000]
+
+            def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+                pid[0] += 1
+                return _fake_handle(model_tag, port, pid[0])
+
+            async def fake_health(*a, **k):
+                return True
+
+            async def fake_sigterm(handle, **k):
+                return True, "sigterm-clean"
+
+            async def fake_vram(**k):
+                return True, 100
+
+            async def fake_complete(slot, handle):
+                return {"ok": True, "model": handle.model_tag}
+
+            mgr = TurbohaulManager(
+                boot, runtime,
+                spawn_fn=fake_spawn, health_fn=fake_health,
+                sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+                complete_fn=fake_complete,
+            )
+            mgr.runtime.queue.safety_enabled = False
+
+            from turbohaul.subprocess_mgr import SLOT_SAVE_DIR
+            import os
+            os.makedirs(SLOT_SAVE_DIR, exist_ok=True)
+
+            # Mock httpx.AsyncClient to capture POST payloads
+            class _FakeSaveClient:
+                def __init__(self, *args, **kwargs):
+                    self.closed = False
+                    self._slots_payload = [{
+                        "id": 0,
+                        "n_prompt_tokens": 5,
+                        "id_task": 0,
+                    }]
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return False
+
+                async def get(self, url):
+                    if "/slots" in url and "action=save" not in url:
+                        return _FakeResp(self._slots_payload)
+                    return _FakeResp({})
+
+                async def post(self, url, json=None):
+                    post_payloads.append({"url": url, "json": json})
+                    return _FakeResp({"status": "ok"})
+
+                async def aclose(self):
+                    self.closed = True
+
+            with _high_vram():
+                with patch("httpx.AsyncClient", _FakeSaveClient):
+                    mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+                    try:
+                        # Manually set up idle holder (simulating what worker_loop does)
+                        import time
+                        from turbohaul.slot import Slot
+                        handle = _fake_handle("m1", 59500, 90001)
+                        slot = Slot.new("m1", prompt="hello", thread_id="t1", admission_ctx_len=5)
+                        mgr._set_idle_holder(handle, "m1", time.monotonic() + 10, "t1", 5)
+
+                        # Verify idle holder is set up
+                        assert mgr._idle_handle is not None
+                        assert mgr._idle_thread_id == "t1"
+                        assert mgr._idle_admission_ctx_len == 5
+
+                        # Now trigger _teardown_idle_holder
+                        await mgr._teardown_idle_holder("test_reason")
+
+                        # Verify POST was made with 'filename' not 'thread_id'
+                        save_posts = [p for p in post_payloads if "action=save" in p["url"]]
+                        assert save_posts, "save POST should have been made"
+                        for p in save_posts:
+                            assert "filename" in p["json"], f"POST should have 'filename', got {p['json']}"
+                            assert "thread_id" not in p["json"], f"POST should NOT have 'thread_id', got {p['json']}"
+
+                    finally:
+                        await mgr.shutdown()
+
+    async def test_save_slot_kv_metadata_prompt_len_uses_admission_ctx_len(self, tmp_path):
+        """_save_slot_kv with admission_ctx_len_override writes metadata with
+        prompt_len = admission_ctx_len_override, not computed from prompt."""
+        boot, runtime = _boot_runtime_multislot(
+            tmp_path, max_parallel_sidecars=2, idle_hot_load_seconds=120
+        )
+        _seed_manifest(boot, "m1", split_mode="none", main_gpu=0)
+
+        pid = [90000]
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            pid[0] += 1
+            return _fake_handle(model_tag, port, pid[0])
+
+        async def fake_health(*a, **k):
+            return True
+
+        async def fake_sigterm(handle, **k):
+            return True, "sigterm-clean"
+
+        async def fake_vram(**k):
+            return True, 100
+
+        async def fake_complete(slot, handle):
+            return {"ok": True, "model": handle.model_tag}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            complete_fn=fake_complete,
+        )
+        mgr.runtime.queue.safety_enabled = False
+
+        from turbohaul.subprocess_mgr import SLOT_SAVE_DIR
+        import os
+        os.makedirs(SLOT_SAVE_DIR, exist_ok=True)
+
+        # Track the metadata written
+        written_meta = {}
+
+        class _FakeSaveClient:
+            def __init__(self, *args, **kwargs):
+                self.closed = False
+                self._slots_payload = [{
+                    "id": 0,
+                    "n_prompt_tokens": 100,
+                    "id_task": 0,
+                }]
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url):
+                if "/slots" in url and "action=save" not in url:
+                    return _FakeResp(self._slots_payload)
+                return _FakeResp({})
+
+            async def post(self, url, json=None):
+                # Simulate engine creating the temp file
+                if "action=save" in url and json and "filename" in json:
+                    import os
+                    tmp_path = os.path.join(SLOT_SAVE_DIR, json["filename"])
+                    os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+                    with open(tmp_path, "wb") as f:
+                        f.write(b"dummy kv cache data")
+                return _FakeResp({"status": "ok"})
+
+            async def aclose(self):
+                self.closed = True
+
+        with _high_vram():
+            with patch("turbohaul.manager.httpx.AsyncClient", _FakeSaveClient):
+                mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+                try:
+                    # Manually trigger _save_slot_kv with override
+                    from turbohaul.slot import Slot
+                    slot = Slot.new("m1", prompt="x" * 1000, thread_id="t-test", admission_ctx_len=42)
+
+                    await mgr._save_slot_kv(
+                        59500, "m1", slot,
+                        thread_id_override="t-test",
+                        admission_ctx_len_override=42,
+                    )
+
+                    # Verify metadata was written with prompt_len = 42 (admission_ctx_len_override)
+                    thread_hash = mgr._thread_hash("t-test")
+                    from turbohaul.kv_policy import kv_meta_fn
+                    meta_fn = kv_meta_fn("m1", 0, thread_hash, 59500)
+                    meta_path = os.path.join(SLOT_SAVE_DIR, meta_fn)
+                    assert os.path.exists(meta_path), "metadata file should exist"
+                    import json
+                    with open(meta_path, 'r') as f:
+                        meta = json.load(f)
+                    assert meta["prompt_len"] == 42, f"prompt_len should be 42 (admission_ctx_len_override), got {meta['prompt_len']}"
+                    assert meta["thread_id"] == "t-test", "thread_id in metadata should match override"
+
+                finally:
+                    await mgr.shutdown()

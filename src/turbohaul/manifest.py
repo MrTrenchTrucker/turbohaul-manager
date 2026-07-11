@@ -1,20 +1,20 @@
 """Per-model manifest: closed flag allowlist + atomic writes + ETag/If-Match concurrency.
 
-Per v0.2 ARCHITECTURE.md §8 + §8.1 + §8.2.
+See ARCHITECTURE.md for the manifest design.
 Addresses the flag-injection RCE class (CRIT), tag path-traversal (CRIT),
-the lost-update class on concurrent writes, and non-atomic write hazards.
+the lost-update race, and the atomic-write requirement.
 
-Hardening pass:
-- SAFE_LLAMA_FLAGS expanded from 30 → ~80 (Ollama parity + Hermes reasoning_budget
-  + Tom's Fork fit-target + RoPE/YaRN + sampling completeness + server toggles
+Hardening summary:
+- SAFE_LLAMA_FLAGS expanded from 30 → ~80 (Ollama parity + reasoning_budget
+  + fit-target + RoPE/YaRN + sampling completeness + server toggles
   + KV cache controls + debug knobs).
-- DENIED_FLAGS expanded +22 (Tom's Fork path-bearing/RCE: model_url, hf_repo*,
+- DENIED_FLAGS expanded +22 (path-bearing/RCE: model_url, hf_repo*,
   api_key_file, ssl_*, path, media_path, tools, control_vector*, lookup_cache_*).
-- Suffix-pattern forward-defense guard rejects future Tom's Fork pulls.
+- Suffix-pattern forward-defense guard rejects future path-bearing pulls.
 - Numeric bounds via SAFE_LLAMA_FLAG_BOUNDS prevent DoS-by-extreme.
 - flash_attn type fixed: int → bool|str-enum (on/off/auto).
 - chat_template hardened: must match built-in enum OR be plain non-Jinja string
-  (closes the chat_template SSTI gap).
+  (closes the SSTI gap).
 """
 import contextlib
 import os
@@ -27,7 +27,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-# === Closed allowlist of safe llama-server flags (v0.2 §8.1, flag-injection guard) ===
+# === Closed allowlist of safe llama-server flags (flag-injection guard) ===
 # Each entry is (key, expected_python_type | tuple of types). To add a new
 # flag here requires a code change + review; yaml cannot smuggle it in.
 # Special-cased types: "flash_attn" accepts bool OR str-enum (handled below).
@@ -87,7 +87,7 @@ SAFE_LLAMA_FLAGS: dict[str, Any] = {
     "split_mode": str,          # enum: none/layer/row/tensor
     "main_gpu": int,
     # NOTE: tensor_split intentionally NOT added — CSV-string with shell-meta risk;
-    # defer until validator can parse "N,N,N" safely (future work).
+    # defer until a validator can parse "N,N,N" safely.
     "fit": str,                 # enum on/off (Tom's Fork auto-mem-fit)
     "fit_ctx": int,
     # NOTE: fit_target also CSV-string; defer.
@@ -127,8 +127,8 @@ SAFE_LLAMA_FLAGS: dict[str, Any] = {
     "reasoning_format": str,    # enum: none/deepseek/deepseek-legacy/auto
     "reasoning": str,           # enum: on/off/auto
     "reasoning_budget": int,    # -1/0/N — Hermes preserved-thinking knob
-    # === Speculative decoding / MTP (PR #22673 = build b9180; needs GGUF nextn head; Qwen3.5/3.6) ===
-    # Composes with TurboQuant cache_type_k/v (turbo2/3/4) + flash_attn. Spawn-level argv (cold-spawn to apply).
+    # === Speculative decoding / MTP (PR #22673 = build b9180; needs a GGUF nextn head) ===
+    # Composes with the turbo cache_type_k/v (turbo2/3/4) + flash_attn. Spawn-level argv (cold-spawn to apply).
     "spec_type": str,                    # enum: "draft-mtp" (multi-token-prediction speculative decode)
     "spec_draft_n_max": int,             # max draft tokens per step (MTP default 3)
     "spec_draft_n_min": int,             # min draft tokens per step
@@ -219,7 +219,7 @@ SAFE_LLAMA_FLAG_BOUNDS: dict[str, tuple[Any, Any]] = {
 }
 
 
-# === String enum bounds (closes the chat_template Jinja-injection gap) ===
+# === String enum bounds (closes the chat_template Jinja injection gap) ===
 # Only fixed enum values allowed for these string flags. chat_template special-cased
 # below (accepts enum OR plain non-Jinja string).
 SAFE_LLAMA_FLAG_STRING_ENUMS: dict[str, set[str]] = {
@@ -309,7 +309,7 @@ def _suffix_guard_check(key: str) -> None:
             )
 
 
-# === Explicit denylist of path-bearing flags (flag-injection CRITICAL) + expansion ===
+# === Explicit denylist of path-bearing flags (CRITICAL) ===
 # Any of these in llama_server_flags would allow file read/write injection,
 # credential exfil, SSRF, or direct RCE via llama-server's tool-call interface.
 DENIED_FLAGS: set[str] = {
@@ -334,7 +334,7 @@ DENIED_FLAGS: set[str] = {
     "rpc",
     "host",
     "port",
-    # +22 expansion (Tom's Fork ships these, were unguarded)
+    # +22 more path-bearing/credential flags that ship upstream but were unguarded
     "model_draft",            # -md — arbitrary GGUF path
     "model_url",              # SSRF + RCE — network fetch by attacker URL
     "model_url_draft",
@@ -370,7 +370,7 @@ DENIED_FLAGS: set[str] = {
 }
 
 
-# === Tag validation regex (v0.2 §8.1, tag path-traversal CRITICAL) ===
+# === Tag validation regex (tag path-traversal guard, CRITICAL) ===
 TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 # Minimum per-slot context window when llama.cpp --parallel > 1 splits the
@@ -547,11 +547,11 @@ def _validate_parallel_ctx(flags: dict[str, Any]) -> None:
     # guard against a non-int sneaking through (it would already have raised).
     if not isinstance(parallel, int) or isinstance(parallel, bool) or parallel <= 1:
         return
-    # Design #1: a parallel>1 config MUST set kv_unified:true. Without a unified
+    # A parallel>1 config MUST set kv_unified:true. Without a unified
     # KV pool, --parallel N's per-slot KV accounting diverges from the single
     # count the VRAM gate uses (that count is only accidentally correct because
     # --parallel divides ctx). The unified pool keeps the cache exact and flat
-    # across concurrent slots (verified: 35b parallel:2 + kv_unified adds ~0 VRAM).
+    # across concurrent slots (verified: a 35B model at parallel:2 + kv_unified adds ~0 VRAM).
     if not bool(flags.get("kv_unified", False)):
         raise ManifestValidationError(
             f"llama_server_flags: parallel={parallel} requires kv_unified: true "
@@ -591,7 +591,7 @@ class Manifest(BaseModel):
     gguf_blob_sha256: str
     gguf_size_bytes: int = Field(default=0, ge=0)
     context_size: int = Field(default=2048, ge=1)
-    expected_vram_bytes: int = Field(default=0, ge=0)  # mandatory for VRAM-fit pre-check (v0.2 §10 + §15)
+    expected_vram_bytes: int = Field(default=0, ge=0)  # mandatory for VRAM-fit pre-check
     revision: int = Field(default=1, ge=1)  # ETag value
     llama_server_flags: dict[str, Any] = Field(default_factory=dict)
     prompt_template: PromptTemplate = Field(default_factory=PromptTemplate)
@@ -618,15 +618,15 @@ class Manifest(BaseModel):
             if key in DENIED_FLAGS:
                 raise ManifestValidationError(
                     f"llama_server_flags.{key} is explicitly denied "
-                    f"(path-traversal/RCE class). See v0.2 §8.1."
+                    f"(path-traversal/RCE class)."
                 )
-            # Suffix-pattern forward-defense: catches future Tom's Fork
-            # pulls that ship path-bearing flags before they reach DENIED_FLAGS.
+            # Suffix-pattern forward-defense: catches future upstream pulls
+            # that ship path-bearing flags before they reach DENIED_FLAGS.
             _suffix_guard_check(key)
             if key not in SAFE_LLAMA_FLAGS:
                 raise ManifestValidationError(
                     f"llama_server_flags.{key} is not in the closed allowlist. "
-                    f"See v0.2 §8.1 - unknown flags REJECTED. "
+                    f"unknown flags REJECTED. "
                     f"Allowlist currently has {len(SAFE_LLAMA_FLAGS)} entries."
                 )
             _validate_flag_value(key, value)
@@ -651,7 +651,7 @@ def _safe_manifest_path(manifests_root: Path, tag: str) -> Path:
         ) from e
     if target_unresolved.is_symlink() or target.is_symlink():
         raise ManifestValidationError(
-            f"manifest path is a symlink - refusing (v0.2 §8.1 safety)"
+            f"manifest path is a symlink - refusing (safety)"
         )
     return target
 
@@ -677,13 +677,13 @@ def manifest_etag(manifests_root: Path, tag: str) -> str:
 def write_manifest_atomic(
     manifests_root: Path, manifest: Manifest, if_match: str | None = None
 ) -> Manifest:
-    """Atomic write with ETag/If-Match concurrency check (v0.2 §8.2).
+    """Atomic write with ETag/If-Match concurrency check.
 
     - First write (no existing manifest): writes as-is, revision preserved;
       if_match must be None on create (else 412).
     - Subsequent writes: if_match REQUIRED. Mismatch -> ConcurrencyError.
-      Missing -> ConcurrencyError too (previously this silently overwrote,
-      opening a lost-update class).
+      Missing -> ConcurrencyError too (guards the lost-update class: previously
+      this silently overwrote a concurrent write).
     - POSIX-atomic: tempfile-in-same-dir + fsync(file) + rename + fsync(dir).
     """
     target = _safe_manifest_path(manifests_root, manifest.model_tag)
@@ -692,9 +692,9 @@ def write_manifest_atomic(
     if target.exists():
         existing = read_manifest(manifests_root, manifest.model_tag)
         if if_match is None:
-            # Refuse update without If-Match. Previously a
-            # caller could omit the header and silently overwrite the
-            # concurrent write of another caller. Lost-update class.
+            # Refuse update without If-Match. Previously a caller could omit
+            # the header and silently overwrite the concurrent write of
+            # another caller. Lost-update class.
             raise ConcurrencyError(
                 "If-Match header required for manifest update "
                 f"(current ETag is \"{existing.revision}\")"
@@ -718,9 +718,9 @@ def write_manifest_atomic(
             f.write(yaml_text)
             f.flush()
             os.fsync(f.fileno())
-        # Chmod the tempfile BEFORE rename so the final inode
-        # never has a window with tempfile's default mode (mkstemp is
-        # 0o600 on Linux already, this is paranoia-grade defense in depth).
+        # chmod the tempfile BEFORE rename so the final inode never has a
+        # window with tempfile's default mode (mkstemp is 0o600 on Linux
+        # already, this is paranoia-grade defense in depth).
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, target)
         # fsync parent dir (POSIX durability)
@@ -754,13 +754,14 @@ def list_manifests(manifests_root: Path) -> list[str]:
 def delete_manifest(manifests_root: Path, tag: str) -> bool:
     """Delete a manifest. Returns True if existed and removed."""
     target = _safe_manifest_path(manifests_root, tag)
-    if target.exists():
+    try:
         target.unlink()
         return True
-    return False
+    except FileNotFoundError:
+        return False
 
 
-# === llama-server CLI flag mapping (v0.2 §8 + §10) ===
+# === llama-server CLI flag mapping ===
 def flags_to_argv(flags: dict[str, Any]) -> list[str]:
     """Map snake_case flags dict to llama-server CLI argv.
 
@@ -771,8 +772,8 @@ def flags_to_argv(flags: dict[str, Any]) -> list[str]:
     Boolean False → flag OMITTED (not `--<flag> false`).
     Other types → `--<flag> <value>`.
 
-    Additions:
-    - flash_attn bool True → "--flash-attn on" (Tom's Fork tri-state)
+    flash_attn tri-state:
+    - flash_attn bool True → "--flash-attn on"
     - flash_attn bool False → "--flash-attn off"
     - flash_attn str → "--flash-attn <value>"
     """

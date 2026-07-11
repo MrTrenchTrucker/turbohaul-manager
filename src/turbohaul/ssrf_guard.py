@@ -1,8 +1,8 @@
-"""SSRF guard for pull-url + pull-hf per v0.2 ARCHITECTURE.md §9.1.
+"""SSRF guard for pull-url + pull-hf per ARCHITECTURE.md.
 
-Defends against:
+Hardens the pull-url / pull-hf fetch path. Defends against:
   - http/file/ftp/gopher/dict/ldap/data scheme abuse → https-only
-  - Internal endpoints (metadata services, IMDS) → IP allowlist via denyset
+  - Internal service endpoints (metadata, IMDS, private APIs) → IP allowlist via denyset
   - NAT64 64:ff9b::/96 + IPv4-compat IPv6 ::/96 (known bypass classes)
   - DNS rebinding → resolve-once + peer-IP verify (caller responsibility)
   - HF_API_KEY exfil to non-HF hosts → host allowlist
@@ -25,7 +25,7 @@ ALLOWED_SCHEMES: set[str] = {"https"}
 
 # Private + link-local + reserved IP ranges (IPv4 + IPv6)
 DENY_IPV4_NETWORKS: list[ipaddress.IPv4Network] = [
-    ipaddress.IPv4Network("10.0.0.0/8"),     # RFC1918 + ZeroTier (10.244/16 subset)
+    ipaddress.IPv4Network("10.0.0.0/8"),     # RFC1918 + overlay VPN (e.g. 10.244.0.0/16 subset)
     ipaddress.IPv4Network("172.16.0.0/12"),  # RFC1918
     ipaddress.IPv4Network("192.168.0.0/16"), # RFC1918
     ipaddress.IPv4Network("127.0.0.0/8"),    # loopback
@@ -41,8 +41,8 @@ DENY_IPV6_NETWORKS: list[ipaddress.IPv6Network] = [
     ipaddress.IPv6Network("fc00::/7"),        # unique-local
     ipaddress.IPv6Network("fe80::/10"),       # link-local
     ipaddress.IPv6Network("ff00::/8"),        # multicast
-    ipaddress.IPv6Network("64:ff9b::/96"),    # NAT64 (bypass class)
-    ipaddress.IPv6Network("::/96"),           # IPv4-compat IPv6 (bypass class)
+    ipaddress.IPv6Network("64:ff9b::/96"),    # NAT64 (known bypass class)
+    ipaddress.IPv6Network("::/96"),           # IPv4-compat IPv6 (known bypass class)
     ipaddress.IPv6Network("::ffff:0:0/96"),   # IPv4-mapped IPv6
     ipaddress.IPv6Network("2001:db8::/32"),   # documentation
 ]
@@ -68,7 +68,7 @@ def resolve_safely(host: str) -> str:
     Returns the resolved IP. Raises UrlSafetyError if host or IP fails checks.
 
     Caller MUST connect to this resolved IP (not re-resolve) to defeat DNS
-    rebinding — the manager's pull worker passes resolved_ip explicitly.
+    rebinding — the pull worker passes resolved_ip explicitly.
     """
     try:
         # getaddrinfo returns all records; we pin to the first
@@ -83,7 +83,7 @@ def resolve_safely(host: str) -> str:
     if is_blocked_ip(ip):
         raise UrlSafetyError(
             f"host {host} resolves to {ip} which is in a denied network "
-            "(RFC1918 / link-local / NAT64 / IPv4-compat IPv6 — v0.2 §9.1)"
+            "(RFC1918 / link-local / NAT64 / IPv4-compat IPv6)"
         )
     return ip
 

@@ -1,4 +1,4 @@
-"""Manifests CRUD routes per v0.2 ARCHITECTURE.md §8.1 + §8.2.
+"""Manifests CRUD routes.
 
 GET/PUT /api/manifests/{tag} with ETag/If-Match concurrency control + closed flag
 allowlist enforcement.
@@ -47,7 +47,7 @@ async def put_manifest(
     response: Response,
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> dict:
-    """Write a manifest. ETag/If-Match required for updates (v0.2 §8.2).
+    """Write a manifest. ETag/If-Match required for updates.
 
     First write (no existing manifest) succeeds without If-Match.
     Subsequent updates require If-Match: "<current-revision>"; mismatch → 412.

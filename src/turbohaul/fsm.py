@@ -1,30 +1,30 @@
-"""State machine transitions per v0.2 ARCHITECTURE.md §6.
+"""State machine transitions per ARCHITECTURE.md.
 
 Pure functions — no I/O, no side effects beyond mutating slot.state.
 The TurbohaulManager (manager.py) owns the timing + subprocess + queue interactions
 and calls these transition primitives.
 
-Encodes the 10-state machine plus the new GRACE-BUSY, ACTIVE-MATCH, COLD-RECOVERY
-transitions added in v0.2.
+Encodes the 10-state machine plus the GRACE-BUSY, ACTIVE-MATCH, COLD-RECOVERY
+transitions.
 """
 from turbohaul.slot import Slot, SlotState
 
 
-# Legal transitions per v0.2 §6.
+# Legal transitions.
 # Each entry: from_state → set of allowed to_states.
 LEGAL_TRANSITIONS: dict[SlotState, set[SlotState]] = {
     SlotState.RECEIVED: {SlotState.ACCEPT_BUFFER, SlotState.STAGED},
     SlotState.ACCEPT_BUFFER: {SlotState.STAGED, SlotState.COLD},
-    # STAGED → ACTIVE_MATCH added in v0.2.1:
+    # STAGED → ACTIVE_MATCH:
     # a staged slot whose (thread_id, model_tag) matches the currently-active
     # warm slot during the GRACE window fast-tracks straight to ACTIVE_MATCH
     # (skipping LOADING) because the model is already in VRAM and the
     # _active_handle is reused. Without this entry, the worker_loop's
     # ACTIVE_MATCH promotion raises InvalidTransition and the slot vanishes
     # from queue.remove() while its DB state stays STAGED forever — the
-    # alternating-pattern bug observed during a 10-request burst.
+    # alternating-pattern bug observed under a rapid 10-request burst.
     SlotState.STAGED: {SlotState.LOADING, SlotState.COLD, SlotState.ACTIVE_MATCH},
-    SlotState.LOADING: {SlotState.ACTIVE, SlotState.LOADING_FAIL, SlotState.COLD},  # +COLD: load can be cancelled mid-flight
+    SlotState.LOADING: {SlotState.ACTIVE, SlotState.LOADING_FAIL, SlotState.COLD},  # +COLD per hardening review H-5
     # Retry from LOADING_FAIL → re-STAGED; on retry-exhaust → POPPED
     SlotState.LOADING_FAIL: {SlotState.STAGED, SlotState.POPPED},
     SlotState.ACTIVE: {SlotState.GRACE, SlotState.ACTIVE_MATCH},

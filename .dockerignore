@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
-dist/
+# dist/   # UN-IGNORED: committed FE dist is needed for the self-contained image build
 build/
 .pytest_cache/
 .coverage
@@ -11,7 +11,7 @@ htmlcov/
 
 # Frontend build artifacts
 src/frontend/node_modules/
-src/frontend/dist/
+# src/frontend/dist/   # UN-IGNORED: committed FE dist is needed for the self-contained image build
 src/frontend/build.log
 src/frontend/build.done
 src/frontend/build.fail
@@ -34,5 +34,4 @@ var/
 # Project meta + tests (kept for image — but `tests/` is large; comment to include)
 tests/
 ARCHITECTURE.md
-TODO.md
 docs/

@@ -1,4 +1,4 @@
-"""Tests for /api/import + DELETE /api/delete."""
+"""Tests for /api/import + DELETE /api/delete (spec §9.2 + §12.1)."""
 import hashlib
 import os
 from pathlib import Path
@@ -79,7 +79,7 @@ class TestImportValidation:
 
     def test_import_400_root_denied(self, app_test):
         app, client, _ = app_test
-        r = client.post("/api/import", json={"path": "/root/.config/secret.env"})
+        r = client.post("/api/import", json={"path": "/root/.config/secrets.env"})
         assert r.status_code == 400
 
     def test_import_400_escape_via_traversal(self, app_test):

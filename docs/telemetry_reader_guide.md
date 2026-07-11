@@ -1,7 +1,5 @@
 # Turbohaul Flap/Degradation Telemetry — Reader's Guide
 
-2026-06-27
-
 ## What This Is
 
 An OBSERVE-ONLY JSONL log that captures per-request lifecycle signals in
@@ -61,7 +59,7 @@ A new inference request arrived at the API layer.
       "event_type": "request_arrival",
       "ts": "2026-06-27T05:30:00.123+00:00",
       "slot_id": "slot-abc123",
-      "model_tag": "qwen3.6-27b",
+      "model_tag": "example-model-27b",
       "thread_id": "thread-xyz",
       "has_context": true
     }

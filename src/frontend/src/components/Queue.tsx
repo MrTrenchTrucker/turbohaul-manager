@@ -21,6 +21,16 @@ export default function Queue() {
       ? Math.min(100, (queue.staging_queue_depth / queue.staging_queue_max) * 100)
       : 0;
 
+  // Wave F Item 3: grace row — "held during serve — re-arms after turn"
+  // when an ACTIVE serve is holding the engine (backend suppresses the
+  // countdown during serve so FE never shows a mid-prefill 'unload in Ns' clock).
+  const showGraceHeld = active && active.state === 'ACTIVE' && grace;
+  const graceDisplay = showGraceHeld
+    ? 'held during serve — re-arms after turn'
+    : grace
+      ? `${grace.remaining_s}s (ext ${grace.extension_count}/${grace.max_extensions})`
+      : '—';
+
   return (
     <div className="space-y-6">
       <div>
@@ -80,9 +90,7 @@ export default function Queue() {
           </div>
           <div className="flex justify-between">
             <span className="text-slate-400">Grace remaining</span>
-            <span className="font-mono text-slate-200">
-              {grace ? `${grace.remaining_s}s` : '—'}
-            </span>
+            <span className="font-mono text-slate-200">{graceDisplay}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-slate-400">Idle hot-load</span>

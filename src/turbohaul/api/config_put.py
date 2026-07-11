@@ -1,8 +1,8 @@
-"""PUT /api/config with boot-vs-runtime split per v0.2 §7.1.
+"""PUT /api/config with a boot-vs-runtime config split.
 
-Security: runtime-mutable fields PUT-able; boot fields → HTTP 403
-(prevents the binary-swap attack: PUT /api/config with runtime.llama_server_binary
-pointed at /tmp/evil.sh).
+Hardening rule: runtime-mutable fields are PUT-able; boot fields return HTTP 403.
+This prevents a binary-swap attack: PUT /api/config with runtime.llama_server_binary
+pointed at /tmp/evil.sh.
 """
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import ValidationError
@@ -13,7 +13,7 @@ from turbohaul.config import RuntimeConfig
 router = APIRouter(prefix="/api", tags=["config"])
 
 
-# Boot-only sections (per v0.2 §7 split)
+# Boot-only sections (part of the boot-vs-runtime config split)
 BOOT_SECTIONS = {"server", "storage", "runtime", "ui"}
 
 
@@ -34,11 +34,11 @@ async def put_config(payload: dict, request: Request) -> dict:
             status_code=403,
             detail=(
                 f"sections {sorted(boot_attempts)} are BOOT-ONLY; restart manager "
-                "to change (v0.2 §7.1 - prevents binary-swap attack class)"
+                "to change (prevents binary-swap attack class)"
             ),
         )
 
-    valid_sections = {"queue", "pull"}
+    valid_sections = {"queue", "pull", "persist"}
     unknown = set(payload.keys()) - valid_sections
     if unknown:
         raise HTTPException(

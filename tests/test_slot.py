@@ -1,4 +1,4 @@
-"""Tests for Slot + thread_id prefix-hash derivation (v0.2 §4, §6, §9)."""
+"""Tests for Slot + thread_id prefix-hash derivation."""
 from turbohaul.slot import Slot, SlotState, derive_thread_id_prefix_hash
 
 
@@ -21,11 +21,11 @@ class TestSlotState:
 
 class TestSlot:
     def test_new_generates_slot_id(self):
-        s = Slot.new("qwen3.6-35b-moe")
+        s = Slot.new("model-35b-moe")
         assert s.slot_id.startswith("slot-")
         assert len(s.slot_id) > len("slot-")
         assert s.state == SlotState.RECEIVED
-        assert s.model_tag == "qwen3.6-35b-moe"
+        assert s.model_tag == "model-35b-moe"
 
     def test_new_with_thread_id(self):
         s = Slot.new("m", thread_id="thr-abc")
@@ -58,13 +58,26 @@ class TestThreadIdDerivation:
         t2 = derive_thread_id_prefix_hash(prompt, "m")
         assert t1 == t2
 
-    def test_shared_prefix_different_suffix_distinct_id(self):
-        # THE FIX. Two requests sharing a long common preamble but
-        # different tasks (e.g. parallel sub-agents) must get DISTINCT thread_ids
-        # so they fan out concurrently instead of being serialized as one
-        # conversation. Pre-fix (64-word prefix hash) these collided.
-        prompt1 = "Translate this English text into French: The quick brown fox jumps over the lazy dog"
-        prompt2 = "Translate this English text into French: The quick brown fox jumps over the lazy dog. Additional context here."
+    def test_shared_prefix_same_prefix_same_id(self):
+        # Two requests sharing the same prefix (same conversation, extended
+        # with more tokens) must get the SAME thread_id so the grace window
+        # matches and the KV cache restore fires.
+        # Under the earlier full-prompt hash these had distinct ids.
+        # Use long prompts (>256 words) to exercise the prefix-hash path.
+        system = "You are a helpful assistant. Follow instructions carefully. " * 40  # 320 words
+        prompt1 = system + "Translate this: The quick brown fox jumps over the lazy dog."
+        prompt2 = system + "Translate this: The quick brown fox jumps over the lazy dog. Then summarize it."
+        t1 = derive_thread_id_prefix_hash(prompt1, "m")
+        t2 = derive_thread_id_prefix_hash(prompt2, "m")
+        assert t1 == t2
+
+    def test_different_conversation_different_id(self):
+        # Genuinely different conversations (different prefix) must get
+        # DISTINCT thread_ids so they are NOT serialized as one conversation.
+        system1 = "You are a helpful assistant. Follow instructions carefully. " * 40
+        system2 = "You are a translator bot. Your job is to translate. " * 40
+        prompt1 = system1 + "Translate this: The quick brown fox jumps over the lazy dog."
+        prompt2 = system2 + "Translate this: The quick brown fox jumps over the lazy dog."
         t1 = derive_thread_id_prefix_hash(prompt1, "m")
         t2 = derive_thread_id_prefix_hash(prompt2, "m")
         assert t1 != t2
@@ -89,3 +102,17 @@ class TestThreadIdDerivation:
         t1 = derive_thread_id_prefix_hash("hello world", "m", prefix_tokens=10)
         t2 = derive_thread_id_prefix_hash("hello world", "m", prefix_tokens=10)
         assert t1 == t2
+
+    def test_prefix_tokens_limits_hash(self):
+        # When prefix_tokens is small, prompts with the same prefix
+        # produce the same thread_id even if the full prompt differs.
+        prompt1 = "one two three four five six"
+        prompt2 = "one two three four five six seven eight nine ten"
+        # With prefix_tokens=4, only "one two three four" is hashed
+        t1 = derive_thread_id_prefix_hash(prompt1, "m", prefix_tokens=4)
+        t2 = derive_thread_id_prefix_hash(prompt2, "m", prefix_tokens=4)
+        assert t1 == t2
+        # With prefix_tokens=10, the full prompt1 is hashed
+        t3 = derive_thread_id_prefix_hash(prompt1, "m", prefix_tokens=10)
+        t4 = derive_thread_id_prefix_hash(prompt2, "m", prefix_tokens=10)
+        assert t3 != t4  # prompt2 has more tokens, prefix differs

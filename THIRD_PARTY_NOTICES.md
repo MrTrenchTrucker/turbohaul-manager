@@ -58,3 +58,19 @@ All licenses listed above are the official upstream licenses as of the package
 versions pinned in `pyproject.toml` (Python deps) and `src/frontend/package.json`
 (JS deps), audited 2026-05-17 at v0.2.1 ship. No copyleft (GPL/AGPL/LGPL) deps
 were detected.
+
+
+## Vendored engine — self-contained repo
+The turboquant llama.cpp fork ("Tom's TurboQuant" + heavy in-house mods) is now
+SHIPPED IN THIS REPO at `engine/llama-cpp-turboquant/` (a pinned source snapshot).
+See `engine/llama-cpp-turboquant/VENDORED.md`. Build the engine from source (no external
+image, PyPI, or npm) with `Dockerfile.engine-src`, or with wider GPU-architecture
+coverage using `Dockerfile.cuda-multi`.
+
+
+## Vendored dependency licenses (full-vendor license audit)
+All vendored deps are permissively licensed, freely redistributable (no copyleft):
+- **Engine** (engine/llama-cpp-turboquant): MIT (Tom's TurboQuant fork of llama.cpp; MIT preserved).
+- **Python** (vendor/pywheels): MIT/BSD (fastapi, pydantic, uvicorn, httpx, etc.).
+- **Frontend** (src/frontend/node_modules): MIT/ISC/Apache-2.0/BSD-3-Clause; plus **caniuse-lite** (browser-compat DATA) under **CC-BY-4.0** (attribution: "caniuse-lite (c) caniuse.com, CC-BY-4.0"). No GPL/AGPL/LGPL.
+- **Base OS image** (if mirrored/baked to internal registry): NVIDIA CUDA container images under the NVIDIA Deep Learning Container License (internal use of copies + internal derivative images permitted; NO standalone third-party redistribution). Retain NVIDIA + Canonical(Ubuntu) copyright/license notices + EULA in any derived image; keep cuBLAS Modified-BSD attributions; GPU-only execution. CUDA Toolkit redistributables per EULA Attachment A. Ubuntu base internal-mirror permitted (Canonical IP policy).

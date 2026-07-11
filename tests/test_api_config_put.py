@@ -1,4 +1,4 @@
-"""Tests for PUT /api/config split."""
+"""Tests for the PUT /api/config split (runtime-mutable vs boot-only sections)."""
 import pytest
 from fastapi.testclient import TestClient
 
@@ -89,7 +89,7 @@ class TestPutConfigBootForbidden:
         assert r.status_code == 403
 
     def test_put_runtime_paths_403(self, app_test):
-        """The killer attack: changing runtime.llama_server_binary → RCE primitive."""
+        """The dangerous case: mutating runtime.llama_server_binary would be an RCE primitive, so it must be boot-only."""
         app, client = app_test
         r = client.put(
             "/api/config",

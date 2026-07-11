@@ -1,4 +1,4 @@
-"""Tests for FastAPI app skeleton (v0.2 §9) + Phase 5 §11 UI mount."""
+"""Tests for FastAPI app skeleton + UI mount."""
 import pytest
 from fastapi.testclient import TestClient
 
@@ -46,7 +46,7 @@ def app_and_client(tmp_path):
 
 @pytest.fixture
 def app_and_client_with_ui(tmp_path):
-    """create_app variant where a real ui_dist exists. Used for Phase 5 §11 tests."""
+    """create_app variant where a real ui_dist exists. Used for UI mount tests."""
     storage_root = tmp_path / "state"
     storage_root.mkdir()
     (storage_root / "blobs").mkdir()
@@ -279,8 +279,8 @@ class TestUIPathTraversal:
 class TestProductionWiring:
     """Asserts create_app() injects real factory functions into TurbohaulManager.
 
-    This test class exists because an earlier release shipped with `complete_fn` NOT
-    wired in production: api/main.py constructed TurbohaulManager(boot, runtime)
+    This test class exists because an earlier release shipped with `complete_fn`
+    NOT wired in production: api/main.py constructed TurbohaulManager(boot, runtime)
     without passing complete_fn=, so the default raised
     'no completion_fn wired' on every real /v1/chat/completions request.
     All 322+ existing tests passed because each one explicitly injected its own
@@ -294,9 +294,9 @@ class TestProductionWiring:
     def test_complete_fn_is_wired_not_default(self, app_and_client):
         """create_app() must inject a real make_llama_server_complete_fn() callable.
 
-        Regression caught in smoke testing: the default complete_fn
-        raised 'no completion_fn wired' on first chat completion. The fix
-        wired make_llama_server_complete_fn() into manager construction.
+        Caught in a smoke test: the default complete_fn raised
+        'no completion_fn wired' on the first chat completion. The fix wired
+        make_llama_server_complete_fn() into manager construction.
         """
         app, _ = app_and_client
         mgr = app.state.manager

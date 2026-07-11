@@ -186,6 +186,12 @@ def app_completion_autostart(tmp_path):
     (storage_root / "blobs").mkdir()
     (storage_root / "manifests").mkdir()
     (storage_root / "import-staging").mkdir()
+    # chat/completion routes now 404 on an unknown model tag, so the
+    # tags this fixture's tests dispatch against ("m" / "test-model") need a
+    # manifest present. Individual tests may still overwrite "m" via
+    # _write_manifest_yaml(..., reasoning_budget=...) for their own scenario.
+    _write_manifest_yaml(storage_root / "manifests", "m")
+    _write_manifest_yaml(storage_root / "manifests", "test-model")
     boot = BootConfig(
         server=ServerConfig(),
         storage=StorageConfig(
@@ -360,7 +366,7 @@ class TestStreamPayloadBuilder:
                 "tool_choice": tool_choice_obj,
                 "parallel_tool_calls": False,
             },
-            model="qwen3.6-27b-dense",
+            model="example-27b",
             messages=[{"role": "user", "content": "what's the weather?"}],
         )
         assert payload["tools"] == tools
@@ -649,9 +655,9 @@ class TestParseKeepAlive:
     def test_bool_false_means_zero(self):
         """Ollama keep_alive: false → unload immediately (matches `0`).
 
-        Edge case — without this, real Ollama clients sending
-        {"keep_alive": false} would silently fall through to default 300s
-        instead of the immediate teardown they asked for.
+        Without this, real Ollama clients sending {"keep_alive": false} would
+        silently fall through to default 300s instead of the immediate
+        teardown they asked for.
         """
         from turbohaul.api.chat_completion import parse_keep_alive
         assert parse_keep_alive(False) == 0
@@ -665,7 +671,7 @@ class TestParseKeepAlive:
 class TestKeepAliveClientMetaPlumbing:
     """Regression: streaming path must propagate keep_alive_s into client_meta
     (it's Turbohaul-internal, NOT forwarded to llama-server). Streaming-only
-    clients depend on this.
+    clients depend on this fix.
     """
 
     def test_keep_alive_NOT_in_stream_payload(self):
@@ -697,8 +703,8 @@ class TestKeepAliveClientMetaPlumbing:
 # ============================================================================
 
 
-class TestResponseFormatJsonObject:
-    """Contract tests — accept json_object, reject json_schema, no regression.
+class TestResponseFormatSUB4a:
+    """json_object contract tests — accept json_object, reject json_schema, no regression.
 
     Pattern: override mgr._complete_fn (or _build_stream_payload monkeypatch)
     to capture the slot.client_meta / stream-payload that crosses the
@@ -783,10 +789,11 @@ class TestResponseFormatJsonObject:
         assert captured, "_complete_fn was never invoked"
         assert captured[0].get("response_format") == {"type": "json_object"}
 
-    # (c) openai json_schema body — the schema is validated:
-    # bad schema → 422 schema_validation_failed.
-    # This test guards the 422 contract for the bad-schema path (object
-    # type missing additionalProperties: false).
+    # (c) openai json_schema body — schema is now validated rather than rejected.
+    # An earlier revision rejected json_schema as deferred (HTTP 400 "not yet
+    # supported"); the schema is now validated instead: bad schema → 422
+    # schema_validation_failed. This test guards the 422 contract for the
+    # bad-schema path (object type missing additionalProperties: false).
     # See TestResponseFormatJsonSchema for the comprehensive json_schema set.
     def test_c_openai_json_schema_validation_failed_422(self, app_completion_autostart):
         app, client = app_completion_autostart
@@ -806,6 +813,7 @@ class TestResponseFormatJsonObject:
         d1 = r1.json()["detail"]
         assert d1["error"] == "schema_validation_failed"
         assert "additionalProperties" in d1["message"]
+        assert "internal-id" not in str(d1)  # error must not leak internal identifiers
         # Stream variant — must also reject at entry, BEFORE any SSE
         body_stream = {**body, "stream": True}
         r2 = client.post("/v1/chat/completions", json=body_stream)
@@ -865,9 +873,9 @@ class TestResponseFormatJsonObject:
         assert r.status_code == 200, r.text
         assert captured[0].get("response_format") == {"type": "json_object"}
 
-    # (g) ollama json_schema body — schema is validated → 422 on bad schema.
-    # See test_c_openai docstring + TestResponseFormatJsonSchema for the
-    # full json_schema set.
+    # (g) ollama json_schema body — schema is validated rather than rejected.
+    # Earlier 400-reject → current 422-schema-validation. See test_c_openai
+    # docstring + TestResponseFormatJsonSchema for the full json_schema set.
     def test_g_ollama_json_schema_validation_failed_422(self, app_completion_autostart):
         app, client = app_completion_autostart
         body = {
@@ -883,6 +891,7 @@ class TestResponseFormatJsonObject:
         d1 = r1.json()["detail"]
         assert d1["error"] == "schema_validation_failed"
         assert "additionalProperties" in d1["message"]
+        assert "internal-id" not in str(d1)  # error must not leak internal identifiers
         r2 = client.post("/api/chat", json={**body, "stream": True})
         assert r2.status_code == 422
 
@@ -1233,7 +1242,7 @@ class TestResponseFormatJsonSchema:
         assert is_thinking_payload({}, {"reasoning_budget": 0}) is False
         assert is_thinking_payload({}, {}) is False
         assert is_thinking_payload({}, {"reasoning_budget": "not-int"}) is False
-        # Payload arg is interface-parity only — must be ignored
+        # Payload arg is interface-parity only — must be ignored per FP N2
         assert is_thinking_payload(
             {"chat_template_kwargs": {"enable_thinking": True}}, {"reasoning_budget": 0}
         ) is False

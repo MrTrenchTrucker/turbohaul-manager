@@ -349,6 +349,65 @@ class TestIdleHotWire:
         # Only ONE spawn call (second slot inherited warm handle)
         assert spawn_call_count[0] == 1
 
+    async def test_same_model_queued_stays_warm_with_idle_disabled(self, tmp_path):
+        """Residency: two SAME-model requests (distinct
+        threads) served back-to-back with idle disabled (idle_hot_load_seconds=0,
+        i.e. the keep_alive=0 edge) must NOT teardown+respawn between them — the
+        second warm-inherits because the residency floor keeps the resident model
+        warm while a same-model request is queued.
+
+        FAILS before the floor (2 spawns + a grace-expired sigterm BETWEEN the two
+        = churn); PASSES after (1 spawn, the only sigterm is the final shutdown).
+        The 1-slot invariant is preserved: exactly one live sidecar throughout."""
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=0
+        )
+        spawn_calls = []
+        sigterm_calls = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            spawn_calls.append(model_tag)
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(*a, **k):
+            return True
+
+        async def fake_sigterm(handle, **k):
+            sigterm_calls.append(handle.model_tag)
+            return True, "sigterm-clean"
+
+        async def fake_vram(**k):
+            return True, 100
+
+        async def fake_complete(slot, handle):
+            await asyncio.sleep(0.01)
+            return {"ok": True, "who": slot.prompt}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram, complete_fn=fake_complete,
+        )
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        try:
+            # Two SAME-model requests, distinct threads, submitted together so the
+            # 2nd is queued (head_model_tag == m1) when the 1st finishes grace.
+            r1, r2 = await asyncio.gather(
+                mgr.submit_and_wait("m1", "first", thread_id="t1"),
+                mgr.submit_and_wait("m1", "second", thread_id="t2"),
+            )
+        finally:
+            await mgr.shutdown()
+
+        # Both requests served successfully.
+        assert r1[1]["ok"] and r2[1]["ok"]
+        # ONE spawn: the second warm-inherited (no swap/respawn).
+        assert spawn_calls == ["m1"]
+        # No mid-stream churn: the only teardown is the final shutdown.
+        assert sigterm_calls.count("m1") == 1
+        # 1-slot invariant preserved: never more than one live sidecar.
+        assert mgr.runtime.queue.max_parallel_sidecars == 1
+
     async def test_different_model_tears_down_idle_then_spawns(self, tmp_path):
         """Second request for DIFFERENT model_tag tears down idle holder first."""
         boot, runtime = _boot_runtime(
@@ -374,7 +433,7 @@ class TestIdleHotWire:
         async def fake_complete(slot, handle):
             return {"ok": True}
 
-        # Seed manifests so manifest_found=True keeps the
+        # H-4 polish: seed manifests so manifest_found=True keeps the
         # holder-at-risk bail-fast path inactive; tests the actual swap.
         manifests_dir = boot.storage.manifests_path
         manifests_dir.mkdir(parents=True, exist_ok=True)
@@ -408,7 +467,7 @@ class TestIdleHotWire:
         # gpt-y also sigterm at shutdown
         assert sigterm_calls.count("gpt-y") >= 1
     async def test_bogus_model_tag_preserves_idle_holder(self, tmp_path):
-        """Bogus model_tag must NOT tear down idle holder."""
+        """A bogus model_tag must NOT tear down the idle holder."""
         boot, runtime = _boot_runtime(
             tmp_path, grace_seconds=0, idle_hot_load_seconds=120,
         )
@@ -465,7 +524,7 @@ class TestIdleHotWire:
             # WITHOUT tearing down the idle holder.
             with pytest.raises(RuntimeError, match="no manifest"):
                 await mgr.submit_and_wait(
-                    "qwen-pretend", "prompt-bogus", thread_id="t2",
+                    "bogus-model", "prompt-bogus", thread_id="t2",
                 )
             # Holder must STILL be the real-model warm sidecar
             assert mgr._idle_handle is not None, (
@@ -473,7 +532,7 @@ class TestIdleHotWire:
             )
             assert mgr._idle_model_tag == "real-model"
             # No bogus-spawn fired (we bailed before spawn)
-            assert "qwen-pretend" not in spawn_calls
+            assert "bogus-model" not in spawn_calls
             # No sigterm fired on the holder
             assert "real-model" not in sigterm_calls
         finally:
@@ -488,7 +547,7 @@ class TestIdleHotWire:
 #   The streaming ACTIVE_MATCH branch in worker_loop unconditionally called
 #   _complete_fn for the matched slot, ignoring its stream=True flag. The
 #   matched slot's stream_ready_event was never set; the route then waited
-#   for SLOT_READY_TIMEOUT_S=600s before failing. Every turn ≥ 2 of a Hermes
+#   for SLOT_READY_TIMEOUT_S=600s before failing. Every turn ≥ 2 of a
 #   multi-tool agent loop hit this and hung for 10 minutes.
 #
 # These two tests pin the contract:
@@ -573,7 +632,7 @@ class TestActiveMatchStreaming:
                 client_meta={"kind": "openai-chat-completion-stream", "stream": True},
             )
             # Wait for worker to bring anchor to ACTIVE + set stream_ready_event.
-            # The 5s wait_for cap is the timeout; pre-fix this would have
+            # The 5s wait_for cap is the timeout guard; pre-fix this would have
             # waited 600s. Anything > 0.5s here is a CI red flag, see below.
             t0_anchor = time.monotonic()
             await asyncio.wait_for(anchor.stream_ready_event.wait(), timeout=5.0)
@@ -737,7 +796,7 @@ class TestLoadingWedgeFix:
     wait_until_healthy (NOT injected) receives handle.is_alive and bails fast, so
     the existing LOADING_FAIL->POPPED cleanup fires in ~one poll interval and the
     worker_loop stays free to drain the queue. Pre-fix this hung ~600s = the
-    no-reply the caller saw.
+    no-reply the operator saw.
     """
 
     async def test_dead_child_during_load_fails_fast_and_queue_drains(self, tmp_path):

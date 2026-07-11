@@ -1,6 +1,6 @@
-"""Singleton invariant enforcement per v0.2 ARCHITECTURE.md §3.1.
+"""Singleton invariant enforcement.
 
-Design invariant: turbohaul-manager MUST be the only writer to GPU 0
+Design requirement: turbohaul-manager MUST be the only writer to GPU 0
 on a given host. Without this, the cross-process race we are fixing can simply
 be re-introduced by a second turbohaul instance on the same box.
 
@@ -92,7 +92,7 @@ def acquire_state_lock(state_db_path: Path) -> Iterator[int]:
             if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                 raise SingletonViolation(
                     f"another turbohaul-manager already holds flock on {state_db_path}. "
-                    "refusing to start (singleton invariant per v0.2 §3.1)"
+                    "refusing to start (singleton invariant)"
                 ) from e
             raise
         yield fd

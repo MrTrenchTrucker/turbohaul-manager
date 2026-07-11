@@ -1,7 +1,7 @@
 """state.sqlite - persistent queue snapshot + slot history + audit events.
 
-Per v0.2 ARCHITECTURE.md §12. Supports cold-recovery on boot
-(orphan reconciliation in §3.1 / §10).
+Per ARCHITECTURE.md. Supports cold-recovery on boot
+(orphan reconciliation).
 """
 import asyncio
 import json
@@ -73,12 +73,12 @@ def open_state_db(
 ) -> sqlite3.Connection:
     """Open + initialize state.sqlite. Idempotent.
 
-    PRAGMA busy_timeout = 5000 so transient SQLITE_BUSY on concurrent
-    open_state_db calls retry-wait up to 5s instead of failing the request
-    with HTTP 500. There are 8 direct callers (boot_reconcile + submit +
-    _process_slot + _teardown + _force_cold + _audit + _audit_event_only +
-    state_db_session) so contention IS real on burst traffic + concurrent
-    audit writes.
+    PRAGMA busy_timeout = 5000 so transient SQLITE_BUSY
+    on concurrent open_state_db calls retry-wait up to 5s instead of
+    failing the request with HTTP 500. There are 8 direct callers
+    (boot_reconcile + submit + _process_slot + _teardown + _force_cold +
+    _audit + _audit_event_only + state_db_session) so contention IS real
+    on burst traffic + concurrent audit writes.
 
     Each thread gets its own connection via `init_audit_pool`
     (thread-local, check_same_thread=True — no cross-thread sharing).
@@ -94,7 +94,7 @@ def open_state_db(
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=5000")  # retry-wait on transient SQLITE_BUSY
     for stmt in _SCHEMA:
         conn.execute(stmt)
     cur = conn.execute(
@@ -117,7 +117,7 @@ def state_db_session(state_db_path: Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-# === Audit-write connection pool ===========================================
+# === Audit-write connection pool ============================================
 # Thread-local connections — replaces per-event sqlite3.connect/close in
 # manager.py's 7 record_audit_event call sites. Each thread gets its own
 # connection (created lazily, reused within the thread). No shared mutable
@@ -290,8 +290,8 @@ def reconcile_orphaned_slots(conn: sqlite3.Connection, live_pids: set[int]) -> i
        'boot-reconcile-pre-active-orphan'. These cannot be live since they
        were never assigned a pid (caller crashed pre-spawn).
 
-    Edge case: previously pid=NULL slots survived reboots in pre-active
-    state forever; the second pass catches them.
+    Second-pass fix: previously pid=NULL slots survived reboots in pre-active
+    state forever; the second pass below catches them.
     """
     cur = conn.execute(
         """SELECT slot_id, pid FROM slots
@@ -305,7 +305,7 @@ def reconcile_orphaned_slots(conn: sqlite3.Connection, live_pids: set[int]) -> i
         if row["pid"] not in live_pids:
             mark_slot_ended(conn, row["slot_id"], "boot-reconcile-orphaned-pid")
             n += 1
-    # pid-NULL pre-active orphans (never spawned, never have a pid)
+    # Second pass: pid-NULL pre-active orphans (never spawned, never have a pid)
     cur = conn.execute(
         """SELECT slot_id FROM slots
            WHERE pid IS NULL

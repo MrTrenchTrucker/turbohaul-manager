@@ -28,11 +28,11 @@ router = APIRouter()
 
 # Constants
 _MAX_REQUEST_BYTES = 32_768 * 64  # ~2MB Content-Length ceiling
-_BATCH_CAP = 64  # power-of-2
+_BATCH_CAP = 64  # power-of-2 batch cap
 _UPSTREAM_TIMEOUT_S = 120.0
 _SLOT_READY_TIMEOUT_S = 7200.0
 
-# Module-scope httpx client (NO factory pattern)
+# Module-scope httpx client (no factory pattern)
 # asyncio.Lock to prevent TOCTOU between is_closed check and creation.
 _HTTPX_CLIENT: httpx.AsyncClient | None = None
 _HTTPX_CLIENT_LOCK: asyncio.Lock | None = None  # lazy-init in _get_httpx_client
@@ -44,7 +44,7 @@ async def _get_httpx_client() -> httpx.AsyncClient:
         _HTTPX_CLIENT_LOCK = asyncio.Lock()
     async with _HTTPX_CLIENT_LOCK:
         if _HTTPX_CLIENT is None or _HTTPX_CLIENT.is_closed:
-            # close the old client before creating a new one to avoid leaks.
+            # Close the old client before creating a new one to avoid leaks.
             if _HTTPX_CLIENT is not None:
                 try:
                     _HTTPX_CLIENT.close()
@@ -87,14 +87,14 @@ async def post_embeddings(req: EmbeddingsRequest, request: Request) -> dict:
     """
     mgr = request.app.state.manager
 
-    # Gate 3: encoding_format=base64 → 400 plain-string (Q-4 lock)
+    # Gate 3: encoding_format=base64 → 400 plain-string
     if req.encoding_format is not None and req.encoding_format.lower() == "base64":
         raise HTTPException(
             status_code=400,
             detail="encoding_format='base64' not supported; use 'float'",
         )
 
-    # Gate 4: dimensions param present → 400 plain-string (Q-5 lock)
+    # Gate 4: dimensions param present → 400 plain-string
     if req.dimensions is not None:
         raise HTTPException(
             status_code=400,
@@ -133,7 +133,7 @@ async def post_embeddings(req: EmbeddingsRequest, request: Request) -> dict:
         "keep_alive_s": 0,  # RAG batches do NOT need keep_alive carry-over
     }
     thread_hint = inputs[0][:256] if inputs else ""
-    # client-disconnect watcher for embeddings.
+    # Client-disconnect watcher for embeddings.
     disconnect_event = asyncio.Event()
     watch_task = asyncio.create_task(watch_disconnect(request, disconnect_event))
     slot = None  # bound by submit_for_streaming below; finally guards on None
@@ -147,7 +147,7 @@ async def post_embeddings(req: EmbeddingsRequest, request: Request) -> dict:
                 disconnect_event=disconnect_event,
             )
         except SlotEvictedError as e:
-            # client closed before activation → HTTP 499
+            # Client closed before activation → HTTP 499
             raise HTTPException(
                 status_code=499,
                 detail={"error": "client_closed_request", "message": str(e)},
@@ -199,7 +199,7 @@ async def post_embeddings(req: EmbeddingsRequest, request: Request) -> dict:
             )
         return r.json()
     finally:
-        # tear down disconnect watcher cleanly.
+        # Tear down disconnect watcher cleanly.
         watch_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await watch_task

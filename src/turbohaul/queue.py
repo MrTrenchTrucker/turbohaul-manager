@@ -1,6 +1,6 @@
 """TurbohaulQueue: two-tier (unbounded acceptance buffer + capped staging) + grace/idle timers.
 
-Per v0.2 ARCHITECTURE.md §5 + §6.
+See ARCHITECTURE.md for the queueing and grace/idle-window design.
 """
 import asyncio
 import logging
@@ -87,7 +87,7 @@ class TurbohaulQueue:
         - OR None when ``buf`` is empty OR all ``max_drain`` examined entries
           were already evicted-by-someone-else (next tick retries).
 
-        Rationale: unbounded drain under a storm pattern (100 dead
+        Bounding rationale: an unbounded drain under a storm pattern (100 dead
         clients × every pop_next tick × symmetric use in pop_matched_thread)
         = O(N²) wedge. Bounded ≤10 examinations gives predictable cost and
         eventual progress.
@@ -112,7 +112,7 @@ class TurbohaulQueue:
         entry whose ``model_tag`` matches, SKIPPING (NOT removing) entries for
         other models.
 
-        Eviction handling mirrors ``_pop_first_non_evicted_from`` exactly: if
+        Eviction handling MIRRORS ``_pop_first_non_evicted_from`` EXACTLY: if
         the matched slot's ``disconnect_event`` is SET it is flagged
         ``is_evicted=True`` and returned for caller-handled audit (the
         worker_loop's is_evicted branch then fires). Non-matching entries are
@@ -151,10 +151,10 @@ class TurbohaulQueue:
     async def pop_next(self, *, warm_model_tag: str | None = None) -> Slot | None:
         """Pop the next STAGED slot for activation. Returns None if empty.
 
-        LOOP form, no recursion. After consulting
-        the bounded eviction-aware helper, if the result is None (either buf
-        empty or all examined entries pre-evicted), drain accept-buffer into
-        staging and retry once with the helper. Bounded by helper's max_drain.
+        LOOP form, no recursion. After consulting the bounded eviction-aware
+        helper, if the result is None (either buf empty or all examined entries
+        pre-evicted), drain accept-buffer into staging and retry once with the
+        helper. Bounded by helper's max_drain.
 
         Model-affinity (single-mutator-safe parallelism support): when the
         worker_loop passes ``warm_model_tag`` (the model currently warm in the
@@ -195,15 +195,32 @@ class TurbohaulQueue:
             # forced. Both branches replenish staging from the buffer afterward
             # (one entry, mirroring the FIFO path) so depth invariants hold.
             head = self._staging[0]
+            head_is_other = head.model_tag != warm_model_tag
             head_starved = (
-                head.model_tag != warm_model_tag
+                head_is_other
                 and (time.monotonic() - head.created_at) > self.max_other_model_wait_s
             )
             batch_cap_hit = (
                 self._consecutive_same_model >= self.max_consecutive_same_model
             )
-            if head_starved or batch_cap_hit:
-                # Force the FIFO head to drain the starved / cap-exceeded request.
+            # Residency guard: the count cap must NOT force a MODEL
+            # SWAP while same-model work is still queued for the resident and the
+            # other-model head has not aged past the starvation window. At one GPU
+            # slot (max_parallel_sidecars=1) a forced swap M->N->M evicts + reloads
+            # a model the very next queued item wants back — avoidable churn.
+            # Genuine head-starvation (time-based, `head_starved`) STILL forces the
+            # swap so a truly-waiting other-model request is never starved. The
+            # count cap now only forces the FIFO head when doing so causes NO
+            # avoidable swap — i.e. the head is already the resident's model
+            # (`not head_is_other`, a harmless same-model drain). When the head is
+            # a DIFFERENT, not-yet-starved model we fall to the affinity branch,
+            # which drains queued same-model work and only pops the other-model
+            # head if no same-model work remains. Same-model run-length under real
+            # contention is thus bounded by max_other_model_wait_s (time) rather
+            # than by max_consecutive_same_model (count).
+            force_head = head_starved or (batch_cap_hit and not head_is_other)
+            if force_head:
+                # Force the FIFO head to drain the starved (or same-model) request.
                 returned = self._pop_first_non_evicted_from(self._staging)
             else:
                 # Prefer a same-model staging entry; fall back to FIFO head if
@@ -237,7 +254,7 @@ class TurbohaulQueue:
         self._last_popped_model_tag = returned.model_tag
 
     async def enqueue_head(self, slot: Slot) -> None:
-        """Insert at FIFO head — used for ACTIVE-MATCH mid-stream same-thread arrivals (v0.2 §6).
+        """Insert at FIFO head — used for ACTIVE-MATCH mid-stream same-thread arrivals.
 
         Guard: only transition to STAGED if the slot is not already STAGED.
         enqueue_head is called on ALREADY-STAGED slots (fan-out rider push-back,
@@ -255,7 +272,7 @@ class TurbohaulQueue:
         """Locate a staged slot with same (thread_id, model_tag) for grace-window rematch.
 
         Kept for read-only callers (introspection); the production fast path now uses
-        ``pop_matched_thread`` which atomically pops in one lock acquire (H-3 fix).
+        ``pop_matched_thread`` which atomically pops in one lock acquire.
         """
         if not thread_id:
             return None
@@ -268,7 +285,7 @@ class TurbohaulQueue:
     async def pop_matched_thread(
         self, thread_id: str, model_tag: str
     ) -> Slot | None:
-        """H-3 fix: atomic find + remove + eviction check.
+        """Atomic find + remove + eviction check.
 
         Scans staging in order, deletes the first (thread_id, model_tag) match,
         then performs the eviction-check INLINE before returning. If the
@@ -276,9 +293,9 @@ class TurbohaulQueue:
         worker_loop's is_evicted branch handles it (audit + fail-future).
         Bounded by len(staging) ≤ staging_max=100, so no extra drain cap needed.
 
-        Symmetric with pop_next's eviction handling for consistency —
-        eviction can land on a grace-rematch slot just as easily as a
-        fresh-staging slot.
+        Symmetric with pop_next's eviction handling for consistency — eviction
+        can land on a grace-rematch slot just as easily as a fresh-staging
+        slot.
         """
         if not thread_id:
             return None
@@ -311,6 +328,21 @@ class TurbohaulQueue:
         async with self._lock:
             return list(self._staging)
 
+    async def head_model_tag(self) -> str | None:
+        """Non-destructive peek: model_tag of the current staging head (the FIFO
+        next-to-pop), or None when staging is empty.
+
+        Residency guard: the worker_loop consults this to keep the
+        resident model warm when the very next queued request is the SAME model
+        (intent: "if the next request in the queue is the same model, it
+        should stay loaded"). PURE READ under the same ``self._lock`` discipline
+        pop_next uses — it examines only ``_staging[0]`` and mutates NOTHING
+        (queue depth unchanged), so it never perturbs FIFO order or run-length
+        bookkeeping.
+        """
+        async with self._lock:
+            return self._staging[0].model_tag if self._staging else None
+
     def depth(self) -> dict:
         """Sync snapshot of queue depths. Minor lock-skip OK for /status."""
         return {
@@ -337,8 +369,8 @@ class TurbohaulQueue:
 class GraceTimer:
     """Tracks the GRACE window after slot completion.
 
-    Per v0.2 §6: follow-up with matching thread_id within window → warm-slot reuse.
-    Bounded by max_extensions to prevent starvation (v0.2 §4 + §6).
+    A follow-up with a matching thread_id within the window → warm-slot reuse.
+    Bounded by max_extensions to prevent starvation.
     """
 
     def __init__(self, grace_seconds: float, max_extensions: int = 5) -> None:
@@ -390,7 +422,7 @@ class GraceTimer:
 class IdleHotTimer:
     """Tracks the IDLE_HOT window after the queue drains.
 
-    Per v0.2 §6: fresh request with same model_tag → ACTIVE on warm slot.
+    A fresh request with the same model_tag → ACTIVE on the warm slot.
     """
 
     def __init__(self, idle_seconds: float) -> None:

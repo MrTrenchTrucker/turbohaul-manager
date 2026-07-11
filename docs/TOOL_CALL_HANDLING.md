@@ -46,13 +46,13 @@ When `llama-server` parses the model's chat-template output correctly, the respo
 }
 ```
 
-Turbohaul forwards this to the client unchanged. No post-processing. This is what NIM Llama 3.3 70B and most well-aligned chat templates produce.
+Turbohaul forwards this to the client unchanged. No post-processing. This is what a well-aligned instruction-tuned model (e.g. a 70B chat model) and most well-behaved chat templates produce.
 
 ---
 
 ## Path 2 — text-JSON recovery (defensive)
 
-Some chat-templated GGUFs — notably the **Qwen3 family on llama.cpp jinja** (upstream issues [#20809](https://github.com/ggml-org/llama.cpp/issues/20809), [#20837](https://github.com/ggml-org/llama.cpp/issues/20837), [#20260](https://github.com/ggml-org/llama.cpp/issues/20260)) — produce the call as JSON text inside `message.content` and leave `message.tool_calls` empty. Clients that only read the structured field see "no tool call" and stop.
+Some chat-templated GGUFs — notably certain reasoning model families on llama.cpp jinja (upstream issues [#20809](https://github.com/ggml-org/llama.cpp/issues/20809), [#20837](https://github.com/ggml-org/llama.cpp/issues/20837), [#20260](https://github.com/ggml-org/llama.cpp/issues/20260)) — produce the call as JSON text inside `message.content` and leave `message.tool_calls` empty. Clients that only read the structured field see "no tool call" and stop.
 
 Turbohaul's `maybe_recover_tool_calls` post-processor (lives in [`src/turbohaul/api/tool_call_recovery.py`](../src/turbohaul/api/tool_call_recovery.py)) recovers these. It runs AFTER `_merge_reasoning_into_content` and BEFORE the route returns the result. The pipeline is:
 
@@ -60,7 +60,7 @@ Turbohaul's `maybe_recover_tool_calls` post-processor (lives in [`src/turbohaul/
 llama-server response
         |
         v
-_merge_reasoning_into_content  (existing — Qwen3 think-block normalizer)
+_merge_reasoning_into_content  (existing — reasoning think-block normalizer)
         |
         v
 maybe_recover_tool_calls       (text-JSON recovery)
@@ -78,7 +78,7 @@ Two shapes:
 {"name": "list_directory", "arguments": {"path": "/app"}}
 ```
 
-**2. Qwen XML wrapper:**
+**2. XML-wrapped call:**
 ```
 <tool_call>{"name": "search_web", "arguments": {"q": "hello"}}</tool_call>
 ```
@@ -122,12 +122,12 @@ logging.getLogger("turbohaul.api.tool_call_recovery").setLevel(logging.DEBUG)
 
 ## Closure fix — `/v1/chat/completions` tools forwarding
 
-A separate bug was discovered immediately after the recovery post-processor shipped: the OpenAI endpoint's `client_meta` dict (the contract between the route handler and the `_complete` closure) did NOT include `tools` / `tool_choice` / `parallel_tool_calls` / `function_call` / `functions`. This had two effects:
+A separate bug was discovered immediately after the recovery post-processor first shipped: the OpenAI endpoint's `client_meta` dict (the contract between the route handler and the `_complete` closure) did NOT include `tools` / `tool_choice` / `parallel_tool_calls` / `function_call` / `functions`. This had two effects:
 
 1. The closure's `_COMMON_FORWARDED_KNOBS` loop silently dropped tools toward `llama-server` (worked only by accident when the prompt mentioned tool names verbatim).
 2. `maybe_recover_tool_calls(result, client_meta.get("tools"))` saw `None` and returned early ("no tools advertised").
 
-The closure fix adds these five keys to the `client_meta` dict on the OpenAI endpoint, mirroring the `/api/chat` endpoint pattern that already existed:
+The fix adds these five keys to the `client_meta` dict on the OpenAI endpoint, mirroring the `/api/chat` endpoint pattern that already existed for the Ollama tool-call passthrough:
 
 ```python
 "tools": payload.get("tools"),
@@ -143,7 +143,7 @@ After this fix, the canonical empirical probe passes:
 curl -sN http://localhost:11401/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b-dense",
+    "model": "your-model",
     "messages": [{"role":"user","content":"What is the weather in Boston?"}],
     "tools": [{
       "type": "function",
@@ -169,7 +169,7 @@ Tests live in [`tests/test_tool_call_recovery.py`](../tests/test_tool_call_recov
 | Test | Asserts |
 |---|---|
 | `test_canonical_text_json_extracted` | OpenAI canonical shape → structured `tool_calls`, content stripped, reasoning preserved |
-| `test_qwen_xml_wrapper_extracted` | Qwen `<tool_call>...</tool_call>` → same; wrapper tags stripped |
+| `test_qwen_xml_wrapper_extracted` | XML-wrapped `<tool_call>...</tool_call>` → same; wrapper tags stripped |
 | `test_parallel_tool_calls_all_extracted` | Two canonical JSONs in one response → both extracted, distinct synthetic IDs |
 | `test_parallel_mixed_xml_and_canonical` | XML + canonical in same response → both extracted |
 | `test_idempotency_skip_when_populated` | Pre-existing `tool_calls` → post-processor no-op |
@@ -190,7 +190,7 @@ pytest tests/test_tool_call_recovery.py -v
 
 Status: **18/18 GREEN.**
 
-Companion test for the closure fix is `test_a_inbound_tools_forwarded_into_client_meta` in [`tests/test_ollama_tools.py`](../tests/test_ollama_tools.py) — covers the tools-forwarding closure path.
+Companion test for the closure fix is `test_a_inbound_tools_forwarded_into_client_meta` in [`tests/test_ollama_tools.py`](../tests/test_ollama_tools.py) — covers the tools-forwarding path.
 
 ---
 
@@ -205,8 +205,8 @@ If you have a use case that needs a kill-switch (for example, a future llama.cpp
 ## See also
 
 - [README.md](../README.md) — quickstart + API surface
-- [docs/AI_AGENT_SETUP.md](AI_AGENT_SETUP.md) — per-agent config recipes + multi-tool-call workflow
+- [docs/AI_AGENT_SETUP.md](AI_AGENT_SETUP.md) — per-client config recipes + multi-tool-call workflow
 - [src/turbohaul/api/tool_call_recovery.py](../src/turbohaul/api/tool_call_recovery.py) — source (287 LoC)
 - [tests/test_tool_call_recovery.py](../tests/test_tool_call_recovery.py) — tests (12 functions, 18 sub-cases)
 - Upstream llama.cpp issues: [#20809](https://github.com/ggml-org/llama.cpp/issues/20809), [#20837](https://github.com/ggml-org/llama.cpp/issues/20837), [#20260](https://github.com/ggml-org/llama.cpp/issues/20260)
-- [CHANGELOG.md](../CHANGELOG.md) — `v0.2.3` entry (tool-call recovery + tools-forwarding closure fix)
+- [CHANGELOG.md](../CHANGELOG.md) — `v0.2.3` entry

@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 
 # --- tuning constants (module-level; only enabled/poll_interval_s are config) ---
 SLOTS_TIMEOUT_S = 1.5          # /slots GET timeout — caps a hung sidecar
-STALL_AFTER_S = 2.0           # frozen n_decoded this long while processing => stalled/finishing
+STALL_AFTER_S = 10.0          # frozen (no decode AND no prompt progress) this long => stalled/finishing (2.0 was ~2 orders below legit warm prefill)
 STALE_GAP_S = 5.0             # poll gap beyond this => rate-only reset (keep generation)
 TRANSIENT_HOLD_TICKS = 3      # consecutive down-ticks before honoring a 'transitioning'/'idle' flip (debounce the generating<->transitioning flap)
 EWMA_ALPHA = 0.4             # tok/s smoothing
@@ -48,6 +48,9 @@ MAX_LIVE_KEYS = 8            # LRU cap on concurrent per-generation text buffers
 SSE_HEARTBEAT_S = 15.0        # ': keep-alive' cadence on the output SSE
 MAX_SUBS_PER_GEN = 32        # cap concurrent SSE subscribers per generation (DoS guard)
 CARRY_MAX_BYTES = 65536       # drop carry-over if a sidecar never frames (defensive)
+# Mid-prefill hang alarm — separate clock for prefill stalls
+# (decoding stalls use STALL_AFTER_S; prefill can legitimately run 30-60s on big contexts)
+PREFILL_STALL_AFTER_S = 60.0  # prefill heartbeat frozen this long => alarm
 
 
 def compute_generation_id(pid, spawn_seq, thread_or_slot) -> str:
@@ -64,7 +67,7 @@ def compute_generation_id(pid, spawn_seq, thread_or_slot) -> str:
 def _read_spawn_seq(mgr) -> int:
     """Active resident's spawn_seq, defensively.
 
-    P1a: the spawn counter for the live-monitor generation_id now lives on the
+    The spawn counter for the live-monitor generation_id now lives on the
     active ``Resident`` (mirrored from the legacy global by the manager). Prefer
     the manager's ``_active_spawn_seq()`` accessor; fall back to the legacy
     ``_spawn_seq`` attribute when the manager double doesn't expose the method
@@ -87,8 +90,16 @@ def _base_generation(state: str, generation_id: str | None = None) -> dict:
         "max_tokens": None,
         "n_remain": None,
         "n_prompt_tokens": 0,
+        "n_prompt_proc": None,
+        "n_prompt_cache": None,
         "n_ctx": None,
         "prompt_progress": None,
+        # Telemetry (KV-decoupled): integer prefill percentage
+        # = round(n_prompt_tokens_processed / n_prompt_tokens * 100) while
+        # is_processing and n_prompt_tokens > 0, else null. DISTINCT from
+        # ``prompt_progress`` (a fraction shown only during the prefill state);
+        # ``prefill_pct`` is populated whenever a slot is processing.
+        "prefill_pct": None,
         "pct": None,
         "eta_s": None,
         "stalled": False,
@@ -290,7 +301,7 @@ class LiveSlotsPoller:
                 t0 = time.monotonic()
                 try:
                     await self._tick()
-                    # cache per-GPU free VRAM at cap<=1 too, so
+                    # Cache per-GPU free VRAM at cap<=1 too, so
                     # status_snapshot can emit vram[]. The cap>=2 supervisor
                     # already does this; the legacy single poller did NOT, so
                     # /status.vram was null under single-residency (blank bars).
@@ -319,15 +330,17 @@ class LiveSlotsPoller:
             self._mgr._vram_free_mib = await asyncio.to_thread(_read_free_vram_all_mib)
         except Exception:  # noqa: BLE001 -- probe failure -> null, never stale/raise
             self._mgr._vram_free_mib = None
+            log.warning("VRAM free probe failed — setting _vram_free_mib=None")
 
-        # one-time boot read of total VRAM per GPU (never changes at runtime)
+        # One-time boot read of total VRAM per GPU (never changes at runtime)
         if self._mgr._vram_total_mib is None:
             try:
                 self._mgr._vram_total_mib = await asyncio.to_thread(_read_total_vram_all_mib)
             except Exception:  # noqa: BLE001
                 self._mgr._vram_total_mib = None
+                log.warning("VRAM total probe failed — setting _vram_total_mib=None")
 
-        # telemetry — VRAM + process memory sample
+        # Telemetry — VRAM + process memory sample
         try:
             tel = getattr(self._mgr, "_telemetry", None)
             if tel is not None:
@@ -354,8 +367,8 @@ class LiveSlotsPoller:
             and gen.get("generation_id") is not None
             and gen.get("generation_id") != self._held_active_gen.get("generation_id")
         ):
-            # A DIFFERENT generation is already visible to the poller:
-            # do NOT keep holding the old one — its generation_id is the
+            # A DIFFERENT generation is already visible to the poller: do NOT keep
+            # holding the old one — its generation_id is the
             # anchor the live-output SSE follows, so holding it while a new gen
             # decodes would mis-key the new gen's text under the old gen's id (the
             # exact stale-generation bug the anchor-follow design prevents). Publish
@@ -364,10 +377,10 @@ class LiveSlotsPoller:
             self._held_active_gen = None
             self._transient_ticks = 0
         elif self._held_active_gen is not None:
-            # FLAP DEBOUNCE: a single
+            # FLAP DEBOUNCE (guards against a flaky-network flap): a single
             # 'transitioning'/'idle' tick right after an active one is almost
             # always a TRANSIENT — a post-await identity-revalidate miss (a
-            # concurrent spawn_seq bump under rapid sub-agent traffic) or a
+            # concurrent spawn_seq bump under rapid concurrent traffic) or a
             # momentary /slots gap — not a real stop. Honoring it instantly made
             # the FE flap generating<->transitioning every ~1s AND reset the
             # tok/s EWMA so it never populated. Hold the last REAL active gen
@@ -498,6 +511,7 @@ class LiveSlotsPoller:
             has_next = nt0.get("has_next_token")
             n_prompt = s.get("n_prompt_tokens")
             n_prompt_proc = s.get("n_prompt_tokens_processed")
+            n_prompt_cache = s.get("n_prompt_tokens_cache")
             n_ctx = s.get("n_ctx")  # model context-window capacity (e.g. 250112)
             max_tokens = params.get("max_tokens")
             n_predict = params.get("n_predict")
@@ -524,6 +538,8 @@ class LiveSlotsPoller:
                     "last_n_decoded": n_decoded, "last_t": resp_t,
                     "max_tokens": max_tokens,
                     "last_change_t": resp_t,
+                    "last_n_prompt_proc": n_prompt_proc,
+                    "dproc": 0,
                 }
                 inst = 0.0
             else:
@@ -532,8 +548,17 @@ class LiveSlotsPoller:
                     self._agg_ewma = None  # starvation: rate-only reset, keep generation
                 dn = max(0, n_decoded - smp["last_n_decoded"])
                 inst = dn / dt if dt > 1e-3 else 0.0
-                if dn > 0:
+                # Prompt-processing progress IS activity. The engine
+                # resets n_decoded only at DONE_PROMPT (server-context.cpp:4049), so a
+                # warm follow-up's whole prefill reads as 'frozen n_decoded>0' and
+                # false-alarmed STALLED after 2s. Rising n_prompt_tokens_processed
+                # resets the freeze clock exactly like decoded tokens do.
+                _prev_proc = smp.get("last_n_prompt_proc")
+                _dproc = (n_prompt_proc - _prev_proc) if (n_prompt_proc is not None and _prev_proc is not None) else 0
+                if dn > 0 or _dproc > 0:
                     smp["last_change_t"] = resp_t
+                smp["dproc"] = _dproc
+                smp["last_n_prompt_proc"] = n_prompt_proc
                 smp["last_n_decoded"] = n_decoded
                 smp["last_t"] = resp_t
             total_inst += inst
@@ -545,6 +570,8 @@ class LiveSlotsPoller:
                     "n_ctx": n_ctx,
                     "max_tokens": max_tokens, "n_predict": n_predict,
                     "has_next": has_next,
+                    "dproc": self._samples[id_task].get("dproc", 0),
+                    "n_prompt_cache": n_prompt_cache,
                     "last_change_t": self._samples[id_task]["last_change_t"],
                 }
 
@@ -577,9 +604,20 @@ class LiveSlotsPoller:
         stalled = False
         tok_s: float | None = None
 
-        if nd == 0 and hd["n_prompt"] and hd["n_prompt_proc"] is not None and hd["n_prompt_proc"] < hd["n_prompt"]:
+        # Prefill keys on LIVE prompt
+        # progress THIS tick (dproc>0) — never on proc<n_prompt. On this fork
+        # n_prompt_tokens includes cached+generated tokens and grows through
+        # decode, while n_prompt_tokens_processed counts only NEW prompt tokens
+        # and freezes at DONE_PROMPT (server-context.cpp:855/:3752/:3964/:4004),
+        # so proc<n_prompt holds through ALL of decode and would classify a
+        # genuine decode-stall as 'prefill' forever, masking the red alarm.
+        # Warm prefills stay out of the stall path via the freeze clock (rising
+        # proc resets last_change_t above); the stalled guard is the original
+        # nd>0 — reachable again during decode.
+        if total_inst == 0.0 and (hd.get("dproc") or 0) > 0:
             state = "prefill"
-            prompt_progress = round(hd["n_prompt_proc"] / max(1, hd["n_prompt"]), 3)
+            if hd["n_prompt"] and hd["n_prompt_proc"] is not None:
+                prompt_progress = round(hd["n_prompt_proc"] / max(1, hd["n_prompt"]), 3)
         else:
             frozen_for = resp_t - hd["last_change_t"]
             if total_inst == 0.0 and frozen_for >= STALL_AFTER_S:
@@ -594,6 +632,26 @@ class LiveSlotsPoller:
                 tok_s = None if self._agg_ewma is None else round(min(max(self._agg_ewma, 0.0), 10000.0), 1)
 
         tok_s_instant = round(min(max(total_inst, 0.0), 10000.0), 1)
+        # Telemetry: integer prefill % from the same /slots headline
+        # (is_processing is implied — _derive is only reached with a processing
+        # slot). Guard divide-by-zero on n_prompt_tokens; null when the counter
+        # is absent. DISTINCT from prompt_progress (fraction, prefill-state only).
+        n_prompt_hd = hd["n_prompt"] or 0
+        n_prompt_proc_hd = hd["n_prompt_proc"]
+        # Respin: proc counts only NEW prompt tokens; the reused prefix lives in
+        # n_prompt_tokens_cache. A truthful % = (cache+proc)/n_prompt, clamped
+        # (n_prompt grows during decode, drifting the ratio down).
+        _cache_hd = hd.get("n_prompt_cache")
+        _pref_num = (
+            n_prompt_proc_hd + _cache_hd
+            if (n_prompt_proc_hd is not None and _cache_hd is not None)
+            else n_prompt_proc_hd
+        )
+        prefill_pct = (
+            round(min(_pref_num / n_prompt_hd, 1.0) * 100)
+            if (n_prompt_hd > 0 and _pref_num is not None)
+            else None
+        )
         pct = round(min(max(nd / effective_max * 100.0, 0.0), 100.0), 1) if effective_max else None
         n_remain = hd["n_remain"] if isinstance(hd["n_remain"], int) and hd["n_remain"] >= 0 else None
         eta_s = None
@@ -603,6 +661,26 @@ class LiveSlotsPoller:
         ):
             eta_s = round(n_remain / self._agg_ewma, 1)
 
+        # Prefill-stall alarm flag (separate from decoding stall).
+        # Prefill can legitimately run 30-60s on large contexts; the decoding
+        # stall clock (STALL_AFTER_S=10s) is too aggressive for prefill.
+        # Alarm when prefill heartbeat (n_prompt_proc + n_prompt_cache) is
+        # frozen for PREFILL_STALL_AFTER_S.
+        # FIX (PL early gate): state=='prefill' requires dproc>0 this tick, which
+        # resets last_change_t -> frozen_for≈0. The wedge case (cold prefill,
+        # nd==0, proc frozen) classifies as 'generating' in the else branch.
+        # Use state-independent check: nd==0 (cold wedge) + proc>0 (prefill started)
+        # + frozen >= 60s (stalled). FE banner keys ONLY on prefill_stall_alarm.
+        prefill_stall_alarm = False
+        _frozen_for = resp_t - hd["last_change_t"]
+        if (
+            total_inst == 0.0
+            and _frozen_for >= PREFILL_STALL_AFTER_S
+            and nd == 0
+            and (hd.get("n_prompt_proc") or 0) > 0
+        ):
+            prefill_stall_alarm = True
+
         return {
             "state": state,
             "tok_s": tok_s,
@@ -611,8 +689,14 @@ class LiveSlotsPoller:
             "max_tokens": max_tokens,
             "n_remain": n_remain,
             "n_prompt_tokens": hd["n_prompt"] or 0,
+            # Raw prefill counters for the FE growth bar (cache-restored
+            # + newly-processed both rise through prefill; n_prompt itself fills
+            # as it is processed so it cannot be the denominator mid-flight).
+            "n_prompt_proc": hd["n_prompt_proc"],
+            "n_prompt_cache": hd.get("n_prompt_cache"),
             "n_ctx": hd.get("n_ctx"),
             "prompt_progress": prompt_progress,
+            "prefill_pct": prefill_pct,
             "pct": pct,
             "eta_s": eta_s,
             "stalled": stalled,
@@ -620,6 +704,9 @@ class LiveSlotsPoller:
             "generation_id": gen_id,
             "riders": riders,
             "measured_at_iso": utcnow_iso(),
+            # Mid-prefill hang alarm (observability-only, drives
+            # no FSM decision). FE renders a red banner when true.
+            "prefill_stall_alarm": prefill_stall_alarm,
         }
 
 
@@ -772,6 +859,7 @@ class LiveResidentsSupervisor:
             self._mgr._vram_free_mib = await asyncio.to_thread(_read_free_vram_all_mib)
         except Exception:  # noqa: BLE001 -- probe failure -> null, never stale/raise
             self._mgr._vram_free_mib = None
+            log.warning("VRAM free probe failed — setting _vram_free_mib=None")
 
     async def _close_all(self) -> None:
         for poller in list(self._pollers.values()):

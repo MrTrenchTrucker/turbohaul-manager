@@ -54,5 +54,7 @@ pull:
   pull_concurrency: 2
   pull_chunk_size_mb: 64
   per_stream_max_bytes: 107374182400
+persist:
+  max_bytes: 42949672960
 """)
     return cfg_path

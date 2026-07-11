@@ -1,6 +1,6 @@
-import { useEffect, useRef, useMemo, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { GenerationInfo, ResidentModel, StatusSnapshot } from '../api';
+import type { GenerationInfo, LoadVerifyRecord, RequestIdentity, ResidentModel, StatusSnapshot } from '../api';
 import { useStatus } from '../hooks/useStatus';
 import { useLiveStream } from '../hooks/useLiveStream';
 import type { GenPane } from '../hooks/useLiveStream';
@@ -40,8 +40,16 @@ function synthesizeResident(data: StatusSnapshot): ResidentModel | null {
     main_gpu: 0,
     split_mode: 'single',
     inflight: 0,
-    idle_expires_in_s: (data.grace?.remaining_s ?? data.idle_hot?.remaining_s ?? null),
+    // 'unload in Ns' is only truthful when the model is actually
+    // parked — never while a serve is in flight (this badge + the stale advertised
+    // grace clock was the source of a 'grace timer fired mid-prefill' illusion).
+    idle_expires_in_s:
+      source.state === 'GRACE' || source.state === 'IDLE_HOT'
+        ? (data.grace?.remaining_s ?? data.idle_hot?.remaining_s ?? null)
+        : null,
     generation: data.generation,
+    // engine_op from active/loading info
+    engine_op: (source as any).engine_op,
   };
 }
 
@@ -123,6 +131,11 @@ type ActivityPhase = 'live' | 'recent' | 'idle';
 // Observed inter-burst gaps run ~5-6s, so a 10s hold bridges adjacent bursts
 // while still surfacing a genuine stop as IDLE within ~10s.
 const RECENT_HOLD_MS = 10000;
+
+// mid-prefill hang alarm threshold (must match the backend PREFILL_STALL_AFTER_S)
+// Prefill can legitimately run 30-60s on large contexts; decoding stall clock
+// (STALL_AFTER_S=10s) is too aggressive for prefill.
+const PREFILL_STALL_AFTER_S = 60;
 
 // NOTE: our GenerationInfo.state is a plain `string` (no GenerationState union),
 // so this set is keyed on string.
@@ -229,8 +242,46 @@ function pillClasses(tone: PillTone): string {
   }
 }
 
-function derivePill(data: StatusSnapshot, gen: GenerationInfo, phase: ActivityPhase): Pill {
-  // STALLED takes precedence — it's the one alarm state.
+const BUSY_ESCALATE_S = 120; // longest legit engine op (4.6GB KV restore) is ~30s
+
+function derivePill(data: StatusSnapshot, gen: GenerationInfo, phase: ActivityPhase, busyForS: number | null): Pill {
+  // PREFILL keys on the backend state ONLY. prefill_pct must
+  // NOT gate the pill — on this fork n_prompt grows through decode while proc
+  // freezes at DONE_PROMPT, so pct<100 through all of healthy decode.
+  // Never paint stark IDLE while the manager reports an ACTIVE serve
+  // (the /slots poll starves during engine save/restore) — but a starved poll
+  // must ESCALATE: a dead engine behind an ACTIVE slot must not read as calm
+  // amber forever.
+  // No % detail — on this fork prompt.tokens fills as it is
+  // processed, so (cache+proc)/n_prompt pegs at 100 for the whole prefill; a
+  // constant "100%" is a lie. A true % needs the admission-context denominator
+  // the manager knows at submit time (follow-up).
+  if (gen.state === 'prefill') {
+    return { label: 'PREFILL', tone: 'amber' };
+  }
+  // engine_op pill override — show the named engine operation
+  // (kv_restore, kv_save, prefill, decode, idle, stream, unload) when active/loading.
+  const activeOp = data.active?.engine_op;
+  const loadingOp = data.loading?.engine_op;
+  const engineOp = activeOp || loadingOp;
+  // The op pill must NEVER outrank the alarms — a stalled engine
+  // or a telemetry blackout paints RED even mid-op (a calm blue pill over them
+  // would re-mask exactly that class).
+  if (engineOp && engineOp !== 'idle' && !gen.stalled && gen.state !== 'stalled' && phase !== 'idle') {
+    const opLabel = engineOp.toUpperCase().replace('_', ' ');
+    return { label: opLabel, tone: 'blue' };
+  }
+  if (phase === 'idle' && data.active) {
+    if (busyForS != null && busyForS >= BUSY_ESCALATE_S) {
+      return { label: 'NO TELEMETRY', tone: 'red', detail: `engine unresponsive ${busyForS}s` };
+    }
+    return {
+      label: 'BUSY',
+      tone: 'amber',
+      detail: busyForS != null ? `engine busy — telemetry paused ${busyForS}s` : 'engine busy — telemetry paused',
+    };
+  }
+  // STALLED takes precedence among true alarm states.
   if (gen.stalled || gen.state === 'stalled') {
     return { label: 'STALLED', tone: 'red' };
   }
@@ -380,24 +431,43 @@ function fmtInt(n: number): string {
   return n.toLocaleString('en-US');
 }
 
-function PrefillBar({ gen }: { gen: GenerationInfo }) {
-  const p = gen.prompt_progress;
+function PrefillBar({ gen, sessionTotal }: { gen: GenerationInfo; sessionTotal: number }) {
+  // A GROWING prefill bar. Numerator = cache-restored +
+  // newly-processed tokens (both rise through prefill on this fork; n_prompt
+  // itself fills as it is processed so it can't be the denominator mid-flight).
+  // Denominator = the largest prompt seen this session (context only grows
+  // within a session) — an estimate, so the fill clamps at 99% until the
+  // engine flips to decode. No session history yet -> indeterminate pulse
+  // with the live token count.
+  const holdVal = useRef(0);
+  const nowRaw = (gen.n_prompt_cache ?? 0) + (gen.n_prompt_proc ?? 0);
+  if (nowRaw > 0) holdVal.current = nowRaw; // hold through /slots-starvation ticks
+  const now = holdVal.current;
+  // Denominator = the LAST COMPLETED turn's prompt total, learned by
+  // the always-mounted parent (this component only exists during 'prefill' —
+  // n_prompt_tokens fills DURING prefill on this fork, so learning it here
+  // pegged the % at ~99 while the count grew, e.g. 24,576->42,648
+  // both '~99%'). First-ever turn: sessionTotal=0 -> indeterminate pulse.
+  const pct = sessionTotal > 0 ? Math.min(99, Math.max(1, (now / sessionTotal) * 100)) : null;
   return (
     <div className="rounded-lg border border-blue-700 bg-blue-950/30 p-4">
       <div className="flex items-baseline justify-between mb-2">
         <div className="text-xs uppercase tracking-wide text-blue-300 font-semibold">
           Processing prompt
         </div>
-        {p != null && p !== '' && (
-          <span className="font-mono text-sm text-blue-200 tabular-nums">{p}</span>
-        )}
+        <span className="font-mono text-sm text-blue-200 tabular-nums">
+          {fmtInt(now)} tokens{pct != null ? ` · ~${Math.round(pct)}%` : ''}
+        </span>
       </div>
       <div className="h-3 bg-slate-800 rounded overflow-hidden">
-        {/* Indeterminate — prompt_progress is a string, no numeric fraction. */}
-        <div className="h-full w-1/3 bg-blue-600/70 rounded animate-pulse" />
+        {pct != null ? (
+          <div className="h-full bg-blue-500 transition-all" style={{ width: `${pct}%` }} />
+        ) : (
+          <div className="h-full w-1/3 bg-blue-600/70 rounded animate-pulse" />
+        )}
       </div>
       <div className="mt-2 text-xs text-blue-300/70">
-        reading the prompt before the first token decodes
+        restored from KV + newly processed · % vs session size (est) · hands off to token progress at first decode
       </div>
     </div>
   );
@@ -408,7 +478,7 @@ function Progress({ gen }: { gen: GenerationInfo }) {
   const nDecoded = gen.n_decoded ?? 0;
   const bounded = gen.max_tokens != null && gen.pct != null;
   // CONTEXT used / window: surface the request context against the model's
-  // context-window capacity. Fall back to just the used count when n_ctx unknown.
+  // context-window capacity. Fall back to just the used count when n_ctx is unknown.
   const nPrompt = gen.n_prompt_tokens ?? 0;
   const contextLabel =
     gen.n_ctx != null
@@ -434,10 +504,12 @@ function Progress({ gen }: { gen: GenerationInfo }) {
             className="h-full bg-emerald-500 transition-all"
             style={{ width: `${Math.min(100, Math.max(0, gen.pct as number))}%` }}
           />
-        ) : (
-          // Indeterminate barber-pole for unbounded generations (count-up only).
+        ) : gen.state === 'generating' || gen.state === 'finishing' || gen.state === 'stalled' ? (
+          // Indeterminate barber-pole ONLY while a generation actually runs
+          // unbounded. This block used to render at IDLE too — a
+          // permanently-stuck ~33% bar on an idle dashboard.
           <div className="h-full w-1/3 bg-emerald-600/70 rounded animate-pulse" />
-        )}
+        ) : null}
       </div>
       <div className="mt-2 space-y-0.5 text-xs text-slate-500">
         <div className="font-mono">context: {contextLabel}</div>
@@ -512,9 +584,38 @@ function ThroughputSection({ data }: { data: StatusSnapshot }) {
   // unconditionally (before any early return) to keep hook order stable.
   const { phase, heldTokS } = useActivityPhase(gen);
 
+  // BUSY elapsed clock — hooks live ABOVE the early return
+  // (rules-of-hooks; same invariant as useActivityPhase). Escalates a
+  // permanently-starved /slots (dead engine behind an ACTIVE slot) to a red
+  // NO TELEMETRY alarm instead of calm amber forever.
+  const busySince = useRef<number | null>(null);
+  // prefill-bar hold flag — hook lives above the early return too.
+  const lastWasPrefill = useRef(false);
+  const engineBusy = phase === 'idle' && !!data.active;
+  useEffect(() => {
+    if (engineBusy) {
+      if (busySince.current == null) busySince.current = Date.now();
+    } else {
+      busySince.current = null;
+    }
+  }, [engineBusy]);
+  const busyForS = engineBusy && busySince.current != null
+    ? Math.max(0, Math.round((Date.now() - busySince.current) / 1000))
+    : null;
+
+  // PrefillBar mounts ONLY during 'prefill' (see the render
+  // swap below), so it can never observe 'generating'/'finishing' and its own
+  // ref would reset on every remount — learn the finished prompt total HERE,
+  // in the always-mounted parent (hook above the early return, same invariant
+  // as busySince), and pass it down as the bar's denominator.
+  const promptTotalRef = useRef(0);
+  if (gen && (gen.state === 'generating' || gen.state === 'finishing')) {
+    promptTotalRef.current = gen.n_prompt_tokens ?? 0;
+  }
+
   useEffect(() => {
     if (!gen) return;
-    // Edge case: a NEW generation resets the rolling
+    // A NEW generation resets the rolling
     // buffer. Otherwise peak/sparkline blend samples across generations and
     // "peak" can show a number that never occurred in the current generation.
     if (gen.generation_id !== lastGenId.current) {
@@ -543,19 +644,25 @@ function ThroughputSection({ data }: { data: StatusSnapshot }) {
     );
   }
 
-  const pill = derivePill(data, gen, phase);
+  const pill = derivePill(data, gen, phase, busyForS);
   // PEAK tok/s — the max of the recent tok_s_instant samples in the buffer.
   // Bursty workloads dip to 0 between bursts; peak shows the true speed.
   const peak = sparkRef.current.length > 0 ? Math.max(...sparkRef.current) : 0;
   const instant = gen.tok_s_instant ?? 0;
-  const prefill = gen.state === 'prefill';
+  // Hold the prefill bar through /slots-starvation flaps (prefill <->
+  // transitioning at ~batch cadence) so the bars don't alternate; any other
+  // real state clears the hold.
+  if (gen.state === 'prefill') lastWasPrefill.current = true;
+  else if (gen.state !== 'transitioning') lastWasPrefill.current = false;
+  const prefill =
+    gen.state === 'prefill' || (gen.state === 'transitioning' && lastWasPrefill.current);
 
   return (
     <div className="space-y-3">
       <div className="flex items-baseline justify-between">
         <div className="flex items-baseline gap-2">
           <h2 className="text-sm font-semibold text-slate-300">LIVE INFERENCE</h2>
-          {/* Note: honest about double-parallel — /status.generation is a
+          {/* Honest about double-parallel — /status.generation is a
               single (primary) block, so the Hero/sparkline/peak reflect ONE gen.
               The per-generation live-output panes below show every concurrent gen. */}
           {(gen.riders ?? 0) > 1 && (
@@ -567,7 +674,17 @@ function ThroughputSection({ data }: { data: StatusSnapshot }) {
         <StatePill pill={pill} />
       </div>
 
-      {prefill && <PrefillBar gen={gen} />}
+      {/* Mid-prefill hang alarm — red banner when prefill heartbeat
+          frozen for PREFILL_STALL_AFTER_S (60s). Observability-only, drives no
+          FSM decision. */}
+      {gen.prefill_stall_alarm && (
+        <div className="mt-2 rounded border-2 border-red-700 bg-red-950/40 p-3">
+          <div className="flex items-center gap-2 text-red-300">
+            <span className="font-mono text-sm">⚠ MID-PREFILL HANG</span>
+            <span className="text-xs">prefill heartbeat frozen ≥{PREFILL_STALL_AFTER_S}s — engine may be stuck</span>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2">
@@ -585,7 +702,9 @@ function ThroughputSection({ data }: { data: StatusSnapshot }) {
         </div>
       </div>
 
-      <Progress gen={gen} />
+      {/* The prefill bar REPLACES the token-progress bar during
+          prompt processing, then hands off at first decode. */}
+      {prefill ? <PrefillBar gen={gen} sessionTotal={promptTotalRef.current} /> : <Progress gen={gen} />}
 
       <div className="text-xs text-slate-500 flex items-center gap-3">
         <span>
@@ -603,8 +722,21 @@ function ThroughputSection({ data }: { data: StatusSnapshot }) {
 /*  Residents Panel                                                      */
 /* ------------------------------------------------------------------ */
 
-function ResidentCard({ model }: { model: ResidentModel }) {
+function ResidentCard({
+  model,
+  requestIdentity,
+  soleResident = false,
+  loadVerify,
+}: {
+  model: ResidentModel;
+  requestIdentity?: RequestIdentity | null;
+  soleResident?: boolean;
+  loadVerify?: LoadVerifyRecord[] | null;
+}) {
   const gen = model.generation;
+  // engine_op from active/loading info (synthesized resident)
+  // We get this from the data.active or data.loading engine_op via synthesis
+  const engineOp = (model as any).engine_op;
   return (
     <Card title={model.model_tag} tone={stateTone(model.state)}>
       <div className="flex items-center gap-2 mb-2">
@@ -616,10 +748,25 @@ function ResidentCard({ model }: { model: ResidentModel }) {
             {model.inflight} inflight
           </span>
         )}
+        {/* Engine operation pill */}
+        {engineOp && engineOp !== 'idle' && (
+          <span className="text-xs font-medium px-2 py-0.5 rounded bg-slate-700 text-slate-100">
+            {engineOp.toUpperCase()}
+          </span>
+        )}
         <span className="text-xs text-slate-500">
           GPU{model.main_gpu} · pid {model.pid} · port {model.port}
         </span>
       </div>
+      {/* The structured-identity strip
+          lives INSIDE the resident slot card (per-slot), not floating above the
+          RESIDENTS box. Shown on the sole resident (single-residency deployment)
+          or on the card whose model served the last request (multi-residency). */}
+      {requestIdentity && (soleResident || requestIdentity.model_tag === model.model_tag) && (
+        <RequestIdentityStrip identity={requestIdentity} />
+      )}
+      {/* Per-slot load/restore verify verdict (green/yellow/red). */}
+      <LoadVerifyWidget records={loadVerify} modelTag={model.model_tag} />
       <KV k="reserved need" v={`${model.reserved_need_mib} MiB`} />
       <KV k="parallel" v={model.parallel} />
       <KV k="split_mode" v={model.split_mode} />
@@ -649,7 +796,7 @@ function ResidentCard({ model }: { model: ResidentModel }) {
 }
 
 function VramBars({ vram, vramTotal }: { vram: number[] | null; vramTotal: number[] | null }) {
-  const TOTAL = vramTotal?.[0] ?? 24576;  // prefer backend-reported total; fallback to RTX 5090
+  const TOTAL = vramTotal?.[0] ?? 24576;  // prefer backend-reported total; fallback to a 24 GiB GPU
   if (!vram || vram.length === 0) return null;
   return (
     <Card title="VRAM" tone="border-slate-700">
@@ -674,11 +821,11 @@ function VramBars({ vram, vramTotal }: { vram: number[] | null; vramTotal: numbe
   );
 }
 
-// BUG 3 — VRAM honesty placeholder. Under single-residency (cap<=1) the backend
+// VRAM honesty placeholder. Under single-residency (cap<=1) the backend
 // suppresses /status.vram (null). The FE has NO real VRAM source, so we DO NOT
 // fabricate numbers — we surface the gap so it's visibly accounted-for rather
 // than silently missing.
-// TODO: backend must populate status.vram even at cap<=1
+// TODO: backend must populate status.vram even at cap<=1.
 function VramPlaceholder() {
   return (
     <Card title="VRAM" tone="border-slate-700">
@@ -690,16 +837,115 @@ function VramPlaceholder() {
   );
 }
 
+// Compact strip showing the last request's structured identity — proof
+// Turbohaul reads + trusts the structured client_meta instead of guessing
+// off the thread_id prefix.
+// Null-safe: renders a muted placeholder when no request has landed yet.
+function RequestIdentityStrip({ identity }: { identity: RequestIdentity | null | undefined }) {
+  if (!identity) {
+    return (
+      <div className="text-xs text-slate-600 italic px-1">— no request yet —</div>
+    );
+  }
+  // Derive the single role label from the is_* booleans (priority: curator >
+  // compression > sub_agent > main; fall back to resolved_class).
+  const role = identity.is_curator
+    ? 'Curator'
+    : identity.is_compression
+      ? 'Compression'
+      : identity.is_sub_agent
+        ? 'Sub-Agent'
+        : identity.is_main
+          ? 'Main'
+          : (identity.resolved_class ?? '—');
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-mono text-slate-400 px-1 py-1 border-b border-slate-800 mb-2">
+      <span>{identity.ip ?? '—'}</span>
+      <span className="text-slate-600">·</span>
+      <span>{identity.model_tag ?? '—'}</span>
+      <span className="text-slate-600">·</span>
+      <span className="text-emerald-400">{role}</span>
+      <span className="text-slate-600">·</span>
+      <span className="truncate max-w-[10rem]">{identity.session_id ?? '—'}</span>
+    </div>
+  );
+}
+
+// Observability: green/yellow/red verdict per model (re)spawn +
+// KV restore, with expected-vs-actual n_past. Answers "did the model + precomputed
+// KV truly load?" at a glance — the blind spot that let a dead llama-server look
+// idle-hot. final_status is the resolved verdict (ok / retried_ok / failed).
+function loadVerifyTone(status: string): { dot: string; text: string; label: string } {
+  if (status === 'ok') return { dot: 'bg-emerald-500', text: 'text-emerald-400', label: 'OK' };
+  if (status === 'retried_ok') return { dot: 'bg-amber-500', text: 'text-amber-400', label: 'RETRIED' };
+  if (status === 'failed') return { dot: 'bg-rose-500', text: 'text-rose-400', label: 'FAILED' };
+  return { dot: 'bg-slate-500', text: 'text-slate-400', label: (status || '—').toUpperCase() };
+}
+
+function LoadVerifyRow({ rec }: { rec: LoadVerifyRecord }) {
+  const tone = loadVerifyTone(rec.final_status);
+  const isKv = rec.event === 'kv_restore';
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-mono py-0.5">
+      <span className={`inline-block w-2 h-2 rounded-full ${tone.dot}`} />
+      <span className="text-slate-400">{isKv ? 'KV restore' : 'model load'}</span>
+      <span className="text-slate-600">·</span>
+      <span className="text-slate-500">{rec.trigger}</span>
+      <span className="text-slate-600">·</span>
+      <span className={tone.text}>{tone.label}</span>
+      {rec.retry_count > 0 && <span className="text-amber-500">×{rec.retry_count}</span>}
+      {isKv && rec.kv_expected_tokens != null && (
+        <>
+          <span className="text-slate-600">·</span>
+          <span className={rec.kv_restore_ok === false ? 'text-rose-400' : 'text-slate-400'}>
+            n_past {rec.kv_actual_n_past?.toLocaleString() ?? '—'}/{rec.kv_expected_tokens.toLocaleString()}
+          </span>
+        </>
+      )}
+      {rec.process_alive === false && <span className="text-rose-400">· dead-pid</span>}
+      {rec.model_resident === false && <span className="text-rose-400">· not-resident</span>}
+      {rec.reason && (
+        <span className="text-slate-500 truncate max-w-[12rem]" title={rec.reason}>· {rec.reason}</span>
+      )}
+    </div>
+  );
+}
+
+function LoadVerifyWidget({
+  records,
+  modelTag,
+}: {
+  records?: LoadVerifyRecord[] | null;
+  modelTag: string;
+}) {
+  const mine = (records ?? []).filter(r => r.model_tag === modelTag);
+  // records arrive newest-last; find the most-recent of each event type.
+  const lastLoad = [...mine].reverse().find(r => r.event === 'model_load');
+  const lastRestore = [...mine].reverse().find(r => r.event === 'kv_restore');
+  if (!lastLoad && !lastRestore) return null;
+  return (
+    <div className="mt-2 pt-2 border-t border-slate-800">
+      <div className="text-xs text-slate-500 mb-1">Load / Restore verify</div>
+      {lastLoad && <LoadVerifyRow rec={lastLoad} />}
+      {lastRestore && <LoadVerifyRow rec={lastRestore} />}
+    </div>
+  );
+}
+
 function ResidentsPanel({
   residents,
   vram,
   vramTotal,
   parallelSlots,
+  requestIdentity,
+  loadVerify,
 }: {
   residents: ResidentModel[];
   vram: number[] | null;
   vramTotal: number[] | null;
   parallelSlots: { used: number; max: number };
+  requestIdentity?: RequestIdentity | null;
+  loadVerify?: LoadVerifyRecord[] | null;
 }) {
   const hasVram = vram != null && vram.length > 0;
   return (
@@ -712,7 +958,13 @@ function ResidentsPanel({
       </div>
       <div className="grid grid-cols-1 gap-3">
         {residents.map(m => (
-          <ResidentCard key={m.model_tag} model={m} />
+          <ResidentCard
+            key={m.model_tag}
+            model={m}
+            requestIdentity={requestIdentity}
+            soleResident={residents.length === 1}
+            loadVerify={loadVerify}
+          />
         ))}
       </div>
       {/* Real bars when vram is a populated array (cap>=2); honest placeholder
@@ -796,13 +1048,35 @@ function LiveOutputPane({
   tokHistory: number[];
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Sticky-bottom: only auto-follow the
+  // live output when the user is already at/near the bottom, so scrolling up to
+  // free-read mid-generation is NOT yanked back down on every new token.
+  const stickRef = useRef(true);
+  const [atBottom, setAtBottom] = useState(true);
 
-  // Auto-scroll when text grows
-  useEffect(() => {
-    if (scrollRef.current) {
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    stickRef.current = near;
+    setAtBottom(near);
+  };
+
+  // Auto-scroll when text grows — ONLY if the user is sticking to the bottom.
+  // useLayoutEffect (pre-paint) avoids a one-frame un-scrolled flicker while streaming.
+  useLayoutEffect(() => {
+    if (scrollRef.current && stickRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [text]);
+
+  const jumpToBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    stickRef.current = true;
+    setAtBottom(true);
+  };
 
   const shortId = genId.slice(0, 8);
   const ago = lastFrameAt ? `${Math.round((Date.now() - lastFrameAt) / 1000)}s ago` : '—';
@@ -826,11 +1100,24 @@ function LiveOutputPane({
         <Sparkline samples={tokHistory} />
         <span className="text-xs text-slate-500 ml-auto">last: {ago}</span>
       </div>
-      <div
-        ref={scrollRef}
-        className="h-64 overflow-y-auto rounded bg-slate-900 p-3 text-sm font-mono text-slate-200 whitespace-pre-wrap break-words"
-      >
-        {text || <span className="text-slate-600 italic">Waiting for tokens…</span>}
+      <div className="relative">
+        <div
+          ref={scrollRef}
+          onScroll={onScroll}
+          className="h-64 overflow-y-auto rounded bg-slate-900 p-3 text-sm font-mono text-slate-200 whitespace-pre-wrap break-words"
+        >
+          {text || <span className="text-slate-600 italic">Waiting for tokens…</span>}
+        </div>
+        {!atBottom && (
+          <button
+            type="button"
+            onClick={jumpToBottom}
+            aria-label="Jump to latest output"
+            className="absolute bottom-2 right-2 text-xs px-2 py-0.5 rounded bg-emerald-700 text-emerald-100 opacity-90 hover:opacity-100"
+          >
+            ↓ latest
+          </button>
+        )}
       </div>
     </Card>
   );
@@ -915,7 +1202,7 @@ function QueueCard({
 }
 
 /* ------------------------------------------------------------------ */
-/*  Main Dashboard (P2 Split-View)                                       */
+/*  Main Dashboard (Split-View)                                          */
 /* ------------------------------------------------------------------ */
 
 export default function Dashboard() {
@@ -924,7 +1211,7 @@ export default function Dashboard() {
 
   // When residents[] is empty (single-residency, cap<=1), synthesize a
   // partial ResidentModel from the legacy active/loading/grace/idle_hot
-  // fields + the generation alias. This bridges the P2 split-view FE
+  // fields + the generation alias. This bridges the split-view FE
   // back to the data the operator wants to see.
   const effectiveResidents = useMemo(() => {
     if (!data) return [];
@@ -965,6 +1252,8 @@ export default function Dashboard() {
             vram={data.vram}
             vramTotal={data.vram_total_mib}
             parallelSlots={data.parallel_slots}
+            requestIdentity={data.request_identity}
+            loadVerify={data.load_verify}
           />
         </div>
         <div className="xl:col-span-3">

@@ -42,7 +42,7 @@ export function useStatus(): UseStatusResult {
      intervalRef.current = interval;
      let wsTimer: ReturnType<typeof setTimeout> | null = null;
      const sub = subscribeWsState(() => {
-       // debounce WS-triggered fetch — if we're within 200ms of the
+       // Debounce WS-triggered fetch — if we're within 200ms of the
        // next interval tick, skip the extra poll. Otherwise fetch now and
        // restart the interval to avoid double-polling.
        if (wsTimer !== null) {

@@ -59,6 +59,22 @@ class TestConstructor:
         assert mgr._active_slot is None
         assert mgr._active_handle is None
 
+    def test_cold_start_idle_client_meta_initialized(self, boot_and_runtime):
+        """Cold-start safety: _idle_client_meta must be initialized to None.
+        
+        Caught in early smoke test: first request after fresh manager startup would
+        hit AttributeError when reading _idle_client_meta at line 3643, causing the
+        request to be dropped. Root cause: __init__ read and wrote the attribute via
+        _set_idle_holder() but never initialized it.
+        
+        Fix: Initialize to None alongside other _idle_* fields (lines 903-917).
+        """
+        boot, runtime = boot_and_runtime
+        mgr = TurbohaulManager(boot, runtime)
+        # Critical: attribute exists and is None (cold-start state, no idle holder yet)
+        assert hasattr(mgr, "_idle_client_meta"), "Missing initialization in __init__"
+        assert mgr._idle_client_meta is None, "Should be None on cold start"
+
 
 class TestAllocPort:
     """P1a: resident-registry-aware port allocation (max=1 identical to base)."""
@@ -194,10 +210,10 @@ class TestSubmit:
     async def test_submit_returns_slot_with_auto_thread_id(self, boot_and_runtime):
         boot, runtime = boot_and_runtime
         mgr = TurbohaulManager(boot, runtime)
-        slot = await mgr.submit(model_tag="qwen", prompt="hello world")
+        slot = await mgr.submit(model_tag="demo-model", prompt="hello world")
         assert slot.slot_id.startswith("slot-")
         assert slot.thread_id.startswith("auto-")
-        assert slot.model_tag == "qwen"
+        assert slot.model_tag == "demo-model"
         # Audit-logged
         conn = open_state_db(boot.storage.state_db_path)
         cur = conn.execute("SELECT state FROM slots WHERE slot_id=?", (slot.slot_id,))
@@ -209,19 +225,19 @@ class TestSubmit:
     async def test_submit_preserves_explicit_thread_id(self, boot_and_runtime):
         boot, runtime = boot_and_runtime
         mgr = TurbohaulManager(boot, runtime)
-        slot = await mgr.submit(model_tag="qwen", prompt="hi", thread_id="custom-thread")
+        slot = await mgr.submit(model_tag="demo-model", prompt="hi", thread_id="custom-thread")
         assert slot.thread_id == "custom-thread"
 
     async def test_submit_with_grace_match_enqueues_head(self, boot_and_runtime):
         boot, runtime = boot_and_runtime
         mgr = TurbohaulManager(boot, runtime)
         # Prime: fill queue
-        s_first = await mgr.submit(model_tag="qwen", prompt="prior", thread_id="thr-x")
-        s_other = await mgr.submit(model_tag="qwen", prompt="other")
+        s_first = await mgr.submit(model_tag="demo-model", prompt="prior", thread_id="thr-x")
+        s_other = await mgr.submit(model_tag="demo-model", prompt="other")
         # Manually start grace timer to simulate active slot popped + in grace
-        mgr.grace.start("thr-x", "qwen")
+        mgr.grace.start("thr-x", "demo-model")
         # Now follow-up should land at head
-        s_followup = await mgr.submit(model_tag="qwen", prompt="next-turn", thread_id="thr-x")
+        s_followup = await mgr.submit(model_tag="demo-model", prompt="next-turn", thread_id="thr-x")
         # Pop from queue → should be follow-up first (head)
         popped = await mgr.queue.pop_next()
         assert popped.slot_id == s_followup.slot_id
@@ -255,20 +271,20 @@ class TestStatusSnapshot:
     def test_grace_state_reflected(self, boot_and_runtime):
         boot, runtime = boot_and_runtime
         mgr = TurbohaulManager(boot, runtime)
-        mgr.grace.start("thr-abc12345", "qwen3.6-35b-moe")
+        mgr.grace.start("thr-abc12345", "example-35b-moe")
         snap = mgr.status_snapshot()
         assert snap["grace"] is not None
-        assert snap["grace"]["model_tag"] == "qwen3.6-35b-moe"
+        assert snap["grace"]["model_tag"] == "example-35b-moe"
         # Redaction: only first 8 chars exposed
         assert snap["grace"]["thread_id_prefix"] == "thr-abc1"
 
     def test_idle_state_reflected(self, boot_and_runtime):
         boot, runtime = boot_and_runtime
         mgr = TurbohaulManager(boot, runtime)
-        mgr.idle.start("qwen-coder")
+        mgr.idle.start("example-coder")
         snap = mgr.status_snapshot()
         assert snap["idle_hot"] is not None
-        assert snap["idle_hot"]["model_tag"] == "qwen-coder"
+        assert snap["idle_hot"]["model_tag"] == "example-coder"
 
 
 @pytest.mark.asyncio
@@ -398,9 +414,9 @@ class TestIdleWindowSeconds:
 
 
 class TestPerModelIdleTimeout:
-    """Bug C: per-model sleep_idle_seconds from manifest.
-    
-    The 35b sub-agent model was evicting after 120s because the global
+    """Per-model sleep_idle_seconds from manifest.
+
+    A 35B model was evicting after 120s because the global
     idle_hot_load_seconds was used for everything. Each model's manifest
     sleep_idle_seconds should govern its own idle timeout.
     """

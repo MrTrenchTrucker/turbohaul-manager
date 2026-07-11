@@ -1,0 +1,14 @@
+# ENGINE PIN (durable) -- Turbohaul runs the TurboQuant llama.cpp engine baked at this SHA.
+# Cold-restore checkpoint-ladder rewind is proven. TURBOHAUL_CKPT_SIDECAR (default-on)
+# requires this engine (its per-entry draft-MTP validator fixes the earlier cold-restore reject).
+turboquant_engine_sha = 86771a58d
+turboquant_engine_version = 9915
+turboquant_engine_branch = fix/engine-savestate
+libllama_server_impl_bytes = 6343816
+built = 2026-07-07
+
+# ---- VENDORED IN-REPO ----
+# The TurboQuant engine SOURCE ships INSIDE this repo (one self-contained repo):
+#   engine/llama-cpp-turboquant/   -- git-archive snapshot of SHA 86771a58d (no history)
+# Provenance + re-sync: engine/llama-cpp-turboquant/VENDORED.md
+# Build-from-source: Dockerfile.engine-src (compiles the vendored tree).

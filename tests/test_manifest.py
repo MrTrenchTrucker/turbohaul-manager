@@ -1,4 +1,4 @@
-"""Tests for manifest schema + atomic write + ETag/If-Match concurrency (v0.2 §8.1+§8.2)."""
+"""Tests for manifest schema + atomic write + ETag/If-Match concurrency."""
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 
@@ -15,14 +15,14 @@ from turbohaul.manifest import (
     write_manifest_atomic,
 )
 
-SAMPLE_TAG = "qwen3.6-35b-moe"
+SAMPLE_TAG = "example-35b-moe"
 SAMPLE_SHA = "1a2b3c4d" + "0" * 56  # 64 hex chars
 
 
 def make_manifest(**overrides) -> Manifest:
     base = dict(
         model_tag=SAMPLE_TAG,
-        display_name="Qwen 3.6 35B-A3B MoE Q4",
+        display_name="Example 35B-A3B MoE Q4",
         description="test",
         gguf_blob_sha256=SAMPLE_SHA,
         gguf_size_bytes=22_000_000_000,
@@ -37,7 +37,7 @@ def make_manifest(**overrides) -> Manifest:
 
 class TestTagValidation:
     def test_valid_tags(self):
-        for t in ["qwen3.6-35b-moe", "abc", "a", "tag-name_v1.0", "model123"]:
+        for t in ["example-35b-moe", "abc", "a", "tag-name_v1.0", "model123"]:
             validate_tag(t)
 
     def test_invalid_tags(self):
@@ -72,7 +72,7 @@ class TestManifestSchema:
 
     def test_reject_path_bearing_flag_lora(self):
         with pytest.raises(PydanticValidationError, match="explicitly denied"):
-            make_manifest(llama_server_flags={"lora": "/root/.config/nc_claude.env"})
+            make_manifest(llama_server_flags={"lora": "/root/.config/secrets.env"})
 
     def test_reject_path_bearing_flag_log_file(self):
         with pytest.raises(PydanticValidationError, match="explicitly denied"):

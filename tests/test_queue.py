@@ -1,4 +1,4 @@
-"""Tests for TurbohaulQueue + GraceTimer + IdleHotTimer (v0.2 §5/§6)."""
+"""Tests for TurbohaulQueue + GraceTimer + IdleHotTimer."""
 import asyncio
 import time
 
@@ -129,6 +129,69 @@ class TestTurbohaulQueue:
         await q.enqueue(s2)
         # Staging full, s2 lands in accept buffer
         assert s2.state == SlotState.ACCEPT_BUFFER
+
+    # === model residency / affinity ======================================
+
+    async def test_head_model_tag_peek_is_non_destructive(self):
+        q = TurbohaulQueue(staging_max=10)
+        assert await q.head_model_tag() is None  # empty -> None
+        a = Slot.new("model-a")
+        b = Slot.new("model-b")
+        await q.enqueue(a)
+        await q.enqueue(b)
+        before = q.depth()
+        assert await q.head_model_tag() == "model-a"
+        # Idempotent + non-destructive: repeat peek, depth + head unchanged.
+        assert await q.head_model_tag() == "model-a"
+        assert q.depth() == before
+        # FIFO order is intact after peeking.
+        assert (await q.pop_next()).slot_id == a.slot_id
+        assert await q.head_model_tag() == "model-b"
+
+    async def test_batch_cap_does_not_force_avoidable_swap(self):
+        """After max_consecutive_same_model same-model pops, a NON-starved
+        other-model head must NOT force a swap while same-model work is still
+        queued. FAILS before the fix (4th pop returned 'N'); PASSES after."""
+        q = TurbohaulQueue(
+            staging_max=100,
+            max_consecutive_same_model=3,
+            max_other_model_wait_s=3600.0,  # huge -> head never 'starved'
+        )
+        # FIFO: M M M N M  (other-model N buried behind 3 M's, one more M after)
+        for _ in range(3):
+            await q.enqueue(Slot.new("M"))
+        n = Slot.new("N")
+        await q.enqueue(n)
+        m_tail = Slot.new("M")
+        await q.enqueue(m_tail)
+
+        for _ in range(3):  # drain 3 M's -> consecutive-same run hits the cap
+            p = await q.pop_next(warm_model_tag="M")
+            assert p.model_tag == "M"
+
+        # 4th pop: head is now N (different, NOT starved) but m_tail is queued.
+        p4 = await q.pop_next(warm_model_tag="M")
+        assert p4.model_tag == "M"          # was "N" before the fix (avoidable swap)
+        assert p4.slot_id == m_tail.slot_id
+        # N is not starved -> served next (never dropped).
+        p5 = await q.pop_next(warm_model_tag="M")
+        assert p5.model_tag == "N"
+
+    async def test_starved_other_model_still_forces_swap(self):
+        """Genuine head-starvation (aged past max_other_model_wait_s) STILL forces
+        the swap even with same-model affinity active -> no other-model starvation."""
+        q = TurbohaulQueue(
+            staging_max=100,
+            max_consecutive_same_model=1000,  # count cap effectively off
+            max_other_model_wait_s=10.0,
+        )
+        n = Slot.new("N")
+        n.created_at = time.monotonic() - 100.0  # aged well past the window
+        await q.enqueue(n)
+        await q.enqueue(Slot.new("M"))
+        # resident=M, but the aged N head forces the swap.
+        p = await q.pop_next(warm_model_tag="M")
+        assert p.model_tag == "N"
 
 
 class TestGraceTimer:

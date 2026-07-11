@@ -5,8 +5,7 @@ export interface WsSubscription {
   close: () => void;
 }
 
-// Reconnect pattern verified against Logbook src/frontend/src/components/Dashcam/useDashcamStream.ts
-// (production-validated; exponential backoff 1s -> 30s cap).
+// Reconnect pattern: production-validated exponential backoff, 1s -> 30s cap.
 export function subscribeWsState(handler: WsHandler): WsSubscription {
   let ws: WebSocket | null = null;
   let stopped = false;

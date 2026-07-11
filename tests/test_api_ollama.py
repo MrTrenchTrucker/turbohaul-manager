@@ -48,8 +48,8 @@ def app_with_manifests(tmp_path):
     write_manifest_atomic(
         manifests_path,
         Manifest(
-            model_tag="qwen3.6-35b-moe",
-            display_name="Qwen 3.6 35B-A3B MoE",
+            model_tag="example-35b-moe",
+            display_name="Example 35B-A3B MoE",
             description="MoE Q4",
             gguf_blob_sha256=SAMPLE_SHA,
             gguf_size_bytes=22_000_000_000,
@@ -61,8 +61,8 @@ def app_with_manifests(tmp_path):
     write_manifest_atomic(
         manifests_path,
         Manifest(
-            model_tag="qwen-coder",
-            display_name="Qwen Coder",
+            model_tag="example-coder",
+            display_name="Example Coder",
             gguf_blob_sha256=SECOND_SHA,
             gguf_size_bytes=15_000_000_000,
             context_size=32768,
@@ -82,10 +82,10 @@ class TestApiTags:
         assert r.status_code == 200
         body = r.json()
         names = {m["name"] for m in body["models"]}
-        assert "qwen3.6-35b-moe" in names
-        assert "qwen-coder" in names
-        # Verify shape per v0.2 §9
-        moe = next(m for m in body["models"] if m["name"] == "qwen3.6-35b-moe")
+        assert "example-35b-moe" in names
+        assert "example-coder" in names
+        # Verify the response shape
+        moe = next(m for m in body["models"] if m["name"] == "example-35b-moe")
         assert moe["digest"].startswith("sha256:")
         assert moe["size"] == 22_000_000_000
         assert moe["details"]["format"] == "gguf"
@@ -119,11 +119,11 @@ class TestApiTags:
 class TestApiShow:
     def test_show_returns_manifest_details(self, app_with_manifests):
         app, client = app_with_manifests
-        r = client.get("/api/show?name=qwen3.6-35b-moe")
+        r = client.get("/api/show?name=example-35b-moe")
         assert r.status_code == 200
         body = r.json()
-        assert body["name"] == "qwen3.6-35b-moe"
-        assert body["display_name"] == "Qwen 3.6 35B-A3B MoE"
+        assert body["name"] == "example-35b-moe"
+        assert body["display_name"] == "Example 35B-A3B MoE"
         assert body["context_length"] == 131072
         assert body["expected_vram_bytes"] == 22_500_000_000
         assert body["llama_server_flags"]["ctx_size"] == 131072

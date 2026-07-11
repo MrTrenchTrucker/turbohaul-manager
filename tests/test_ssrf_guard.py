@@ -1,4 +1,4 @@
-"""Tests for ssrf_guard - URL safety validation (v0.2 §9.1)."""
+"""Tests for ssrf_guard - URL safety validation."""
 import socket
 from unittest.mock import patch
 
@@ -15,7 +15,7 @@ from turbohaul.ssrf_guard import (
 
 class TestIsBlockedIp:
     def test_rfc1918_blocked(self):
-        for ip in ["10.0.0.1", "10.0.0.5", "172.16.0.1", "192.168.1.50"]:
+        for ip in ["10.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.50"]:
             assert is_blocked_ip(ip), ip
 
     def test_loopback_blocked(self):
@@ -44,7 +44,7 @@ class TestIsBlockedIp:
         assert is_blocked_ip("fc00::1")
 
     def test_nat64_blocked(self):
-        """NAT64-encoded private-IP bypass class."""
+        """NAT64-encoded IPv4 bypass class."""
         assert is_blocked_ip("64:ff9b::1.2.3.4")  # NAT64-encoded 1.2.3.4
         assert is_blocked_ip("64:ff9b::a.b.c.d") if False else True
         assert is_blocked_ip("64:ff9b::101:101")  # 1.1.1.1 in NAT64 prefix
@@ -126,7 +126,7 @@ class TestValidatePullUrl:
 
     def test_ip_literal_private_rejected(self):
         with pytest.raises(UrlSafetyError, match="denied range"):
-            validate_pull_url("https://192.168.1.50/x")
+            validate_pull_url("https://10.1.2.3/x")
 
     def test_ip_literal_imds_rejected(self):
         with pytest.raises(UrlSafetyError):

@@ -1,7 +1,7 @@
 """FastAPI app for Turbohaul-Manager.
 
-Per v0.2 ARCHITECTURE.md §9 + §11. The /ui static-file serving layer adds SPA
-fallback + CSP + security headers.
+Serves the API plus /ui static files with SPA fallback, CSP, and security
+headers.
 """
 import asyncio
 import logging
@@ -15,6 +15,7 @@ from turbohaul.api.chat_completion import (
     make_llama_server_complete_fn,
     router as chat_completion_router,
 )
+from turbohaul.api.body_size_limit import BodySizeLimitMiddleware
 from turbohaul.api.config_put import router as config_put_router
 from turbohaul.api.embeddings import router as embeddings_router
 from turbohaul.api.import_ import router as import_router
@@ -34,10 +35,9 @@ from turbohaul.state import close_audit_pool, init_audit_pool
 log = logging.getLogger(__name__)
 
 
-# CSP adopted from a production-validated nginx.conf to inherit prod hardening.
-# Permits same-origin scripts, inline
-# styles (Tailwind injects), data: + blob: images, ws/wss connections same-origin,
-# self-hosted fonts. Denies object/embed and framing.
+# CSP adapted from a production-hardened nginx config. Permits same-origin
+# scripts, inline styles (Tailwind injects), data: + blob: images, ws/wss
+# connections same-origin, self-hosted fonts. Denies object/embed and framing.
 _CSP_HEADER = (
     "default-src 'self'; "
     "script-src 'self'; "
@@ -53,7 +53,7 @@ _CSP_HEADER = (
 
 
 def _ui_security_headers() -> dict[str, str]:
-    """Headers applied to every /ui/* response per v0.2 §11.2."""
+    """Headers applied to every /ui/* response."""
     return {
         "Content-Security-Policy": _CSP_HEADER,
         "X-Content-Type-Options": "nosniff",
@@ -87,7 +87,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Eager-init audit pool BEFORE boot_reconcile (which writes audit).
+        # Eager-init the audit pool BEFORE boot_reconcile (which writes audit).
         init_audit_pool(boot.storage.state_db_path)
         if auto_boot_reconcile:
             try:
@@ -106,11 +106,29 @@ def create_app(
                     "runtime.llama_server_binary_sha256 to empty for dev, "
                     "or correct the pinned value."
                 )
+            # Purge KV bins whose stamped build/model/ctx
+            # fingerprint no longer matches the current engine BEFORE serving — a
+            # llama-server binary rebuild (new engine_build_id) or a manifest
+            # ctx/gguf change would otherwise leave stale bins that, if restored,
+            # produce garbage KV. Gated by TURBOHAUL_FINGERPRINT_PURGE, best-effort,
+            # offloaded (sync file I/O). File sweep only — never touches the restore
+            # decision.
+            try:
+                purged = await asyncio.to_thread(
+                    mgr._purge_mismatched_bins, reason="startup"
+                )
+                if purged:
+                    log.info(
+                        "startup fingerprint purge: removed %d stale KV bin(s)",
+                        purged,
+                    )
+            except Exception:
+                log.exception("startup fingerprint purge failed (best-effort)")
         if auto_start_worker:
             mgr._worker_task = asyncio.create_task(mgr.worker_loop())
-            # Spawn the background sweeper alongside
-            # the worker_loop. Lifecycle is symmetric — shutdown() cancels
-            # both with contextlib.suppress(CancelledError).
+            # Spawn the background sweeper alongside the worker_loop.
+            # Lifecycle is symmetric — shutdown() cancels both with
+            # contextlib.suppress(CancelledError).
             mgr._sweeper_task = asyncio.create_task(
                 mgr._periodic_terminal_park_sweep()
             )
@@ -138,11 +156,13 @@ def create_app(
 
     app = FastAPI(
         title="Turbohaul-Manager",
-        description="Ollama-shape inference manager using TurboQuant llama.cpp (v0.2).",
+        description="Ollama-shape inference manager using TurboQuant llama.cpp.",
         version=__version__,
         lifespan=lifespan,
     )
     app.state.manager = mgr
+    # Reject 413 oversized bodies before routing/handlers on these two paths.
+    app.add_middleware(BodySizeLimitMiddleware)
     app.include_router(ollama_router)
     app.include_router(manifests_router)
     app.include_router(config_put_router)
@@ -162,12 +182,12 @@ def create_app(
 
     @app.get("/status")
     async def status() -> dict:
-        """Queue + active + grace + idle state per v0.2 §9.3."""
+        """Queue + active + grace + idle state."""
         return mgr.status_snapshot()
 
     @app.get("/api/version")
     async def api_version() -> dict:
-        """User-Agent / version info per v0.2 §9."""
+        """User-Agent / version info."""
         return {
             "version": __version__,
             "backend": "turboquant-llama-cpp",
@@ -185,9 +205,9 @@ def create_app(
         live_runtime = mgr.runtime
         return {
             "server": boot.server.model_dump(mode="json"),
-            # HAUL A-1: redact internal paths to basename. Disclosing full
-            # absolute paths gave a rebind-pivoting attacker the exact
-            # write targets on disk. UI only needs basenames anyway.
+            # Redact internal paths to basename. Disclosing full absolute
+            # paths gave a rebind-pivoting attacker the exact write targets
+            # on disk. UI only needs basenames anyway.
             "storage": {
                 "blob_store_path": boot.storage.blob_store_path.name,
                 "manifests_path": boot.storage.manifests_path.name,
@@ -205,9 +225,10 @@ def create_app(
             },
             "queue": live_runtime.queue.model_dump(mode="json"),
             "pull": live_runtime.pull.model_dump(mode="json"),
+            "persist": live_runtime.persist.model_dump(mode="json"),
         }
 
-    # Phase 5 §11: /ui static-file serving with SPA fallback + CSP.
+    # /ui static-file serving with SPA fallback + CSP.
     # Only registered when the bundle is enabled AND the static dir exists,
     # so tests that don't provision a ui_dist see no /ui route.
     if boot.ui.enabled and boot.ui.static_path.exists():

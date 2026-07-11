@@ -1,4 +1,4 @@
-"""Tests for BootConfig + RuntimeConfig schema (v0.2 §7 + §7.1)."""
+"""Tests for BootConfig + RuntimeConfig schema."""
 import pytest
 from pathlib import Path
 from pydantic import ValidationError
@@ -50,18 +50,18 @@ class TestQueueConfig:
     def test_v0_2_conservative_defaults(self):
         q = QueueConfig()
         assert q.grace_seconds == 30
-        # Bumped 120 → 300 → 600 default: with reasoning_budget=1000, Qwen3
-        # produces 5-7min inter-turn gaps on complex prompts, eating the 300s
-        # coverage. Covers OpenAI-SDK clients that can't send keep_alive
-        # natively (Ollama Issue #11458).
+        # Default raised over time: 120 → 300 → 600. A reasoning model with
+        # reasoning_budget=1000 can produce 5-7min inter-turn gaps on complex
+        # prompts, which would eat a 300s coverage window. Covers OpenAI-SDK
+        # clients that can't send keep_alive natively (Ollama Issue #11458).
         assert q.idle_hot_load_seconds == 600
         assert q.max_grace_extensions == 5
         assert q.drained_sigterm_window_active_s == 15
         assert q.drained_sigterm_window_cold_s == 5
 
-    def test_wave_4b5_keep_alive_max_constant(self):
-        # Module-level constant (not a Field — operational policy,
-        # not a per-deployment knob).
+    def test_keep_alive_max_constant(self):
+        # Module-level constant (not a Field — this is a fixed operational
+        # policy, deliberately not a per-deployment knob).
         assert KEEP_ALIVE_MAX_S == 1800
 
     def test_reject_unknown_field(self):
@@ -133,3 +133,13 @@ class TestEnvOverrides:
         cfg = load_config_yaml(temp_etc_config)
         cfg2 = apply_env_overrides(cfg)
         assert cfg2.queue.grace_seconds == cfg.queue.grace_seconds
+
+
+def test_persist_max_bytes_env_override(temp_etc_config, monkeypatch):
+    """Regression guard: the env var must land on the field the persist GC and
+    snapshot logic actually read (persist.max_bytes) — it originally mapped to a
+    dead queue field, making the operator env override a silent no-op."""
+    cfg = load_config_yaml(temp_etc_config)
+    monkeypatch.setenv("TURBOHAUL_KVCACHE_PERSIST_MAX_BYTES", "1073741824")
+    cfg2 = apply_env_overrides(cfg)
+    assert cfg2.persist.max_bytes == 1073741824

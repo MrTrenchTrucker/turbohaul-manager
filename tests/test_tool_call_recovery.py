@@ -1,8 +1,8 @@
-"""Tests for tool-call recovery post-processor.
+"""Tests for the tool-call recovery post-processor.
 
-Covers the 6 mandated vectors:
-  1. OpenAI canonical text-JSON shape extracted
-  2. Qwen <tool_call>...</tool_call> XML wrapper extracted
+Covers the 6 core vectors:
+  1. Canonical text-JSON shape extracted
+  2. <tool_call>...</tool_call> XML wrapper extracted
   3. Parallel calls (multiple JSONs in one response) — all picked up
   4. Idempotency: skip when tool_calls already populated
   5. Unknown name rejected (not in tools allowlist)
@@ -41,7 +41,7 @@ def _result_with_content(content, tool_calls=None, finish_reason="stop"):
 
 
 # ---------------------------------------------------------------------------
-# 1. OpenAI canonical text-JSON shape
+# 1. Canonical text-JSON shape
 # ---------------------------------------------------------------------------
 
 def test_canonical_text_json_extracted():
@@ -65,7 +65,7 @@ def test_canonical_text_json_extracted():
 
 
 # ---------------------------------------------------------------------------
-# 2. Qwen <tool_call> XML wrapper
+# 2. <tool_call> XML wrapper
 # ---------------------------------------------------------------------------
 
 def test_qwen_xml_wrapper_extracted():

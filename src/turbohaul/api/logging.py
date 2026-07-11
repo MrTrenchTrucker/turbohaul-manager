@@ -22,7 +22,7 @@ router = APIRouter(prefix="/v1", tags=["logging"])
 
 
 # Token-budget constants (FP mode 2 — envelope overhead subtracted upfront)
-MAX_RESPONSE_TOKENS = 20_000  # hard cap
+MAX_RESPONSE_TOKENS = 20_000  # hard cap on response size
 APPROX_CHARS_PER_TOKEN = 4
 MAX_RESPONSE_CHARS = MAX_RESPONSE_TOKENS * APPROX_CHARS_PER_TOKEN  # 80_000
 # 512 = JSON envelope overhead allocation (derivation):

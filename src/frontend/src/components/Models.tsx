@@ -14,9 +14,9 @@ import {
   type FlagCategory,
 } from '../flagsSchema';
 
-// Models tab — comprehensive structured editor mirroring BE
-// SAFE_LLAMA_FLAGS exactly, so the FE matches the BE
-// exactly. ~80 flags grouped by category. Primary flags featured at top.
+// Models tab — comprehensive structured editor mirroring the backend
+// SAFE_LLAMA_FLAGS exactly so the FE and BE stay in lockstep.
+// ~80 flags grouped by category. Primary flags featured at top.
 
 function fmtBytes(n?: number): string {
   if (!n) return '—';

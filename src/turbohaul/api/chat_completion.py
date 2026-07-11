@@ -1,7 +1,7 @@
-"""Chat-completion API routes - Ollama-compat + OpenAI-compat (v0.2 §9).
+"""Chat-completion API routes - Ollama-compat + OpenAI-compat.
 
-This module ships the non-streaming completion path and an SSE streaming
-pass-through. The existing manager.submit_and_wait + completion_fn DI is
+This module ships the non-streaming completion path. Streaming SSE comes in a
+future polish pass; the existing manager.submit_and_wait + completion_fn DI is
 streaming-ready (just return an async generator from completion_fn and adapt
 the route).
 
@@ -10,9 +10,9 @@ make_llama_server_complete_fn() which httpx-POSTs to the spawned llama-server's
 /v1/chat/completions on its assigned port. Tests inject a fake completion_fn
 that returns a canned response without spawning anything real.
 
-Typed upstream errors: in practice the sidecar exhibits RemoteProtocolError
-(sidecar OOM-crash during inference) much more often than HTTPStatusError 4xx.
-These need different client-facing status codes:
+Typed upstream errors: in practice, the live sidecar exhibits
+RemoteProtocolError (sidecar OOM-crash during inference) much more often than
+HTTPStatusError 4xx. These need different client-facing status codes:
   - 503 Service Unavailable + Retry-After  → sidecar disconnected / crashed
   - 502 Bad Gateway                         → sidecar returned upstream 4xx/5xx
   - 504 Gateway Timeout                     → request timed out at sidecar
@@ -21,8 +21,11 @@ These need different client-facing status codes:
 """
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -32,16 +35,23 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from turbohaul.config import KEEP_ALIVE_MAX_S  # re-exported for tests + manager
+from turbohaul.kv_policy import (
+    compute_ctx_len,       # shared admission/save size rule
+    _prefix_hash_chain,    # shared admission/save turn-hash chain (unified)
+)
 from turbohaul.live_monitor import (  # live-monitor text tee identity
     compute_generation_id,
     _read_spawn_seq,
 )
-from turbohaul.manifest import read_manifest  # handler-entry manifest read for thinking detect
-from turbohaul.slot import SlotEvictedError  # client-disconnect eviction exception
+from turbohaul.manifest import (  # handler-entry manifest read for thinking detect
+    ManifestValidationError,
+    read_manifest,
+)
+from turbohaul.slot import SlotEvictedError, derive_thread_id_prefix_hash  # first-message fingerprint
 from turbohaul.api.tool_call_recovery import maybe_recover_tool_calls
 
 
-# === client-disconnect watcher =============================================
+# === Client-disconnect watcher =============================================
 # Constant 2s cadence + direct request.is_disconnected() call. Wrapping
 # is_disconnected in asyncio.wait_for can leak the underlying ASGI receive()
 # coroutine on cancellation; Starlette already implements is_disconnected as
@@ -142,9 +152,9 @@ def _validate_json_schema(rf: dict) -> tuple[bool, str | None]:
     safe to forward to llama-server and (later, in `_complete`) to use for
     Draft202012Validator.validate against the model's returned JSON.
 
-    The jsonschema import is LAZY inside the function body — fail-soft against
-    the dep being absent during the writable-layer pip-install window (which can
-    precede the image-bake by up to 24h).
+    The jsonschema import is LAZY inside the function body — fail-soft
+    against the dep being absent during an early boot window (a writable-layer
+    pip-install may precede the image bake).
 
     `rf` is the FULL response_format dict; the schema lives at
     rf["json_schema"]["schema"] per the OpenAI structured-outputs envelope.
@@ -218,12 +228,89 @@ def _strip_thinking_wrapper(content: str) -> str:
     Uses `rsplit('</think>', 1)` so even malformed multi-tag content (an
     aborted think block followed by a real one) surfaces the LAST post-think
     payload. Returns the original string when no closing tag is present.
+
+    NOTE — rsplit-last is DELIBERATE here: the callers (`json_schema` validate +
+    retry) `json.loads` the single trailing payload, so keeping only the tail
+    after the FINAL `</think>` is exactly right. Do NOT switch this to remove-all
+    — the shadow-save + byte-match probe, which must instead mirror the client
+    harness's remove-ALL resend, use :func:`_strip_thinking_all`.
     """
     if not isinstance(content, str):
         return content
     if "</think>" in content:
         return content.rsplit("</think>", 1)[-1].lstrip()
     return content
+
+
+# Mirror the client harness's think-strip so the shadow-save + byte-match probe
+# predict the harness's think-STRIPPED resend byte-for-byte. The harness REMOVES
+# every `<think>...</think>` block via `re.sub(r'<think>.*?</think>', '',
+# flags=re.DOTALL | re.IGNORECASE)` and its callers then `.strip()` the result.
+# `_strip_thinking_wrapper`'s rsplit-last keeps only the tail after the LAST
+# `</think>`, which DIFFERS from remove-all on multi-block / pre-`<think>` content
+# and silently dropped the shadow byte-match (observed: single-block MATCH,
+# multi-block MISMATCH). Non-greedy `.*?` pairs each open with its OWN close (never
+# spans across a block); `re.IGNORECASE` matches the harness flag. Scoped to
+# `<think>` only: the shadow callers pre-guard on a literal `</think>` and only the
+# force-restore family emits that tag — the harness's other passes
+# (`<thinking>`/`<reasoning>`/tool-call XML/unterminated-tag) are no-ops on it, so
+# this single pass is a faithful subset (any residual under-strip safe-degrades to a
+# clean-restore + engine reprefill backstop, never a wrong answer).
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking_all(content: str) -> str:
+    """Remove ALL `<think>...</think>` blocks then `.strip()` — mirrors the client
+    harness resend (`strip_think_blocks(x).strip()`).
+
+    Unlike :func:`_strip_thinking_wrapper` (rsplit-last, keeps only the tail after
+    the FINAL `</think>`), this removes EVERY think block and preserves the visible
+    text between/before blocks, so multi-block (`<think>a</think>X<think>b</think>Y`
+    -> `XY`) and pre-`<think>` prose (`intro<think>t</think>ans` -> `introans`)
+    byte-match what the harness resends next turn.
+
+    Best-effort + None-safe (mirrors `_strip_thinking_wrapper`): a non-str passes
+    through unchanged; single-block content strips identically to the harness; no
+    think block -> the input with surrounding whitespace stripped (the harness always
+    `.strip()`s — the shadow callers never reach this branch, they pre-guard on
+    `</think>`); empty -> empty.
+    """
+    if not isinstance(content, str):
+        return content
+    return _THINK_BLOCK_RE.sub("", content).strip()
+
+
+def wrap_reasoning_think(reasoning: str, content: str) -> str:
+    """SINGLE SOURCE OF TRUTH for the ``<think>``-wrapped reasoning+content
+    history form.
+
+    Returns EXACTLY the bytes :func:`_merge_reasoning_into_content` writes to the
+    client response — which the client harness receives, strips at its storage
+    boundary (``_strip_think_blocks(content).strip()``) and resends think-free
+    next turn. The SAVE-side shadow reconstructions (manager
+    ``_generated_assistant_msg`` + the streaming accumulator) MUST emit these SAME
+    bytes so that ``_strip_thinking_all(shadow_form)`` equals the harness's
+    ``strip_think_blocks(merge_form).strip()`` BYTE-FOR-BYTE. The old no-newline
+    ``<think>{r}</think>{c}`` shadow form diverged from this newline merge form under
+    the remove-ALL strip on multi-block / stray-``</think>`` content (their strips
+    differ on the whitespace the strip leaves behind), which silently broke the cold
+    shadow restore's byte-match -> a reprefill instead of a strict-extension.
+
+    Form (identical bytes to the merge site — do NOT change):
+      reasoning + non-empty content -> ``<think>\\n{r.strip()}\\n</think>\\n\\n{content}``
+      reasoning + empty content     -> ``<think>\\n{r.strip()}\\n</think>``
+    The empty-vs-present branch is decided on ``content.strip()`` (mirrors the merge
+    site's ``if ct.strip():``), so all-whitespace content collapses to the empty form
+    exactly as the merge site does.
+
+    PURE: no I/O, no mutation, deterministic on ``(reasoning, content)``. The
+    ``reasoning`` truthiness + ``"<think>" not in content`` GUARD stays at each CALL
+    site (the three sites guard differently); this helper only FORMATS.
+    """
+    rc_stripped = reasoning.strip()
+    if content.strip():
+        return f"<think>\n{rc_stripped}\n</think>\n\n{content}"
+    return f"<think>\n{rc_stripped}\n</think>"
 
 
 # Cap on per-tool_call argument string size to bound memory + log spam when a
@@ -242,7 +329,7 @@ def _coerce_created_at(created_value: Any) -> Any:
     return created_value
 
 
-# === Ollama-style keep_alive parser ========================================
+# === Ollama-style keep_alive parser =========================================
 
 _KEEP_ALIVE_UNITS = {"s": 1, "m": 60, "h": 3600}  # read-only contract; do not mutate
 
@@ -291,6 +378,123 @@ def parse_keep_alive(value: Any) -> int | None:
     return None
 
 
+def _derive_client_meta_identity(payload: dict, messages: list, ip: str | None = None) -> dict:
+    """Parse OPTIONAL identity/classification fields out of an incoming request
+    into a client_meta fragment.
+
+    DORMANT FOUNDATION — decision-neutral. Nothing downstream reads these keys
+    yet; they are stored on ``client_meta`` only. Absent fields → ``None``, so
+    this is fully back-compat (zero behaviour change). Single source of truth so
+    the three ``client_meta`` build sites stay byte-identical (no drift).
+
+    The ``is_main`` / ``is_sub_agent`` / ``is_curator`` caller booleans are ALSO
+    dormant/decision-neutral here (explicit payload field only, None when the
+    caller omits them). A flag-gated curator route reads them off
+    ``client_meta`` via ``kv_classify._class_from_label``; with the flag OFF or
+    the fields absent they stay inert.
+
+    Knob-leak guard: NONE of these keys are in ``_COMMON_FORWARDED_KNOBS`` /
+    ``_STREAM_FORWARDED_KNOBS``, and BOTH the ``_complete`` loop and
+    ``_build_stream_payload`` forward to llama-server by ITERATING that
+    allow-list — so these identity keys can never reach the sidecar payload. Do
+    NOT add any of them to the knob allow-list.
+
+    All values are best-effort and None-safe; never raises on a missing or
+    malformed field.
+
+    NESTING: some callers send identity fields NESTED under
+    payload["client_meta"] (session_id, is_main, is_sub_agent, is_curator,
+    is_compression). This function reads from the nested client_meta with a
+    TOP-LEVEL fallback (back-compat), activating the is_* labels that were
+    previously dormant (never reached manager).
+
+    ``ip`` (an observability surface) is captured here — the caller's
+    ``request.client.host`` — from this ONE source of truth so all 3
+    client_meta build sites stay byte-identical (no drift). Same
+    dormant/decision-neutral contract as session_id/is_*: stored on
+    client_meta only, never referenced by the knob-forwarding allow-lists, so
+    it can never reach the llama-server payload.
+    """
+    # Read from nested client_meta with top-level fallback
+    cm = payload.get("client_meta") if isinstance(payload.get("client_meta"), dict) else {}
+    first = messages[0] if (messages and isinstance(messages[0], dict)) else None
+    return {
+        # Metadata about turn 0 / the system prompt. Explicit payload field wins;
+        # else minimally derive {role, content_len} from the first message.
+        # content_len reuses compute_ctx_len (the shared char-count rule) on the
+        # first turn so non-str / None content never raises. None if underivable.
+        "turn0_meta": payload.get("turn0_meta") or (
+            {"role": first.get("role"), "content_len": compute_ctx_len([first])}
+            if first is not None else None
+        ),
+        # Agent role — explicit harness field ONLY; do NOT infer from content.
+        "role": payload.get("role") if payload.get("role") is not None else cm.get("role"),
+        # Session identifier — DISTINCT from the derived thread_id; explicit only.
+        "session_id": payload.get("session_id") if payload.get("session_id") is not None else cm.get("session_id"),
+        # Compression-turn flag — explicit only; None when the harness omits it.
+        "is_compression": payload.get("is_compression") if payload.get("is_compression") is not None else cm.get("is_compression"),
+        # Identity-class booleans — explicit payload field ONLY, None when
+        # absent (mirrors is_compression). Dormant/back-compat: NOT in the knob
+        # allow-lists so they never reach llama-server; a flag-gated curator
+        # route consumes them via kv_classify._class_from_label.
+        "is_main": payload.get("is_main") if payload.get("is_main") is not None else cm.get("is_main"),
+        "is_sub_agent": payload.get("is_sub_agent") if payload.get("is_sub_agent") is not None else cm.get("is_sub_agent"),
+        "is_curator": payload.get("is_curator") if payload.get("is_curator") is not None else cm.get("is_curator"),
+        # The front-end per-role KV-save toggle. Manager-side ONLY (like the is_*
+        # labels) — NEVER in the knob allow-lists / never to llama-server.
+        # Read by _role_save_enabled off slot.client_meta; absent -> per-role default.
+        "save_kv": payload.get("save_kv") if payload.get("save_kv") is not None else cm.get("save_kv"),
+        # Context size — explicit field, else the cheap serialized-context char
+        # count (same rule as admission_ctx_len). Int (0 for empty), never None
+        # once messages exist.
+        "context_size": payload.get("context_size")
+        if payload.get("context_size") is not None
+        else compute_ctx_len(messages),
+        # Source IP, captured by the caller from request.client.host.
+        # Display/observability only — never in the knob allow-lists, never
+        # forwarded to llama-server.
+        "ip": ip,
+    }
+
+
+def _shadow_recompose_identity(base_thread_id: str, role, session_id) -> str:
+    """DORMANT identity-shadow / activation precursor. Computes a role-keyed
+    thread_id CANDIDATE that is LOGGED ONLY, never used. Today the manager
+    IP-fallback collapses every caller role (main/sub/compression) onto ONE
+    thread_id; the activation stage will fix that with a role-keyed thread_id.
+    This dormant stage first proves — from the emitted corpus — that this
+    recomposition only ever SPLITS an identity (never MERGES two) before we
+    switch it on.
+
+    Safe-by-construction:
+      * APPEND-ONLY — new_key STARTS WITH the full ``base_thread_id`` (today's
+        derived thread_id) and only APPENDS a suffix; it NEVER replaces the base,
+        so two distinct bases can never recompose to the same key (no MERGE).
+      * HASHED suffix — each field is a short SHA-256 hex prefix, so raw
+        session_id / role never leak and a value containing the '-'/'=' delimiter
+        cannot forge another field (delimiter-injection-proof).
+      * No fields present -> new_key == base (identity). Best-effort / None-safe;
+        a falsy role or session_id contributes nothing.
+
+    Unified: delegates to kv_classify.recompose_identity (single source of truth
+    — that pure function is byte-identical to the logic that lived here).
+    """
+    from turbohaul.kv_classify import recompose_identity
+    return recompose_identity(base_thread_id, role, session_id)
+
+
+def _m2b_active() -> bool:
+    """Is role-keyed identity ACTIVATION on? When True the computed
+    role+session-keyed new_key DRIVES the slot identity (thread_id); when False
+    it stays dormant (log-only). env TURBOHAUL_M2B_ACTIVE (default OFF) — a
+    runtime flag so it can be flipped OFF instantly if a MISMATCH/merge ever
+    shows. resolve_kv / the restore gate CODE is byte-identical either way;
+    ONLY the identity fed IN changes."""
+    return os.environ.get("TURBOHAUL_M2B_ACTIVE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 # === SSE tuning constants (module-level for monkeypatch-in-tests) ===
 
 # How long to wait for the slot to actually reach ACTIVE before we give up.
@@ -301,11 +505,11 @@ SLOT_READY_TIMEOUT_S = 7200.0
 # slow-thinking models on large contexts.
 STREAM_TIMEOUT_S = 3600.0
 # Emit `: keep-alive\n\n` SSE comments at this cadence while waiting for
-# `slot.stream_ready_event` to fire. Many clients set 30-60s read-timeouts
-# on streaming responses; without intermittent bytes the client disconnects
-# during cold-load (a 27B GGUF takes 30-60s to load). SSE comments are RFC
-# 8895 / EventSource-compliant; clients silently consume them and the
-# connection stays warm.
+# `slot.stream_ready_event` to fire. Many clients set 30-60s read-timeouts on
+# streaming responses; without intermittent bytes the client disconnects during
+# cold-load (a 27B GGUF takes 30-60s to load). SSE comments are RFC 8895 /
+# EventSource-compliant; clients silently consume them and the connection stays
+# warm.
 HEARTBEAT_INTERVAL_S = 12.0
 
 
@@ -374,23 +578,115 @@ async def openai_chat_completions(payload: dict, request: Request):
         raise HTTPException(status_code=400, detail="`model` field required")
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="`messages` must be a non-empty list")
-    # Best-effort prompt extraction for thread-id derivation
+    # model tag must exist in the manifest store — mirrors the
+    # read_manifest -> 404 pattern at embeddings.py:119 / ollama.py:68.
+    try:
+        read_manifest(mgr.boot.storage.manifests_path, model)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"model not found: {model}") from e
+    except ManifestValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    # Best-effort prompt extraction for thread-id derivation.
+    # OpenAI tool_call messages have content=null (None), not "". The
+    # .get("content", "") pattern returns None (not the default "") when content
+    # is explicitly null, which crashes " ".join() with TypeError. Coerce None
+    # to "" to tolerate tool-call assistant turns in multi-turn conversations.
     prompt = " ".join(
-        m.get("content", "") for m in messages if isinstance(m, dict)
+        (c if isinstance(c := m.get("content"), str) else "")
+        for m in messages if isinstance(m, dict)
     )
     thread_id = payload.get("thread_id") or ""
-    # Stable per-agent identity = the client container source IP, so a caller's
+    # Stable per-agent identity = the client container source IP, so an agent's
     # sequential turns grace-MATCH the same warm slot and reuse its KV prefix
     # cache (cache_reuse) instead of re-prefilling the full context each turn.
     # GATED on single-residency (cap<=1): at cap>=2 the full-prompt-hash identity
-    # (manager.submit) is kept so concurrent fan-out is NOT regressed. Falls back
-    # to hash if no IP.
+    # (manager.submit) is kept so concurrent sub-agent fan-out is NOT regressed.
+    # Falls back to hash if no IP.
     try:
         _single_residency = request.app.state.manager.runtime.queue.max_parallel_sidecars <= 1
     except Exception:
         _single_residency = True
-    if not thread_id and getattr(request, "client", None) and request.client.host and _single_residency:
-        thread_id = "agent-ip-" + request.client.host
+    if not thread_id and _single_residency:
+        # MULTI-SIGNAL identity: IP (role tier) + fingerprint of the STATIC first
+        # message (instance identity). IP-only collapses concurrent sub-agents
+        # into ONE thread_id -> cross-context KV mismatch -> positive stale ->
+        # CLEAR+reprefill. First-message fingerprint distinguishes sub-agents by
+        # persona AND keeps a conversation's follow-ups (same first msg + larger
+        # ctx) on ONE id -> KV reuse fires.
+        _ip = request.client.host if (getattr(request, "client", None) and request.client.host) else ""
+        _first_msg = next(
+            (m.get("content", "") for m in (messages or [])
+             if isinstance(m, dict) and isinstance(m.get("content"), str) and m.get("content").strip()),
+            "",
+        )
+        if _first_msg:
+            _fp = derive_thread_id_prefix_hash(_first_msg, payload.get("model", ""))
+            thread_id = ("agent-ip-" + _ip + "-" if _ip else "") + _fp
+        elif _ip:
+            thread_id = "agent-ip-" + _ip
+    # === DORMANT identity-shadow (decision-neutral) ==========================
+    # thread_id (old_key) is now finalized. Compute a role-keyed CANDIDATE and
+    # LOG old-vs-new ONLY — the shadow is NEVER assigned to thread_id nor passed
+    # anywhere (the activation stage enables it once this corpus proves it only
+    # SPLITS, never MERGES). Best-effort: any failure is swallowed so it can't
+    # break a request.
+    try:
+        old_key = thread_id
+        role = payload.get("role")
+        session_id = payload.get("session_id")
+        # Recover session_id from idle_hot resident when payload omits it.
+        # Tool-call re-cues arrive with session_id=None after the grace timer
+        # fires, but the warm idle resident has the original session_id. Match
+        # the incoming IP+fingerprint base thread_id against the idle resident's
+        # thread_id (which has the s={sha256} suffix). Without this recovery,
+        # _shadow_recompose_identity produces a session-LESS thread_id,
+        # durable_ring_key returns None, KV-bin owner-match fails vs the
+        # session-present bin → forced-full → full-context collapse.
+        if session_id is None:
+            try:
+                mgr = request.app.state.manager
+                if (getattr(mgr, "_idle_handle", None) is not None
+                        and getattr(mgr, "_idle_client_meta", None)
+                        and getattr(mgr, "_idle_thread_id", None)):
+                    _idle_cm = mgr._idle_client_meta
+                    _recovered = _idle_cm.get("session_id") if isinstance(_idle_cm, dict) else None
+                    _idle_tid = mgr._idle_thread_id
+                    # Match: incoming base thread_id is a prefix of the idle
+                    # thread_id (idle has the s-suffix from its original
+                    # derivation, incoming doesn't yet). Only recover when the
+                    # base matches — don't hijack a different agent's session.
+                    if _recovered and _idle_tid.startswith(old_key):
+                        session_id = _recovered
+                        log.info(
+                            "session_id recovered from idle-hot resident: "
+                            "thread_base=%s idle_thread=%s",
+                            old_key[:24], _idle_tid[:24],
+                        )
+            except Exception:
+                log.debug("session_id recovery failed (ignored)", exc_info=True)
+        new_key = _shadow_recompose_identity(old_key, role, session_id)
+        # When TURBOHAUL_M2B_ACTIVE, the role+session-keyed new_key DRIVES the
+        # slot identity (warm-path role isolation). resolve_kv / the restore gate
+        # CODE is byte-identical — ONLY the thread_id fed IN changes. Append-only
+        # (new_key STARTS WITH old_key) + proven no-merge on live corpus: a SPLIT
+        # mints a NEW identity (-> no bin -> fresh reprefill + saves own, never a
+        # wrong-restore); a stable-key continuation keeps warm reuse. Flag-gated
+        # so it can be flipped OFF instantly on any MISMATCH/merge.
+        _m2b = _m2b_active()
+        if _m2b and new_key != old_key:
+            thread_id = new_key
+        log.info(
+            "identity_recompose old_h=%s new_h=%s role=%s session_present=%s "
+            "ip_present=%s m2b_active=%s",
+            hashlib.sha256(old_key.encode()).hexdigest()[:12],
+            hashlib.sha256(new_key.encode()).hexdigest()[:12],
+            role if role else "-",
+            bool(session_id),
+            bool(locals().get("_ip")),
+            _m2b,
+        )
+    except Exception:
+        log.debug("identity_recompose failed (ignored)", exc_info=True)
     # response_format pre-validation. Fires for BOTH stream + non-stream so SSE
     # clients cannot bypass via the wants_stream fork. Strict shape:
     # {type:"json_object"} accepted, {type:"text"} normalized to None (OpenAI
@@ -414,7 +710,7 @@ async def openai_chat_completions(payload: dict, request: Request):
         elif rf_type == "json_schema":
             # Validate caller schema; on bad → 422 schema_validation_failed.
             # On ok, response_format propagates via the existing
-            # _COMMON_FORWARDED_KNOBS tuple (no separate forwarding code path).
+            # _COMMON_FORWARDED_KNOBS tuple (no separate forwarding code path needed).
             ok, reason = _validate_json_schema(rf)
             if not ok:
                 raise HTTPException(
@@ -489,20 +785,28 @@ async def openai_chat_completions(payload: dict, request: Request):
         # check. {} ⇒ retry disabled (non-thinking or read-fail).
         "thinking_manifest": thinking_manifest,
         # Forward tools-family knobs into client_meta so the _complete closure
-        # includes them in the llama-server payload AND so maybe_recover_tool_calls
-        # can read the advertised tools allowlist. Mirrors the /api/chat endpoint
-        # client_meta build — the OpenAI endpoint otherwise dropped tools.
+        # includes them in the llama-server payload AND so
+        # maybe_recover_tool_calls can read the advertised tools allowlist.
+        # Mirrors the /api/chat endpoint client_meta build — the OpenAI endpoint
+        # otherwise silently dropped tools on the floor.
         "tools": payload.get("tools"),
         "tool_choice": payload.get("tool_choice"),
         "parallel_tool_calls": payload.get("parallel_tool_calls"),
         "function_call": payload.get("function_call"),
         "functions": payload.get("functions"),
+        # DORMANT identity/classification foundation. Decision-neutral: stored
+        # only, read nowhere; NOT in the knob allow-list so it never reaches the
+        # llama-server payload. See _derive_client_meta_identity.
+        **_derive_client_meta_identity(
+            payload, messages,
+            ip=request.client.host if (getattr(request, "client", None) and request.client.host) else None,
+        ),
     }
 
     # Client-disconnect watcher. Event constructed IN-HANDLER so it's bound to
     # the route's request-loop (correct-loop guarantee). watch_disconnect polls
-    # request.is_disconnected() every 2s; if client closes, sets the Event which
-    # queue.pop_next sees and evicts the slot.
+    # request.is_disconnected() every 2s; if the client closes, it sets the Event
+    # which queue.pop_next sees and evicts the slot.
     disconnect_event = asyncio.Event()
     watch_task = asyncio.create_task(watch_disconnect(request, disconnect_event))
     try:
@@ -510,8 +814,15 @@ async def openai_chat_completions(payload: dict, request: Request):
             model_tag=model,
             prompt=prompt,
             thread_id=thread_id,
+            context=list(messages),
             client_meta=client_meta,
             disconnect_event=disconnect_event,
+            admission_ctx_len=compute_ctx_len(messages),
+            # Incoming turn-hash chain (parallel to admission_ctx_len) so the
+            # manager restore path classifies by prefix-VALIDITY vs the pinned
+            # clean bin. Same _prefix_hash_chain used at save time, so both sides
+            # of the comparison are byte-identical hashes.
+            admission_hash_chain=_prefix_hash_chain(messages),
         )
     except SlotEvictedError as e:
         # Client closed connection before slot activated; surface as HTTP 499
@@ -575,14 +886,14 @@ async def openai_chat_completions(payload: dict, request: Request):
 # (forwarded everywhere) and _STREAM_ONLY (only included in the streaming
 # payload). `_complete` iterates _COMMON only so non-streaming requests never
 # inherit stream-only keys; the streaming payload-build helper uses the derived
-# _STREAM_FORWARDED_KNOBS alias. Drift between the two lists is now structurally
-# impossible.
+# _STREAM_FORWARDED_KNOBS alias. Drift between the two lists is now
+# structurally impossible.
 _COMMON_FORWARDED_KNOBS = (
     # Core OpenAI-compat
     "temperature", "top_p", "top_k", "max_tokens", "min_p",
-    # Accept-and-forward only; handler-entry validator rejects json_schema as
-    # deferred. Thinking-mode JSON guarantee blocked upstream on llama.cpp
-    # #20345 + Ollama #10538.
+    # Accept-and-forward only; the handler-entry validator rejects json_schema
+    # as deferred. Thinking-mode JSON guarantee blocked upstream on
+    # llama.cpp #20345 + Ollama #10538.
     "response_format",
     # Preserved-thinking controls
     "thinking_budget_tokens", "reasoning_budget", "reasoning",
@@ -592,10 +903,11 @@ _COMMON_FORWARDED_KNOBS = (
     "mirostat", "mirostat_lr", "mirostat_ent",
     # max-output alias
     "n_predict",
-    # Tool-call pass-through: forward the field to a model that supports
-    # tool_calls natively, e.g. Qwen3.6-27b-dense. llama-server mirrors OpenAI's
-    # schema, so structured values (list/dict/string) just pass through
-    # unchanged.
+    # Tool-call pass-through (minimal — full capability advertisement +
+    # size-cap + per-model gating deferred to a follow-on; this is "forward the
+    # field to a model that supports tool_calls natively, e.g. a 27B dense
+    # model"). llama-server mirrors OpenAI's schema, so structured values
+    # (list/dict/string) just pass through unchanged.
     "tools", "tool_choice", "parallel_tool_calls",
     "function_call", "functions",
 )
@@ -652,10 +964,10 @@ async def _openai_chat_completions_stream(
     ``slot.stream_done_event`` so the manager can advance ACTIVE → GRACE.
 
     Wrapper ``_merge_reasoning_into_content`` is intentionally SKIPPED on the
-    streaming path: most modern streaming consumers (Hermes, langchain, Open
-    WebUI, OpenAI SDK) parse ``delta.content`` and ``delta.reasoning_content``
-    independently. Per-chunk merge would require accumulator/reorder state
-    and would break the token-by-token UX.
+    streaming path: most modern streaming consumers (agent harnesses, langchain,
+    Open WebUI, OpenAI SDK) parse ``delta.content`` and
+    ``delta.reasoning_content`` independently. Per-chunk merge would require
+    accumulator/reorder state and would break the token-by-token UX.
     """
     client_meta = {
         "kind": "openai-chat-completion-stream",
@@ -666,16 +978,23 @@ async def _openai_chat_completions_stream(
         "top_p": payload.get("top_p"),
         "max_tokens": payload.get("max_tokens"),
         # Ollama-style keep_alive → IDLE_HOT extension hint. The streaming path
-        # is Hermes-class agents' primary entry; this fix is the whole point of
-        # the keep-alive work.
+        # is agent clients' primary entry, so this hint matters most here.
         "keep_alive_s": parse_keep_alive(payload.get("keep_alive")),
         # All forwardable knobs carried for the streaming payload helper.
         **{k: payload.get(k) for k in _STREAM_FORWARDED_KNOBS if payload.get(k) is not None},
+        # DORMANT identity/classification foundation. Decision-neutral: stored
+        # only, read nowhere; NOT in the knob allow-list so it never reaches the
+        # llama-server payload. See _derive_client_meta_identity.
+        **_derive_client_meta_identity(
+            payload, messages,
+            ip=request.client.host if (getattr(request, "client", None) and request.client.host) else None,
+        ),
     }
 
     # Client-disconnect eviction for the STREAMING path. The non-streaming path
-    # wires this too; without it a streaming slot that sat QUEUED behind a client
-    # that already hung up could never be evicted. Carry a disconnect_event into
+    # wires this too, but the streaming path historically did NOT, so a streaming
+    # slot that sat QUEUED behind a client that already hung up could never be
+    # evicted. Carry a disconnect_event into
     # submit so the queue marks the slot is_evicted on disconnect; the fan-out
     # admit then SKIPS dead-client riders instead of burning a --parallel slot.
     # The watcher task is started after a successful submit (covers the
@@ -687,8 +1006,15 @@ async def _openai_chat_completions_stream(
             model_tag=model,
             prompt=prompt,
             thread_id=thread_id,
+            context=list(messages),
             client_meta=client_meta,
             disconnect_event=disconnect_event,
+            admission_ctx_len=compute_ctx_len(messages),
+            # Incoming turn-hash chain (parallel to admission_ctx_len) so the
+            # manager restore path classifies by prefix-VALIDITY vs the pinned
+            # clean bin. Same _prefix_hash_chain used at save time, so both sides
+            # of the comparison are byte-identical hashes.
+            admission_hash_chain=_prefix_hash_chain(messages),
         )
     except SidecarUnavailableError as e:
         raise HTTPException(
@@ -725,6 +1051,13 @@ async def _openai_chat_completions_stream(
         gen_id_for_tee = None
         first_token_received = False
         prefill_start = time.monotonic()
+        # Accumulate the streamed generated assistant text (content +
+        # reasoning) so the manager can reconstruct the engine-view warm_chain for
+        # the STREAMING forced clean-restore. Best-effort, fail-open — a parse miss
+        # just leaves the warm state unknown (gate safe-degrades to no-force).
+        _gen_content: list[str] = []
+        _gen_reasoning: list[str] = []
+        _sse_carry = ""
         try:
             # Wait for worker_loop to bring slot to ACTIVE + assign handle.
             # Emit `: keep-alive\n\n` SSE comments every HEARTBEAT_INTERVAL_S so
@@ -771,10 +1104,10 @@ async def _openai_chat_completions_stream(
             # not the singleton. At cap>=2 the dispatcher never bumps the
             # singleton's spawn_seq (stays 0) while the metrics supervisor hashes
             # the model_tag resident's bumped spawn_seq; using _read_spawn_seq(mgr)
-            # (=singleton) here would make the text-plane tee feed a DIFFERENT
-            # generation_id than the SSE anchor, so the live pane would subscribe
-            # to an unfed buffer and show nothing. _spawn_seq_for_model unifies
-            # both planes (byte-identical at cap<=1).
+            # (=singleton) here made the text-plane tee feed a DIFFERENT
+            # generation_id than the SSE anchor, so the live pane subscribed to an
+            # unfed buffer and showed nothing. _spawn_seq_for_model unifies both
+            # planes (byte-identical at cap<=1).
             gen_id_for_tee = compute_generation_id(
                 handle.pid, mgr._spawn_seq_for_model(model), slot.slot_id or slot.thread_id
             )
@@ -787,14 +1120,14 @@ async def _openai_chat_completions_stream(
                 # during the STREAM OPEN, not the byte loop.
                 # ``client.stream(...).__aenter__()`` blocks until llama-server
                 # returns the response, which it withholds for the ENTIRE prefill
-                # (no headers/bytes until generation begins — observed 54.6s
+                # (no headers/bytes until generation begins — observed: ~55s
                 # silent on a 60K prompt, ALL of it inside the open). So we open
                 # the stream MANUALLY and emit ': keep-alive' every
-                # HEARTBEAT_INTERVAL_S while the open is pending. asyncio.shield
-                # keeps the open alive across a tick (never cancel it on a tick).
-                # httpx errors from the open still propagate to the outer except
-                # handlers below. Mirrors the existing slot-ready heartbeat
-                # pattern.
+                # HEARTBEAT_INTERVAL_S while the
+                # open is pending. asyncio.shield keeps the open alive across a tick
+                # (never cancel it on a tick). httpx errors from the open still
+                # propagate to the outer except handlers below. Mirrors the existing
+                # slot-ready heartbeat pattern.
                 stream_cm = client.stream(
                     "POST", url, json=stream_payload, timeout=STREAM_TIMEOUT_S,
                 )
@@ -827,8 +1160,8 @@ async def _openai_chat_completions_stream(
                     # the upstream returned a 4xx/5xx.
                     if r.status_code >= 400:
                         # Cap the error-body read so a stalled 4xx/5xx body can't
-                        # block un-heartbeated until STREAM_TIMEOUT_S (error
-                        # bodies are tiny + already generated; empty on timeout).
+                        # block un-heartbeated until STREAM_TIMEOUT_S (error bodies
+                        # are tiny + already generated; empty on timeout).
                         try:
                             body_bytes = await asyncio.wait_for(
                                 r.aread(), timeout=HEARTBEAT_INTERVAL_S
@@ -882,6 +1215,28 @@ async def _openai_chat_completions_stream(
                                     mgr.live_output.feed(gen_id_for_tee, chunk_bytes)
                                 except Exception:
                                     pass
+                                # Parse the SSE deltas to accumulate the
+                                # generated content + reasoning (for warm_chain). Yield
+                                # + tee happen FIRST; this is passive + fail-open and
+                                # never touches the bytes handed to the client.
+                                try:
+                                    _txt = _sse_carry + chunk_bytes.decode("utf-8", errors="replace")
+                                    _lines = _txt.split("\n")
+                                    _sse_carry = _lines.pop()  # last (possibly partial) line
+                                    for _ln in _lines:
+                                        _ln = _ln.strip()
+                                        if not _ln.startswith("data:"):
+                                            continue
+                                        _pl = _ln[5:].strip()
+                                        if not _pl or _pl == "[DONE]":
+                                            continue
+                                        _delta = (json.loads(_pl).get("choices") or [{}])[0].get("delta") or {}
+                                        if _delta.get("content"):
+                                            _gen_content.append(_delta["content"])
+                                        if _delta.get("reasoning_content"):
+                                            _gen_reasoning.append(_delta["reasoning_content"])
+                                except Exception:
+                                    pass  # fail-open: warm state stays unknown -> no force
                             next_read = asyncio.ensure_future(aiter.__anext__())
                     finally:
                         if not next_read.done():
@@ -951,6 +1306,23 @@ async def _openai_chat_completions_stream(
             watch_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await watch_task
+            # Stash the accumulated generated turn (with <think>) on the slot
+            # BEFORE signaling done, so the manager (which wakes on
+            # stream_done_event) computes the engine-view warm_chain for the
+            # streaming no-downgrade gate. Use the SINGLE-SOURCE
+            # wrap_reasoning_think (the exact _merge_reasoning_into_content
+            # newline form) so this shadow reconstruction byte-matches what the
+            # harness stores/resends after its think-strip — the old no-newline
+            # `<think>{r}</think>{c}` form diverged on multi-block / stray-tag
+            # content. Empty -> left None (warm unknown).
+            try:
+                _c = "".join(_gen_content)
+                _r = "".join(_gen_reasoning)
+                _merged = wrap_reasoning_think(_r, _c) if (_r and "<think>" not in _c) else _c
+                if _merged:
+                    slot.streamed_assistant_text = _merged
+            except Exception:
+                pass
             # Signal worker_loop to advance the slot ACTIVE → GRACE.
             # Idempotent: setting an already-set Event is a no-op.
             if slot.stream_done_event is not None and not slot.stream_done_event.is_set():
@@ -988,20 +1360,112 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
     messages = payload.get("messages")
     if not model or not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="`model` + `messages` required")
-    prompt = " ".join(m.get("content", "") for m in messages if isinstance(m, dict))
+    # model tag must exist in the manifest store — mirrors the
+    # read_manifest -> 404 pattern at embeddings.py:119 / ollama.py:68.
+    try:
+        read_manifest(mgr.boot.storage.manifests_path, model)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"model not found: {model}") from e
+    except ManifestValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    # OpenAI tool_call messages have content=null (None), not "". Coerce None to
+    # "" to tolerate tool-call assistant turns.
+    prompt = " ".join(
+        (c if isinstance(c := m.get("content"), str) else "")
+        for m in messages if isinstance(m, dict)
+    )
     thread_id = payload.get("thread_id") or ""
-    # Stable per-agent identity = the client container source IP, so a caller's
+    # Stable per-agent identity = the client container source IP, so an agent's
     # sequential turns grace-MATCH the same warm slot and reuse its KV prefix
     # cache (cache_reuse) instead of re-prefilling the full context each turn.
     # GATED on single-residency (cap<=1): at cap>=2 the full-prompt-hash identity
-    # (manager.submit) is kept so concurrent fan-out is NOT regressed. Falls back
-    # to hash if no IP.
+    # (manager.submit) is kept so concurrent sub-agent fan-out is NOT regressed.
+    # Falls back to hash if no IP.
     try:
         _single_residency = request.app.state.manager.runtime.queue.max_parallel_sidecars <= 1
     except Exception:
         _single_residency = True
-    if not thread_id and getattr(request, "client", None) and request.client.host and _single_residency:
-        thread_id = "agent-ip-" + request.client.host
+    if not thread_id and _single_residency:
+        # MULTI-SIGNAL identity: IP (role tier) + fingerprint of the STATIC first
+        # message (instance identity). IP-only collapses concurrent sub-agents
+        # into ONE thread_id -> cross-context KV mismatch -> positive stale ->
+        # CLEAR+reprefill. First-message fingerprint distinguishes sub-agents by
+        # persona AND keeps a conversation's follow-ups (same first msg + larger
+        # ctx) on ONE id -> KV reuse fires.
+        _ip = request.client.host if (getattr(request, "client", None) and request.client.host) else ""
+        _first_msg = next(
+            (m.get("content", "") for m in (messages or [])
+             if isinstance(m, dict) and isinstance(m.get("content"), str) and m.get("content").strip()),
+            "",
+        )
+        if _first_msg:
+            _fp = derive_thread_id_prefix_hash(_first_msg, payload.get("model", ""))
+            thread_id = ("agent-ip-" + _ip + "-" if _ip else "") + _fp
+        elif _ip:
+            thread_id = "agent-ip-" + _ip
+    # === DORMANT identity-shadow (decision-neutral) ==========================
+    # thread_id (old_key) is now finalized. Compute a role-keyed CANDIDATE and
+    # LOG old-vs-new ONLY — the shadow is NEVER assigned to thread_id nor passed
+    # anywhere (the activation stage enables it once this corpus proves it only
+    # SPLITS, never MERGES). Best-effort: any failure is swallowed so it can't
+    # break a request.
+    try:
+        old_key = thread_id
+        role = payload.get("role")
+        session_id = payload.get("session_id")
+        # Recover session_id from idle_hot resident when payload omits it.
+        # Tool-call re-cues arrive with session_id=None after the grace timer
+        # fires, but the warm idle resident has the original session_id. Match
+        # the incoming IP+fingerprint base thread_id against the idle resident's
+        # thread_id (which has the s={sha256} suffix). Without this recovery,
+        # _shadow_recompose_identity produces a session-LESS thread_id,
+        # durable_ring_key returns None, KV-bin owner-match fails vs the
+        # session-present bin → forced-full → full-context collapse.
+        if session_id is None:
+            try:
+                mgr = request.app.state.manager
+                if (getattr(mgr, "_idle_handle", None) is not None
+                        and getattr(mgr, "_idle_client_meta", None)
+                        and getattr(mgr, "_idle_thread_id", None)):
+                    _idle_cm = mgr._idle_client_meta
+                    _recovered = _idle_cm.get("session_id") if isinstance(_idle_cm, dict) else None
+                    _idle_tid = mgr._idle_thread_id
+                    # Match: incoming base thread_id is a prefix of the idle
+                    # thread_id (idle has the s-suffix from its original
+                    # derivation, incoming doesn't yet). Only recover when the
+                    # base matches — don't hijack a different agent's session.
+                    if _recovered and _idle_tid.startswith(old_key):
+                        session_id = _recovered
+                        log.info(
+                            "session_id recovered from idle-hot resident: "
+                            "thread_base=%s idle_thread=%s",
+                            old_key[:24], _idle_tid[:24],
+                        )
+            except Exception:
+                log.debug("session_id recovery failed (ignored)", exc_info=True)
+        new_key = _shadow_recompose_identity(old_key, role, session_id)
+        # When TURBOHAUL_M2B_ACTIVE, the role+session-keyed new_key DRIVES the
+        # slot identity (warm-path role isolation). resolve_kv / the restore gate
+        # CODE is byte-identical — ONLY the thread_id fed IN changes. Append-only
+        # (new_key STARTS WITH old_key) + proven no-merge on live corpus: a SPLIT
+        # mints a NEW identity (-> no bin -> fresh reprefill + saves own, never a
+        # wrong-restore); a stable-key continuation keeps warm reuse. Flag-gated
+        # so it can be flipped OFF instantly on any MISMATCH/merge.
+        _m2b = _m2b_active()
+        if _m2b and new_key != old_key:
+            thread_id = new_key
+        log.info(
+            "identity_recompose old_h=%s new_h=%s role=%s session_present=%s "
+            "ip_present=%s m2b_active=%s",
+            hashlib.sha256(old_key.encode()).hexdigest()[:12],
+            hashlib.sha256(new_key.encode()).hexdigest()[:12],
+            role if role else "-",
+            bool(session_id),
+            bool(locals().get("_ip")),
+            _m2b,
+        )
+    except Exception:
+        log.debug("identity_recompose failed (ignored)", exc_info=True)
     # Ollama accepts keep_alive at top level OR nested under options.
     ka_raw = payload.get("keep_alive")
     if ka_raw is None and isinstance(payload.get("options"), dict):
@@ -1050,9 +1514,9 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
                     "received_type": str(rf_type),
                 },
             )
-    # Streaming + tools is deferred. Cheap defensive guard before
-    # submit_and_wait so callers get a clean 400 instead of a confusing
-    # partial-tool stream.
+    # Streaming + tools is not yet supported on this endpoint. Cheap defensive
+    # guard before submit_and_wait so callers get a clean 400 instead of a
+    # confusing partial-tool stream.
     if payload.get("stream") and any(
         payload.get(k)
         for k in ("tools", "tool_choice", "parallel_tool_calls",
@@ -1063,15 +1527,15 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
             detail={
                 "error": "streaming_with_tools_deferred",
                 "message": (
-                    "Ollama-shape streaming + tool_calls deferred. "
+                    "Ollama-shape streaming + tool_calls is not yet supported. "
                     "Use stream=false for tool requests or /v1/chat/completions "
                     "for OpenAI-shape streaming-tools."
                 ),
-                "follow_on_rc": "planned",
+                "follow_on": "planned",
             },
         )
-    # Mirror of the OpenAI manifest read — slice reasoning_budget for the
-    # in-_complete retry-path gate. Only fires for json_schema requests.
+    # Mirror of Site A manifest read — slice reasoning_budget for in-_complete
+    # retry-path gate. Only fires for json_schema requests.
     thinking_manifest: dict = {}
     if (
         isinstance(payload.get("response_format"), dict)
@@ -1105,12 +1569,19 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
         "function_call": payload.get("function_call"),
         "functions": payload.get("functions"),
         # Forward validated response_format. Same rationale as the OpenAI path —
-        # handler-entry validator alone does not propagate the field; the
+        # the handler-entry validator alone does not propagate the field; the
         # explicit add line keeps the non-stream ollama path honest.
         "response_format": payload.get("response_format"),
         # Manifest reasoning_budget slice for in-_complete is_thinking_payload
-        # gate. {} ⇒ retry disabled.
+        # gate. Mirrors the OpenAI path; {} ⇒ retry disabled.
         "thinking_manifest": thinking_manifest,
+        # DORMANT identity/classification foundation. Decision-neutral: stored
+        # only, read nowhere; NOT in the knob allow-list so it never reaches the
+        # llama-server payload. See _derive_client_meta_identity.
+        **_derive_client_meta_identity(
+            payload, messages,
+            ip=request.client.host if (getattr(request, "client", None) and request.client.host) else None,
+        ),
     }
     # Client-disconnect watcher (ollama_chat mirror of the OpenAI path).
     disconnect_event = asyncio.Event()
@@ -1120,8 +1591,15 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
             model_tag=model,
             prompt=prompt,
             thread_id=thread_id,
+            context=list(messages),
             client_meta=client_meta,
             disconnect_event=disconnect_event,
+            admission_ctx_len=compute_ctx_len(messages),
+            # Incoming turn-hash chain (parallel to admission_ctx_len) so the
+            # manager restore path classifies by prefix-VALIDITY vs the pinned
+            # clean bin. Same _prefix_hash_chain used at save time, so both sides
+            # of the comparison are byte-identical hashes.
+            admission_hash_chain=_prefix_hash_chain(messages),
         )
     except SlotEvictedError as e:
         # Client closed before activation → HTTP 499
@@ -1154,7 +1632,7 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=f"sidecar failed: {e}") from e
     finally:
-        # Tear down disconnect watcher (ollama_chat).
+        # Tear down the disconnect watcher (ollama_chat).
         watch_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await watch_task
@@ -1167,12 +1645,12 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
 
     # Adapt OpenAI-shape response → Ollama shape with full tool-call
     # translation, arg JSON coercion, size-cap, id preservation, finish_reason
-    # → done_reason mapping, and ISO-8601 created_at. Error guard: if
-    # completion_fn surfaced an error dict (no choices), pass it through
-    # unchanged so the caller still sees the upstream detail.
+    # → done_reason mapping, and ISO-8601 created_at.
+    # Error guard: if completion_fn surfaced an error dict (no choices), pass it
+    # through unchanged so the caller still sees the upstream detail.
     if isinstance(result, dict) and "error" in result:
         return result
-    if "choices" in result:
+    if "choices" in result and result["choices"]:
         choice = result["choices"][0]
         msg = choice.get("message", {}) if isinstance(choice, dict) else {}
         content = msg.get("content", "")
@@ -1243,11 +1721,11 @@ def _merge_reasoning_into_content(
 ) -> None:
     """Merge thinking-model reasoning_content into content.
 
-    Thinking-models (Qwen3, deepseek-r1, Gemma-thinking, etc.) split output
-    between `message.content` (final answer, often empty during thinking)
-    and `message.reasoning_content` (the chain-of-thought). Client parsers
-    that read only `.content` (Hermes-class workers, langchain default,
-    OpenAI SDK) see empty and bail → retry storm → no usable output.
+    Thinking-models (reasoning-style models in general) split output between
+    `message.content` (final answer, often empty during thinking) and
+    `message.reasoning_content` (the chain-of-thought). Client parsers that read
+    only `.content` (many agent harnesses, langchain default, OpenAI SDK) see
+    empty and bail → retry storm → no usable output.
 
     Wrap reasoning_content inline as `<think>...</think>` tags so EVERY
     client sees a non-empty content string. Preserve reasoning_content
@@ -1256,12 +1734,14 @@ def _merge_reasoning_into_content(
     No-op if reasoning_content is empty (non-thinking models) or content
     is already populated alongside reasoning_content (some configs).
 
-    Skip merge when the caller requested
+    Guards against an empty-response edge case observed under load.
+
+    Skip the merge when the caller requested
     `response_format = {"type": "json_object"}`. The `<think>...</think>`
     wrapper would prepend non-JSON tokens to the content and break the
-    contract that response_format clients depend on. The thinking-mode JSON
-    guarantee is blocked upstream on llama.cpp #20345 + Ollama #10538; this
-    function's job is at minimum not to corrupt the path.
+    contract that response_format clients depend on. The json_schema retry path
+    owns the thinking-mode JSON guarantee (blocked upstream on llama.cpp #20345 +
+    Ollama #10538); this merge's job is at minimum not to corrupt the path.
     """
     if not isinstance(result, dict):
         return
@@ -1289,12 +1769,13 @@ def _merge_reasoning_into_content(
         rc_stripped = rc.strip()
         if not rc_stripped:
             continue  # no thinking to merge
-        if ct.strip():
-            # Final answer already populated — prepend thinking as context
-            msg["content"] = f"<think>\n{rc_stripped}\n</think>\n\n{ct}"
-        else:
-            # Final answer empty — surface the thinking so client sees something
-            msg["content"] = f"<think>\n{rc_stripped}\n</think>"
+        # Single-source formatter. Behaviour-preserving extraction —
+        # wrap_reasoning_think reproduces this site's exact bytes (rc.strip() + the
+        # ct.strip() with/without-content branch), so the client-facing response
+        # does not change one byte. The shadow sites now call the SAME helper, so a
+        # shadow reconstruction can never drift from what the harness
+        # stores/resends.
+        msg["content"] = wrap_reasoning_think(rc, ct)
 
 
 def make_llama_server_complete_fn(
@@ -1318,10 +1799,10 @@ def make_llama_server_complete_fn(
         }
         # Iterate the canonical _COMMON_FORWARDED_KNOBS list (which already
         # covers tools/tool_choice/parallel_tool_calls/function_call/functions).
-        # Earlier this loop duplicated an open-coded knob tuple that had drifted
-        # from the source of truth — tools knobs were dropped here. Single-list
-        # invariant now. Stream-only knobs (`stream`, `stream_options`) are
-        # deliberately excluded; this path is non-streaming.
+        # Previously this loop duplicated an open-coded knob tuple that had
+        # drifted from the source of truth — tools knobs were dropped here.
+        # Single-list invariant now. Stream-only knobs (`stream`,
+        # `stream_options`) are deliberately excluded; this path is non-streaming.
         for k in _COMMON_FORWARDED_KNOBS:
             v = client_meta.get(k)
             if v is not None:
@@ -1382,8 +1863,8 @@ def make_llama_server_complete_fn(
                             # ONE retry: enable_thinking=False overlay.
                             retry_payload = dict(payload)
                             # Validate chat_template_kwargs before forwarding to
-                            # the sidecar — only allow known safe keys, strip
-                            # Jinja constructs that could SSTI via llama-server.
+                            # the sidecar — only allow known safe keys, strip Jinja
+                            # constructs that could SSTI via llama-server.
                             _raw_ctk = payload.get("chat_template_kwargs") or {}
                             _safe_ctk = {
                                 "enable_thinking": False,
@@ -1431,9 +1912,9 @@ def make_llama_server_complete_fn(
                 _merge_reasoning_into_content(
                     result, client_meta.get("response_format"),
                 )
-                # Recover Qwen-class text-JSON tool calls into structured
-                # `tool_calls`. No-op when upstream already populated tool_calls
-                # (idempotency) or no tools advertised.
+                # Recover text-JSON tool calls into structured `tool_calls`.
+                # No-op when upstream already populated tool_calls (idempotency)
+                # or no tools advertised.
                 maybe_recover_tool_calls(result, client_meta.get("tools"))
                 return result
         except httpx.HTTPStatusError as e:

@@ -1,0 +1,59 @@
+# Turbohaul-Manager -- FULLY SELF-CONTAINED build (every dependency vendored in one repo).
+# Engine compiled from VENDORED source; Python from VENDORED wheels; frontend from COMMITTED dist.
+# NO PyPI, NO npm, NO external git. Only external = the CUDA base OS image (mirror to local registry
+# for full air-gap). Build: docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.6.0 .
+
+# ---- Stage 1: Compile the VENDORED turboquant llama.cpp engine from source ----
+FROM nvcr.io/nvidia/cuda:12.9.1-devel-ubuntu22.04 AS llama-build
+ARG CUDA_ARCH="89;120"
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake build-essential ca-certificates pkg-config libcurl4-openssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY engine/llama-cpp-turboquant /opt/turboquant
+WORKDIR /opt/turboquant
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+ && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1 \
+ && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so \
+ && ldconfig \
+ && cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+      -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+      -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+ && cmake --build build --config Release -j$(nproc) --target llama-server llama-bench llama-cli
+
+# ---- Stage 2: Runtime (vendored wheels + committed FE dist + compiled engine) ----
+FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.11 python3.11-venv python3.11-dev ca-certificates curl procps libgomp1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+ && ln -sf /usr/bin/python3.11 /usr/local/bin/python
+RUN python3.11 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:${PATH}
+WORKDIR /app
+# Python deps from VENDORED wheels -- fully offline (no PyPI).
+COPY pyproject.toml README.md ./
+COPY src/turbohaul/ ./src/turbohaul/
+COPY vendor/pywheels/ ./vendor/pywheels/
+RUN /opt/venv/bin/pip install --no-index --find-links=vendor/pywheels --upgrade setuptools wheel  && /opt/venv/bin/pip install --no-index --no-build-isolation --find-links=vendor/pywheels .
+# Engine binary compiled from vendored source (Stage 1).
+COPY --from=llama-build /opt/turboquant/build/bin /opt/turboquant/build/bin
+RUN mkdir -p /opt/turbohaul/bin \
+ && ln -sf /opt/turboquant/build/bin/llama-server /opt/turbohaul/bin/llama-server
+# Frontend: COMMITTED pre-built dist (no node/npm needed).
+COPY src/frontend/dist /opt/turbohaul/ui_dist
+RUN mkdir -p /var/lib/turbohaul /etc/turbohaul && chmod 700 /var/lib/turbohaul
+COPY docker/turbohaul.default.yaml /etc/turbohaul/turbohaul.yaml
+COPY THIRD_PARTY_LICENSES.md /usr/share/doc/turbohaul/THIRD_PARTY_LICENSES.md
+EXPOSE 11401
+ENV TURBOHAUL_CONFIG_PATH=/etc/turbohaul/turbohaul.yaml \
+    TURBOHAUL_ALLOW_PUBLIC_BIND=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs
+HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
+  CMD curl -fsS http://127.0.0.1:11401/health || exit 1
+ENTRYPOINT ["turbohaul-manager"]

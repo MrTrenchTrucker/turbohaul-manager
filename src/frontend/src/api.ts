@@ -17,6 +17,8 @@ export interface ActiveInfo {
   thread_id_prefix: string;
   pid: number;
   port: number;
+  // Named engine operation for the Dashboard pill
+  engine_op?: string;
 }
 
 export interface GraceInfo {
@@ -40,6 +42,8 @@ export interface LoadingInfo {
   elapsed_s: number;
   pid: number | null;
   port: number | null;
+  // Named engine operation for the Dashboard pill
+  engine_op?: string;
 }
 
 export interface QueueInfo {
@@ -65,6 +69,11 @@ export interface GenerationInfo {
   n_prompt_tokens?: number;
   n_ctx?: number;
   prompt_progress: string | null;
+  // Integer prefill %% from the /slots headline (backend live monitor).
+  prefill_pct?: number | null;
+  // Raw prefill counters (cache-restored + newly-processed).
+  n_prompt_proc?: number | null;
+  n_prompt_cache?: number | null;
   pct?: number;
   eta_s?: number;
   stalled: boolean;
@@ -72,6 +81,8 @@ export interface GenerationInfo {
   generation_id: string | null;
   riders?: number;
   measured_at_iso: string;
+  // Mid-prefill hang alarm (observability-only; the UI renders a red banner)
+  prefill_stall_alarm?: boolean;
 }
 
 export interface ResidentModel {
@@ -89,6 +100,42 @@ export interface ResidentModel {
   generation: GenerationInfo | null;
 }
 
+// Last per-request structured identity — display/observability only,
+// all fields nullable.
+export interface RequestIdentity {
+  ip: string | null;
+  model_tag: string | null;
+  session_id: string | null;
+  is_main: boolean | null;
+  is_sub_agent: boolean | null;
+  is_curator: boolean | null;
+  is_compression: boolean | null;
+  resolved_class: string | null;
+  thread_id: string | null;
+}
+
+// Observability: one record per model (re)spawn + KV restore — the real
+// end-state so operators and the UI can see whether a load truly took,
+// instead of trusting a bare 200. Display-only, all fields nullable.
+export interface LoadVerifyRecord {
+  event: 'model_load' | 'kv_restore' | string;
+  trigger: string;
+  model_tag: string;
+  port: number;
+  pid: number | null;
+  process_alive: boolean | null;
+  health_200: boolean | null;
+  model_resident: boolean | null;
+  kv_expected_tokens: number | null;
+  kv_actual_n_past: number | null;
+  kv_restore_ok: boolean | null;
+  retry_count: number;
+  final_status: 'ok' | 'retried_ok' | 'failed' | string;
+  reason: string | null;
+  thread_hash: string | null;
+  session_id: string | null;
+}
+
 export interface StatusSnapshot {
   queue: QueueInfo;
   active: ActiveInfo | null;
@@ -102,6 +149,18 @@ export interface StatusSnapshot {
   vram_total_mib: number[] | null;
   // P2: legacy single-generation alias (kept for compat)
   generation: GenerationInfo | null;
+  // Last request's structured identity, additive.
+  request_identity?: RequestIdentity | null;
+  // Last N load/restore verify records (newest last), additive.
+  load_verify?: LoadVerifyRecord[] | null;
+  // Persisted KV cache SSD usage snapshot
+  persist_kvcache?: {
+    total_bytes: number;
+    cap_bytes: number;
+    file_count: number;
+    headroom_bytes: number;
+    over_cap: boolean;
+  } | null;
 }
 
 export interface ModelTag {
@@ -127,7 +186,7 @@ export interface VersionInfo {
   user_agent: string;
 }
 
-// per-model manifest editor types
+// Per-model manifest editor types
 export interface Manifest {
   model_tag: string;
   display_name?: string;
@@ -181,7 +240,26 @@ export const getTags = () => getJSON<{ models: ModelTag[] }>('/api/tags');
 export const getVersion = () => getJSON<VersionInfo>('/api/version');
 export const getConfig = () => getJSON<Record<string, unknown>>('/api/config');
 
-// manifest CRUD with ETag handling
+export async function putConfig(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const r = await fetch(`${BASE}/api/config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    let detail = '';
+    try {
+      const b = await r.json();
+      detail = (b as { detail?: string }).detail || '';
+    } catch {
+      // ignore
+    }
+    throw new Error(`PUT /api/config ${r.status}${detail ? ` — ${detail}` : ''}`);
+  }
+  return (await r.json()) as Promise<Record<string, unknown>>;
+}
+
+// Manifest CRUD with ETag handling
 export async function getManifest(tag: string): Promise<ManifestWithEtag> {
   const r = await fetch(`${BASE}/api/manifests/${encodeURIComponent(tag)}`);
   if (!r.ok) throw new Error(`GET /api/manifests/${tag} ${r.status}`);

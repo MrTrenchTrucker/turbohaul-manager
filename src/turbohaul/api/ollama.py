@@ -1,10 +1,10 @@
-"""Ollama-compatible API routes per v0.2 ARCHITECTURE.md §9.
+"""Ollama-compatible API routes.
 
-This module starts with the read-only endpoints (/api/tags, /api/show, /api/version
-moved here from main.py is still served from main). The streaming completion routes
-(/api/generate, /api/chat) come later with the httpx-proxy completion forwarding.
+Provides the read-only endpoints (/api/tags, /api/show; /api/version is still
+served from main.py). The streaming completion routes (/api/generate, /api/chat)
+are handled separately via httpx-proxy completion forwarding.
 
-Trademark hygiene per v0.2 §14: 'Ollama-compatible' (nominative fair use) only.
+Trademark hygiene: 'Ollama-compatible' (nominative fair use) only.
 """
 from fastapi import APIRouter, HTTPException, Request
 
@@ -57,8 +57,8 @@ async def get_show(name: str, request: Request) -> dict:
     """Ollama-compat: show details for a single model by name.
 
     Note: response strings (display_name, description, chat_template) are returned
-    as plain text - the FE renders them via text-only React text node per v0.2 §11.2
-    XSS-defense policy.
+    as plain text - the frontend renders them via a text-only React text node as
+    part of its XSS-defense policy.
     """
     mgr = request.app.state.manager
     manifests_root = mgr.boot.storage.manifests_path

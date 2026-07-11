@@ -1,6 +1,6 @@
 # TurboQuant Flag Doctrine
 
-**Status:** Locked in production manifests 2026-05-19. Applied to all 6 production manifests via `PUT /api/manifests/{tag}` with ETag/If-Match atomic concurrency. Verified live via `/proc/<pid>/cmdline` after cold-spawn.
+**Status:** Recommended defaults for production manifests. Apply via `PUT /api/manifests/{tag}` with ETag/If-Match atomic concurrency, then verify live via `/proc/<pid>/cmdline` after cold-spawn.
 
 This document defines the canonical TurboQuant flag set Turbohaul-Manager uses for new manifests targeting Tom's TurboQuant llama.cpp fork. New manifests should ship with these defaults unless a model-specific reason requires deviation.
 
@@ -29,18 +29,18 @@ The five doctrine flags above are **spawn argv**. Patching them on a running mod
 
 - **Option A** — send any request to the same manifest tag with body `"keep_alive": 0` (Ollama-style; parsed at `chat_completion.py:parse_keep_alive`). Sets the slot's `IDLE_HOT` window to 0 → the running `llama-server` is torn down at the end of that request; the next request triggers a cold-spawn.
 - **Option B** — wait for natural `IDLE_HOT` teardown (`idle_hot.remaining_s → 0`), then next request triggers cold-spawn.
-- **Option C** — `docker restart <turbohaul-container>` (nuclear; recovers cleanly but interrupts in-flight requests).
+- **Option C** — `docker restart <your-container>` (nuclear; recovers cleanly but interrupts in-flight requests).
 
-Discovered 2026-05-19 post-PUT when `/proc/<pid>/cmdline` audit showed the old cmdline still bound on a model spawned before the manifest PUT. Option B chosen (waited ~3 min for natural teardown); next request spawned with the new flag set verified live.
+This is easy to miss: a `/proc/<pid>/cmdline` audit can show the old cmdline still bound on a model spawned before the manifest PUT. Option B is the least disruptive (wait ~3 min for natural teardown); the next request then spawns with the new flag set, which you can verify live.
 
 ## Verification recipe
 
 ```bash
 # 1. Confirm manifest has the flag (post-PUT)
-curl -s http://localhost:11401/api/manifests/qwen3.6-27b-dense | jq '.llama_server_flags'
+curl -s http://your-host:11401/api/manifests/example-27b-dense | jq '.llama_server_flags'
 
 # 2. Confirm /proc/<pid>/cmdline reflects the flag (post-cold-spawn)
-docker exec <turbohaul-container> bash -c \
+docker exec <your-container> bash -c \
     'pgrep -af llama-server | head -1 | awk "{print \$1}" | xargs -I{} cat /proc/{}/cmdline | tr "\0" " "'
 
 # Expect to see: --flash-attn ... --no-context-shift ... --cache-reuse 256 ... --slot-prompt-similarity 0.5 ... --no-perf
@@ -51,8 +51,8 @@ If `/api/manifests` shows the flag but `/proc/<pid>/cmdline` does not — the ru
 ## Patching recipe (one model)
 
 ```bash
-TAG=qwen3.6-27b-dense
-BASE=http://localhost:11401
+TAG=example-27b-dense
+BASE=http://your-host:11401
 
 # 1. GET current manifest + ETag
 ETAG=$(curl -sI ${BASE}/api/manifests/${TAG} | grep -i etag | awk '{print $2}' | tr -d '\r\n"')
@@ -86,4 +86,5 @@ curl -s -X PUT ${BASE}/api/manifests/${TAG} \
 ## See also
 
 - [MULTI_AGENT_SHARING.md](./MULTI_AGENT_SHARING.md) — multi-agent serialization context.
+- [PERSISTENCE_CHECKLIST.md](./PERSISTENCE_CHECKLIST.md) — manifest persistence (manifests live in `/var/lib/turbohaul/manifests/` YAML — see persistence audit for current bind-mount status).
 - `src/turbohaul/manifest.py` `SAFE_LLAMA_FLAGS` — the in-code allowlist of accepted flags (~80 total).

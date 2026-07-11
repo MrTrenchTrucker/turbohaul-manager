@@ -1,16 +1,16 @@
 """Supervised subprocess management for llama-server children.
 
-Per v0.2 ARCHITECTURE.md §10 - addresses:
-- SIGTERM 5s too short on 21GB-resident models; no orphan reaper
-- orphan Popen on parent death
-- GRACE→POPPED race + drained-SIGTERM
-- upstream llama-server health-contract drift
+Addresses several failure modes:
+- SIGTERM window too short for a large resident model; no orphan reaper.
+- Orphaned Popen on parent death.
+- GRACE→POPPED race + drained-SIGTERM.
+- Upstream llama-server /health contract drift.
 
 Spawn: subprocess.Popen with start_new_session=True (setsid - process group isolation).
 Health: poll /health every poll_interval_s, default 600s cold-load tolerance.
 Pop: drained-SIGTERM on the whole process group; killpg(SIGKILL) on timeout.
 VRAM verify: nvidia-smi cross-check after POPPED before next stage.
-Binary integrity: sha256 verify at boot (defense-in-depth, v0.2 §7.1).
+Binary integrity: sha256 verify at boot (defense-in-depth).
 """
 import asyncio
 import contextlib
@@ -31,8 +31,8 @@ import httpx
 log = logging.getLogger(__name__)
 
 
-# Resolve nvidia-smi to absolute path at module load so a
-# later PATH-poisoning attempt (env injection, attacker-controlled $PATH
+# Resolve nvidia-smi to an absolute path at module load so a later
+# PATH-poisoning attempt (env injection, attacker-controlled $PATH
 # entry) cannot redirect the lookup at run time.
 _NVIDIA_SMI_PATH = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
 
@@ -73,6 +73,13 @@ class SidecarHandle:
         return self.proc.poll() is None
 
 
+SLOT_SAVE_DIR = "/var/lib/turbohaul/kvcache"
+# SLOT_SAVE_DIR is a tmpfs (RAM) — per-turn saves = zero SSD wear.
+# SLOT_PERSIST_DIR is the SSD archive the unload flush copies the clean bin
+# (+ .ckpt sidecar + meta) into, so a controlled swap/idle warm-reloads from SSD.
+SLOT_PERSIST_DIR = "/var/lib/turbohaul/kvcache_persist"
+
+
 def spawn_sidecar(
     binary: Path,
     gguf_path: Path,
@@ -86,42 +93,69 @@ def spawn_sidecar(
 
     popen_factory exists for test injection. Default = subprocess.Popen.
     """
+    os.makedirs(SLOT_SAVE_DIR, exist_ok=True)
     factory = popen_factory or subprocess.Popen
-    # If a pinned fd is provided, exec via /proc/self/fd/<fd>
-    # so the inode we hashed at boot is exactly what we exec; the path could
-    # have been swapped after verify, but the fd still points to the right
-    # inode. Falls back to path-based exec when binary_fd is None (dev mode
-    # / empty sha256).
+    # If a pinned fd is provided, exec via /proc/self/fd/<fd> so the inode we
+    # hashed at boot is exactly what we exec; the path could have been swapped
+    # after verify, but the fd still points to the right inode. Falls back to
+    # path-based exec when binary_fd is None (dev mode / empty sha256).
     if binary_fd is not None:
         exec_path = f"/proc/self/fd/{binary_fd}"
         pass_fds: tuple[int, ...] = (binary_fd,)
     else:
         exec_path = str(binary)
         pass_fds = ()
+    # Observability: capture engine logs (prefill n_tokens, restored n_past,
+    # timings) to a per-model file via llama-server's own --log-file.
+    # Keeps stdout/stderr=DEVNULL intact (the pipe-buffer contract below), so this
+    # adds visibility into KV restore/reuse without re-introducing PIPE.
+    _eng_log_dir = os.path.join(os.path.dirname(SLOT_SAVE_DIR), "engine_logs")
+    try:
+        os.makedirs(_eng_log_dir, exist_ok=True)
+    except OSError:
+        pass
+    _safe_model = "".join(ch if (ch.isalnum() or ch in "-._") else "_" for ch in str(model_tag))
+    _engine_log_file = os.path.join(_eng_log_dir, f"engine_{_safe_model}_p{port}_{int(time.time())}.log")
     cmd = [
         exec_path,
         "--port", str(port),
         "--host", "127.0.0.1",
         "-m", str(gguf_path),
+        "--slot-save-path", SLOT_SAVE_DIR,
+        "--log-file", _engine_log_file,
         *argv_flags,
     ]
     log.info(
         "spawning llama-server pid=? port=%d model=%s pinned_fd=%s",
         port, model_tag, "yes" if binary_fd is not None else "no",
     )
-    # stdout/stderr to DEVNULL — PIPE without an active drainer
-    # fills the 64KB OS pipe buffer once llama-server emits enough log lines
-    # (model load + slot ops + per-token perf), at which point write(2) blocks
-    # inside the child and the drained-SIGTERM contract no longer holds.
+    # stdout/stderr avoid a raw PIPE — PIPE without an active drainer fills the
+    # 64KB OS pipe buffer once llama-server emits enough log lines (model load +
+    # slot ops + per-token perf), at which point write(2) blocks inside the child
+    # and the drained-SIGTERM contract no longer holds.
     # llama-server has its own --log-file argv option if structured log capture
     # is required; wire it via argv_flags rather than re-introducing PIPE here.
+    # stdout/stderr -> append FILE (rather than DEVNULL). Captures the GGML abort
+    # output that bypasses --log-file (the abort callback prints its error text to
+    # stdout, which DEVNULL would discard on a poisoned-binary crash).
+    # A regular file never back-pressures like the 64KB pipe, so the
+    # drained-SIGTERM contract is preserved. Best-effort: fall back to DEVNULL.
+    try:
+        _stdio_f = open(_engine_log_file + ".stdio", "ab")
+    except Exception:
+        _stdio_f = None
     proc = factory(
         cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=_stdio_f if _stdio_f is not None else subprocess.DEVNULL,
+        stderr=_stdio_f if _stdio_f is not None else subprocess.DEVNULL,
         start_new_session=True,  # setsid - own process group → killpg works
         pass_fds=pass_fds,
     )
+    if _stdio_f is not None:
+        try:
+            _stdio_f.close()  # child holds its own dup; release ours
+        except Exception:
+            pass
     # Pin the live --parallel width from the spawn argv (default 1 when absent).
     # Single source of truth for the manager's in-flight admission cap.
     parallel = 1
@@ -138,8 +172,8 @@ def spawn_sidecar(
 
 
 # Defense-in-depth schema check for the upstream /health endpoint.
-# If the upstream server changes the response shape, we want a loud failure not
-# silent health-pass.
+# If the upstream changes the response shape, we want a loud failure not silent
+# health-pass.
 HEALTH_REQUIRED_FIELDS: set[str] = {"status"}
 HEALTH_OK_STATUSES: set[str] = {"ok", "ready", "healthy", "loaded"}
 
@@ -149,7 +183,7 @@ async def health_check_once(port: int, http_client: httpx.AsyncClient) -> dict |
 
     Raises SchemaMismatch if the response shape is unexpectedly different from
     HEALTH_REQUIRED_FIELDS - this is intentional load-bearing visibility for
-    upstream health-contract drift.
+    upstream /health contract drift.
     """
     try:
         r = await http_client.get(f"http://127.0.0.1:{port}/health", timeout=2.0)
@@ -257,7 +291,7 @@ async def drained_sigterm(
 ) -> tuple[bool, str]:
     """SIGTERM the whole process group → wait → SIGKILL on timeout.
 
-    For active slots (is_active=True), use drained_window_s (default 15s in v0.2
+    For active slots (is_active=True), use drained_window_s (default 15s
     to allow in-flight decode to complete cleanly on 21GB-resident llama-server).
     For cold/IDLE_HOT slots, use cold_window_s (default 5s).
 
@@ -282,8 +316,8 @@ async def drained_sigterm(
     try:
         killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
-        # Best-effort waitpid on already-gone — reaps zombie
-        # if process exited between getpgid and killpg.
+        # Best-effort waitpid on already-gone — reaps the zombie if the
+        # process exited between getpgid and killpg.
         try:
             await asyncio.to_thread(handle.proc.wait, timeout=1.0)
         except subprocess.TimeoutExpired:
@@ -295,7 +329,7 @@ async def drained_sigterm(
     deadline = time.monotonic() + wait_window
     while time.monotonic() < deadline:
         if handle.proc.poll() is not None:
-            # Explicit waitpid reap. poll() already reaps if
+            # Explicit waitpid reap. poll() already reaps if the process
             # exited, but be defensive — the zombie-free invariant that
             # the orphan reaper depends on must be guaranteed here.
             try:
@@ -317,10 +351,10 @@ async def drained_sigterm(
     await asyncio.sleep(0.5)
     if handle.proc.poll() is None:
         return False, "sigkill-failed-still-alive"
-    # Explicit waitpid reap. Without this, kernel keeps the
-    # PID slot occupied as <defunct>; any helper the llama-server spawned that
-    # reparents inherits the zombie as PPid, slipping the PPid==1 reaper
-    # filter (false-negative).
+    # Explicit waitpid reap. Without this, the kernel keeps the PID slot
+    # occupied as <defunct>; any helper the server spawned that reparents
+    # inherits the zombie as PPid, slipping the PPid==1 reaper filter
+    # (false-negative).
     try:
         await asyncio.to_thread(handle.proc.wait, timeout=5.0)
     except subprocess.TimeoutExpired:
@@ -336,7 +370,7 @@ async def verify_vram_cleared(
 ) -> tuple[bool, int | None]:
     """After POPPED, poll until VRAM drops by ≥90% of expected.
 
-    Defends against the CUDA-allocator-stuck failure mode (VRAM not released).
+    Defends against the CUDA-allocator-stuck failure mode.
 
     Returns (cleared_ok, current_used_mib).
     nvidia_smi_runner=None and unavailable → returns (True, None) (dev tolerance).
@@ -357,7 +391,7 @@ async def verify_vram_cleared(
 
 
 def verify_binary_sha256(binary_path: Path, expected_sha256: str) -> bool:
-    """Verify llama-server binary sha256 matches the pinned value (v0.2 §7.1).
+    """Verify llama-server binary sha256 matches the pinned value.
 
     Empty expected_sha256 = skip verify (dev mode).
     """
@@ -373,7 +407,7 @@ def verify_binary_sha256(binary_path: Path, expected_sha256: str) -> bool:
 
 
 def open_and_verify_binary(binary_path: Path, expected_sha256: str) -> int | None:
-    """Open llama-server binary fd at boot + verify sha256 via fd.
+    """Open the llama-server binary fd at boot + verify sha256 via that fd.
 
     Returns:
       - the open fd (caller must keep it alive for process lifetime) on hash match

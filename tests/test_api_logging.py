@@ -1,6 +1,6 @@
 """Tests for GET /v1/logging.
 
-13 cases: 11 spec-mandated + 2 edge cases (poison-row + list traversal).
+13 cases: 11 core behaviors + 2 extra edge cases (poison-row + list traversal).
 """
 import json
 
@@ -367,7 +367,7 @@ def test_redact_depth_cap_returns_value_unchanged():
     assert "prompt" in cursor
 
 
-# depth-cap boundary acceptance + cycle guard
+# Depth-cap boundary acceptance + cycle guard
 def test_redact_depth_at_exactly_10_still_redacts():
     """At depth == cap (10) the scrubber MUST still apply redaction.
 
@@ -402,13 +402,13 @@ def test_redact_cycle_detection_terminates():
     # on cap value but the call MUST return rather than raise.
 
 
-# negative-space no-auth posture documentation
+# Negative-space no-auth posture documentation
 def test_get_logging_returns_200_without_authorization_header(app_test):
     """Design-intent: /v1/logging is unauthenticated per the perimeter model.
 
     No Authorization header sent. If future hardening silently adds app-layer
-    auth on this endpoint, this test surfaces the regression — and the design
-    docs should be updated in the same change.
+    auth on this endpoint, this test surfaces the regression — and the
+    perimeter-model docs should be updated in the same change.
     """
     app, client = app_test
     r = client.get("/v1/logging")

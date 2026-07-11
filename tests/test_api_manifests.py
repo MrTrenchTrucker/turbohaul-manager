@@ -1,4 +1,4 @@
-"""Tests for /api/manifests CRUD routes (v0.2 §8.1 + §8.2)."""
+"""Tests for /api/manifests CRUD routes."""
 import pytest
 from fastapi.testclient import TestClient
 
@@ -89,7 +89,7 @@ class TestPutManifest:
         assert r2.status_code == 412
 
     def test_update_without_if_match_412(self, app_blank):
-        """PUT without If-Match on existing manifest -> 412."""
+        """PUT without If-Match on an existing manifest -> 412."""
         app, client = app_blank
         r1 = client.put("/api/manifests/my-model", json=_valid_payload("my-model"))
         assert r1.status_code == 200

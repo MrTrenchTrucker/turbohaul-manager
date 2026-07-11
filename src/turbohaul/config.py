@@ -1,6 +1,6 @@
 """Top-level configuration: BootConfig (read-only at runtime) vs RuntimeConfig (PUT-mutable).
 
-The boot-vs-runtime split keeps restart-only settings isolated from hot-mutable ones.
+See ARCHITECTURE.md §7 + §7.1 for the boot-vs-runtime split rationale.
 
 BootConfig fields require restart to change (server bind, storage paths, binary path).
 RuntimeConfig fields are mutable via PUT /api/config (queue timings, pull params).
@@ -13,9 +13,9 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-# Maximum honored client `keep_alive` value.
-# Module constant, not a QueueConfig field — operational policy, not per-deployment
-# knob. Bump here if your hardware changes.
+# Maximum honored client `keep_alive` value (cap).
+# Module constant, not a QueueConfig field — operational policy, not a per-deployment
+# knob. Bump here if your hardware profile shifts.
 KEEP_ALIVE_MAX_S = 1800
 
 
@@ -89,16 +89,16 @@ class QueueConfig(BaseModel):
     max_consecutive_same_model: int = Field(default=3, ge=1, le=1000)
     max_other_model_wait_s: float = Field(default=20.0, ge=0.0, le=3600.0)
     grace_seconds: int = Field(default=30, ge=0, le=3600)
-    # Default bumped 120 → 300 so multi-turn
-    # agents (Hermes / OpenAI-SDK class) with client-side tool-exec / reflection gaps
-    # in the 2-5min range keep their slot warm without needing to send keep_alive.
-    # OpenAI-SDK clients can't send keep_alive natively (Ollama Issue #11458).
-    # Bumped 300 → 600 because
-    # Qwen3 reasoning_budget=1000 on complex compare prompts produces 5-7min
-    # client-side inter-turn gaps. The 300s window was eaten by the client's reasoning
-    # chain on the FIRST tool-result reflection, not by Turbohaul itself.
+    # Default bumped 120 → 300 so multi-turn agents (OpenAI-SDK class clients)
+    # with client-side tool-exec / reflection gaps in the 2-5min range keep their
+    # slot warm without needing to send keep_alive. OpenAI-SDK clients can't send
+    # keep_alive natively (see Ollama Issue #11458).
+    # Later bumped 300 → 600 because a reasoning model with a large reasoning
+    # budget on complex compare prompts can produce 5-7min client-side inter-turn
+    # gaps. The 300s window was eaten by the client's reasoning chain on the FIRST
+    # tool-result reflection, not by Turbohaul itself.
     idle_hot_load_seconds: int = Field(default=600, ge=0, le=86400)
-    # Safety guardrails -- mirror Ollama pre-spawn safety posture
+    # Safety guardrails -- mirror Ollama's pre-spawn safety posture
     safety_enabled: bool = True
     safety_min_free_ram_mib: int = Field(default=1024, ge=0)
     safety_min_free_vram_mib: int = Field(default=512, ge=0)
@@ -106,15 +106,22 @@ class QueueConfig(BaseModel):
     safety_max_iowait_percent: float = Field(default=30.0, ge=0.0, le=100.0)
     safety_iowait_sample_window_s: float = Field(default=0.4, ge=0.05, le=5.0)
     max_grace_extensions: int = Field(default=5, ge=0, le=1000)
+    # prefix_token_count controls how many tokens of the prompt are
+    # hashed for auto-derived thread_id. Hashing only the prefix (not the full
+    # prompt) ensures that conversation extensions — same prefix, more tokens —
+    # produce the SAME thread_id, allowing the grace window to match and the KV
+    # cache restore to fire. Default 256 captures a typical system prompt + initial
+    # context; adjust via TURBOHAUL_PREFIX_TOKEN_COUNT if needed.
+    prefix_token_count: int = Field(default=256, ge=1, le=8192)
     loading_health_timeout_s: int = Field(default=600, ge=10, le=7200)
     drained_sigterm_window_active_s: int = Field(default=15, ge=1, le=300)
     drained_sigterm_window_cold_s: int = Field(default=5, ge=1, le=300)
-    # Background sweeper cadence — finalizes state-row for
-    # evictions that landed audit-only via _audit_event_only_async pool path.
+    # Background sweeper cadence — finalizes the state-row for evictions that
+    # landed audit-only via the _audit_event_only_async pool path.
     # 60s aligns with the audit pool rhythm. Sweeper requires staleness ≥ 24h
     # (background_sweep_min_age_s) so in-flight slots are never reaped.
     background_sweep_interval_s: int = Field(default=60, ge=1, le=86400)
-    background_sweep_min_age_s: int = Field(default=86400, ge=60, le=2592000)  # floor stays at 60s — actual SQL gate is `state=STAGED` (NOT grace-rematch states), so operator misconfig cannot reap in-flight grace-rematch slots; gate-filter is sufficient defense; 60s floor preserved for synthetic-age test boundary
+    background_sweep_min_age_s: int = Field(default=86400, ge=60, le=2592000)  # Floor stays at 60s — the actual SQL gate is `state=STAGED` (NOT grace-rematch states), so an operator misconfig cannot reap in-flight grace-rematch slots; the gate-filter is sufficient defense; the 60s floor is preserved for the synthetic-age test boundary
 
 
 class PullConfig(BaseModel):
@@ -128,6 +135,14 @@ class PullConfig(BaseModel):
     pull_concurrency: int = Field(default=2, ge=1, le=16)
     pull_chunk_size_mb: int = Field(default=64, ge=1, le=1024)
     per_stream_max_bytes: int = Field(default=107_374_182_400, ge=1)
+
+
+class PersistConfig(BaseModel):
+    """Runtime-mutable: SSD persist tier config."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_bytes: int = Field(default=42949672960, ge=0)  # 40 GiB default
 
 
 class MonitorConfig(BaseModel):
@@ -163,6 +178,7 @@ class RuntimeConfig(BaseModel):
 
     queue: QueueConfig
     pull: PullConfig
+    persist: PersistConfig = Field(default_factory=PersistConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
 
 
@@ -177,6 +193,7 @@ class TurbohaulConfig(BaseModel):
     ui: UIConfig
     queue: QueueConfig
     pull: PullConfig
+    persist: PersistConfig = Field(default_factory=PersistConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
 
     def split(self) -> tuple[BootConfig, RuntimeConfig]:
@@ -186,7 +203,7 @@ class TurbohaulConfig(BaseModel):
             runtime=self.runtime,
             ui=self.ui,
         )
-        runtime = RuntimeConfig(queue=self.queue, pull=self.pull, monitor=self.monitor)
+        runtime = RuntimeConfig(queue=self.queue, pull=self.pull, persist=self.persist, monitor=self.monitor)
         return boot, runtime
 
 
@@ -209,8 +226,10 @@ _ENV_MAP: dict[str, tuple[str, str, type]] = {
     "TURBOHAUL_GRACE_S": ("queue", "grace_seconds", int),
     "TURBOHAUL_IDLE_HOT_S": ("queue", "idle_hot_load_seconds", int),
     "TURBOHAUL_MAX_GRACE_EXT": ("queue", "max_grace_extensions", int),
+    "TURBOHAUL_PREFIX_TOKEN_COUNT": ("queue", "prefix_token_count", int),
     "TURBOHAUL_MAX_CONSECUTIVE_SAME_MODEL": ("queue", "max_consecutive_same_model", int),
     "TURBOHAUL_MAX_OTHER_MODEL_WAIT_S": ("queue", "max_other_model_wait_s", float),
+    "TURBOHAUL_KVCACHE_PERSIST_MAX_BYTES": ("persist", "max_bytes", int),
 }
 
 
@@ -220,5 +239,7 @@ def apply_env_overrides(cfg: TurbohaulConfig) -> TurbohaulConfig:
     for env_key, (section, field, cast) in _ENV_MAP.items():
         v = os.environ.get(env_key)
         if v is not None:
-            data[section][field] = cast(v)
+            # Optional sections (e.g. persist) may be absent from a user yaml;
+            # an env override must not KeyError.
+            data.setdefault(section, {})[field] = cast(v)
     return TurbohaulConfig(**data)

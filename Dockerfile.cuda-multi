@@ -1,17 +1,18 @@
-# Turbohaul-Manager v0.2-cuda-multi — broad-architecture variant.
-# Compiles Tom's TurboQuant llama-server FROM SOURCE with CUDA arches covering
-# Turing through Blackwell (sm_75 / sm_80 / sm_86 / sm_89 / sm_90 / sm_120).
+# Turbohaul-Manager cuda-multi -- broad-architecture variant.
+# Compiles the vendored TurboQuant engine (engine/llama-cpp-turboquant) FROM SOURCE
+# with CUDA arches covering Turing through Blackwell
+# (sm_75 / sm_80 / sm_86 / sm_89 / sm_90 / sm_120).
 # One image, works on ~99% of CUDA-capable consumer/prosumer NVIDIA cards
 # 2018+ (GTX 16-series and later).
 #
-# Build time: ~30-40 min on this hardware (NVCC compile for 6 architectures).
-# Image size: slightly larger than :v0.2-cuda (extra compiled kernels).
+# Build time: ~30-40 min (NVCC compile for 6 architectures).
+# Image size: slightly larger than a single-arch build (extra compiled kernels).
 #
 # Build:
-#   docker build -f Dockerfile.cuda-multi -t turbohaul-manager:v0.2-cuda-multi .
+#   docker build -f Dockerfile.cuda-multi -t turbohaul-manager:v0.6.0 .
 
 # ----------------------------------------------------------------------------
-# Stage 1: Frontend (same as slim + :v0.2-cuda)
+# Stage 1: Frontend (same as the slim Dockerfile)
 # ----------------------------------------------------------------------------
 FROM node:20-alpine AS frontend-build
 WORKDIR /work
@@ -21,8 +22,8 @@ COPY src/frontend/. ./
 RUN npm run typecheck && npm run build
 
 # ----------------------------------------------------------------------------
-# Stage 2: Compile Tom's TurboQuant llama-server from source for 6 GPU arches.
-# Recipe mirrors turboquant-sidecar:v1's build with CUDA_ARCHITECTURES expanded.
+# Stage 2: Compile the vendored TurboQuant engine from source for 6 GPU arches.
+# CUDA_ARCHITECTURES is expanded to cover Turing through Blackwell.
 # ----------------------------------------------------------------------------
 FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS llama-binary
 
@@ -35,11 +36,9 @@ RUN apt-get update \
       libcurl4-openssl-dev \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /opt
-RUN git clone https://github.com/TheTom/llama-cpp-turboquant.git turboquant \
- && cd turboquant \
- && git checkout feature/turboquant-kv-cache \
- && git log -1 --format='%H %s' > /opt/build_commit.txt
+# Engine source VENDORED in-repo (self-contained -- no external git clone).
+COPY engine/llama-cpp-turboquant /opt/turboquant
+RUN echo vendored-engine-86771a58d > /opt/build_commit.txt
 
 WORKDIR /opt/turboquant
 

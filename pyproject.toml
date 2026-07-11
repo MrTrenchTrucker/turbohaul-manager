@@ -9,7 +9,7 @@ description = "Ollama-shape inference manager using TurboQuant llama.cpp - local
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
-authors = [{name = "MrTrench"}]
+authors = [{name = "MrTrenchTrucker"}]
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",

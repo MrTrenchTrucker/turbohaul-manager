@@ -8,9 +8,9 @@ import type { ResponseFormat } from '../lib/responseFormatValidator';
  * (in a future polish wave) fire a smoke chat-completion against the
  * sidecar directly.
  *
- * This is author-only (no live POST UI); the `chatComplete` helper is
- * intentionally deferred to a follow-on change so this page doesn't grow
- * legs into the chat-execution surface.
+ * This page is author-only (no live POST UI); the `chatComplete` helper
+ * is intentionally deferred to a follow-on change so this component
+ * doesn't grow legs into the chat-execution surface.
  */
 export default function Schema() {
   const [envelope, setEnvelope] = useState<ResponseFormat | null>({ type: 'text' });

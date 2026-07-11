@@ -1,6 +1,6 @@
 """Tests for the Ollama-compat tool_calls batch.
 
-Covers the 10 cases:
+Covers the 10 cases in the tool-call compatibility contract:
   (a) inbound forwarding — _complete receives tool knobs
   (b) outbound reshape + multi-tool batch + empty-list omitted
   (c) args STR→OBJECT
@@ -8,11 +8,11 @@ Covers the 10 cases:
   (e) plain-text /api/chat backward compat (no tools)
   (f) error guard single-assert
   (g) /v1/chat/completions cross-path regression — stream-only knob isolation
-  (h) Change 4: stream=true + tools → 400
+  (h) stream=true + tools → 400
   (i) 300KB args → truncated + warning + still returned
   (j) finish_reason → done_reason mapping
 
-Fixture pattern mirrors tests/test_api_chat_completion.py:76 (fake_complete).
+Fixture pattern mirrors tests/test_api_chat_completion.py (fake_complete).
 """
 import asyncio
 import json
@@ -79,8 +79,8 @@ def _build_app(tmp_path, fake_complete):
         ),
         pull=PullConfig(),
     )
-    # auto_start_worker=True so the FastAPI lifespan
-    # creates worker_task on the SAME event loop TestClient runs against.
+    # auto_start_worker=True so the FastAPI lifespan creates worker_task on
+    # the SAME event loop TestClient runs against.
     # The earlier _start_worker() helper spawned the task on whatever loop
     # was current at fixture-build time (often the outer test loop), then
     # TestClient's anyio BlockingPortal created its own loop for lifespan
@@ -294,7 +294,7 @@ def test_d_malformed_args_lenient_fallback(tmp_path, caplog):
 
 def test_e_plain_text_backward_compat(tmp_path):
     """No tool_calls in response → message has no tool_calls key, response
-    shape is the Ollama-native subset the earlier tests expected."""
+    shape is the Ollama-native subset the pre-tool-support tests expected."""
     fc, _ = _make_capturing_complete(_openai_response_with(content="hello"))
     app, mgr = _build_app(tmp_path, fc)
     with TestClient(app) as client:
@@ -318,7 +318,7 @@ def test_e_plain_text_backward_compat(tmp_path):
 
 def test_f_error_guard_passthrough(tmp_path):
     """If completion_fn returns a dict with 'error', return it unchanged
-    (no reshape attempt). Single assert."""
+    (no reshape attempt). Single-assert."""
     err = {"error": "upstream_thing_failed", "detail": "kv-cache OOM"}
     async def fc(slot, handle):
         return err
@@ -338,7 +338,8 @@ def test_f_error_guard_passthrough(tmp_path):
 
 def test_g_openai_path_no_stream_only_leak(tmp_path):
     """Non-streaming /v1/chat/completions request with tools must NOT cause
-    _complete to forward stream-only knobs. Verifies Change 1 split is wired."""
+    _complete to forward stream-only knobs. Verifies the common/stream-only
+    knob split is wired."""
     captured = {}
     async def fc(slot, handle):
         # Re-create the payload the production _complete would build by
@@ -370,7 +371,7 @@ def test_g_openai_path_no_stream_only_leak(tmp_path):
 
 
 # ===========================================================================
-# (h) Change 4: stream=true + tools → 400 with structured body
+# (h) stream=true + tools → 400 with structured body
 # ===========================================================================
 
 

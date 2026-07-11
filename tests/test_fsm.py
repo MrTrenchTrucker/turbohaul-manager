@@ -1,4 +1,4 @@
-"""Tests for state machine transitions (v0.2 §6)."""
+"""Tests for state machine transitions."""
 import pytest
 
 from turbohaul.fsm import (

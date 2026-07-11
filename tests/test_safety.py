@@ -1,4 +1,4 @@
-"""Tests for safety guardrails (including the KV-cache fit gate)."""
+"""Tests for safety guardrails, including the KV-cache fit gate."""
 from unittest.mock import patch
 
 from turbohaul.safety import (
@@ -89,7 +89,7 @@ class TestEstimateKvCacheMib:
         assert estimate_kv_cache_mib(4096, 0) == 0
         assert estimate_kv_cache_mib(0, 17000000000) == 0
 
-    def test_f16_qwen27b_at_64k_in_expected_range(self):
+    def test_f16_27b_at_64k_in_expected_range(self):
         # 17 GB gguf, 64K ctx, f16 → expect ~9000-10000 MiB (calibration)
         kv = estimate_kv_cache_mib(65536, 17 * 1024 * 1024 * 1024, "f16")
         # Allow wide band — formula is heuristic, exact varies per model
@@ -135,7 +135,7 @@ class TestCheckKvCacheFit:
         # A cpu-moe (n_cpu_moe) config whose CLOSED-FORM body+KV would NOT fit, but
         # whose MEASURED expected_vram (experts offloaded to RAM) does. The cpu-moe
         # branch trusts the measured value and PASSES; the same config WITHOUT
-        # cpu_moe_offload refuses on the over-counted body. (live-E2E 35b regression.)
+        # cpu_moe_offload refuses on the over-counted body. (regression case for a 35B MoE model.)
         gguf = 20 * 1024 * 1024 * 1024  # 20 GiB body -> closed-form blows the budget
         with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[23_700]):
             r_closed = check_kv_cache_fit(
@@ -165,19 +165,19 @@ class TestCheckKvCacheFit:
         assert not r.ok
         assert "need" in r.detail and "22000 MiB free" in r.detail
 
-    def test_q4_lets_64k_qwen27b_fit_on_blackwell(self):
-        # 24 GB Blackwell with ~22 GB free. q4_0 at 64K on Qwen27B:
+    def test_q4_lets_64k_27b_fit_on_blackwell(self):
+        # 24 GB Blackwell with ~22 GB free. q4_0 at 64K on a 27B model:
         # 17 GB body + ~2.4 GB KV + 1 GB overhead = ~20.4 GB → fits
         with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[22_000]):
             r = check_kv_cache_fit(65536, 17 * 1024 * 1024 * 1024, kv_cache_quant="q4_0")
-        assert r.ok, f"q4_0 64K Qwen27B should fit on 22 GB free, got: {r.detail}"
+        assert r.ok, f"q4_0 64K 27B model should fit on 22 GB free, got: {r.detail}"
 
-    def test_q8_64k_qwen27b_refused_on_blackwell(self):
+    def test_q8_64k_27b_refused_on_blackwell(self):
         # Same hardware + q8_0 instead of q4_0. q8_0 ≈ 4.9 GB KV → 17+4.9+1 = ~23 GB > 22 GB
         # safety_gate CORRECTLY refuses (correct behavior — q8_0 needs bigger GPU)
         with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[22_000]):
             r = check_kv_cache_fit(65536, 17 * 1024 * 1024 * 1024, kv_cache_quant="q8_0")
-        assert not r.ok, f"q8_0 64K Qwen27B should refuse on 22 GB Blackwell, got: {r.detail}"
+        assert not r.ok, f"q8_0 64K 27B model should refuse on 22 GB Blackwell, got: {r.detail}"
 
     def test_passes_when_inputs_unknown(self):
         r = check_kv_cache_fit(0, 0)

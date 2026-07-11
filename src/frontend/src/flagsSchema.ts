@@ -70,7 +70,7 @@ export const FLAGS_SCHEMA: readonly FlagSpec[] = [
   { name: 'n_predict', type: 'int', category: 'Common', primary: true, default: -1, bounds: [-1, 1_000_000],
     hint: 'Max output tokens per request. -1 = unlimited. Per-request max_tokens from client overrides if passed.' },
   { name: 'reasoning_budget', type: 'int', category: 'Common', primary: true, default: -1, bounds: [-1, 1_000_000],
-    hint: 'Thinking-token cap (Hermes/Qwen3 preserved-thinking). -1 = unlimited. 0 = thinking disabled. N = cap at N. Setting in manifest LOCKS per-request override; leave -1 to let clients pass thinking_budget_tokens.' },
+    hint: 'Thinking-token cap (preserved-thinking reasoning models). -1 = unlimited. 0 = thinking disabled. N = cap at N. Setting in manifest LOCKS per-request override; leave -1 to let clients pass thinking_budget_tokens.' },
 
   // === Performance ===
   { name: 'threads', type: 'int', category: 'Performance', default: -1, bounds: [-1, 256], hint: 'CPU threads for inference. -1 = auto. Match physical core count.' },
@@ -167,16 +167,16 @@ export const FLAGS_SCHEMA: readonly FlagSpec[] = [
   { name: 'adaptive_decay', type: 'float', category: 'Sampling', default: 0.9, bounds: [0.0, 1.0], hint: 'Adaptive sampler decay.' },
   { name: 'ignore_eos', type: 'bool', category: 'Sampling', default: false, hint: 'Ignore EOS token (model keeps generating).' },
 
-  // === Reasoning (Hermes preserved-thinking) ===
+  // === Reasoning (preserved-thinking reasoning models) ===
   { name: 'reasoning_format', type: 'enum-string', category: 'Reasoning', default: 'auto',
     enumValues: ['none', 'deepseek', 'deepseek-legacy', 'auto'], hint: 'Reasoning output format (deepseek-r1 style).' },
   { name: 'reasoning', type: 'enum-string', category: 'Reasoning', default: 'auto',
     enumValues: ['on', 'off', 'auto'], hint: 'Reasoning mode.' },
 
-  // === Speculative / MTP (multi-token-prediction; needs GGUF with nextn head — Qwen3.5/3.6) ===
+  // === Speculative / MTP (multi-token-prediction; needs a GGUF with a nextn head) ===
   { name: 'spec_type', type: 'enum-string', category: 'Speculative / MTP', primary: true, default: 'draft-mtp',
     enumValues: ['draft-mtp'],
-    hint: 'Speculative decode type. draft-mtp = model bundled multi-token-prediction head (faster decode on Qwen3.5/3.6 GGUFs that carry the nextn head). Composes with TurboQuant cache types.' },
+    hint: 'Speculative decode type. draft-mtp = model bundled multi-token-prediction head (faster decode on GGUFs that carry the nextn head). Composes with TurboQuant cache types.' },
   { name: 'spec_draft_n_max', type: 'int', category: 'Speculative / MTP', default: 3, bounds: [0, 64], hint: 'Max draft tokens proposed per step. MTP default 3. Higher = more speculative, diminishing returns.' },
   { name: 'spec_draft_n_min', type: 'int', category: 'Speculative / MTP', default: 0, bounds: [0, 64], hint: 'Min draft tokens per step.' },
   { name: 'spec_draft_p_min', type: 'float', category: 'Speculative / MTP', default: 0.0, bounds: [0.0, 1.0], hint: 'Min probability to continue drafting (0 = always draft n_max).' },
@@ -186,7 +186,7 @@ export const FLAGS_SCHEMA: readonly FlagSpec[] = [
 
   // === Chat / Template ===
   { name: 'chat_template', type: 'chat-template', category: 'Chat / Template', default: 'default',
-    enumValues: SAFE_CHAT_TEMPLATE_NAMES, hint: 'Built-in template name OR plain string. Jinja constructs ({% / {{) REJECTED (F3 SSTI hardening).' },
+    enumValues: SAFE_CHAT_TEMPLATE_NAMES, hint: 'Built-in template name OR plain string. Jinja constructs ({% / {{) REJECTED (SSTI hardening).' },
   { name: 'jinja', type: 'bool', category: 'Chat / Template', default: true, hint: 'Enable Jinja template processing.' },
   { name: 'skip_chat_parsing', type: 'bool', category: 'Chat / Template', default: false, hint: 'Skip chat-template parsing.' },
   { name: 'special', type: 'bool', category: 'Chat / Template', default: false, hint: 'Output special tokens (BOS/EOS/etc).' },

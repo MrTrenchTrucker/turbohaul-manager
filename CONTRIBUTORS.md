@@ -5,9 +5,9 @@ This file records the humans and named AI agents who shaped it.
 
 ## Project Lead
 
-**MrTrench** -- lead, architect, operator, kernel.
+**MrTrench** -- lead architect, operator, kernel.
 - Founder + sole human contributor on v0.2.1.
-- Owns the host hardware (Ryzen 9 9900X, 64 GiB DDR5, RTX PRO 4000 Blackwell, TrueNAS SCALE).
+- Runs the project on a single GPU host (Ryzen 9 9900X, 64 GiB DDR5, RTX PRO 4000 Blackwell, TrueNAS SCALE).
 - Authored the design intent for the FIFO + grace + IDLE_HOT + model-swap state machine
   (the "trucking dispatch" mental model that gives Turbohaul-Manager its name).
 - Directed every load-bearing decision: licensing (MIT), safety guardrails posture, 5-min IDLE_HOT

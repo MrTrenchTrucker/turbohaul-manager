@@ -15,7 +15,8 @@ interface ErrorBoundaryState {
  *
  * Root cause: React 18 unmounts the whole tree on an uncaught
  * render throw when no ErrorBoundary is present — resulting in
- * a blank #root div (e.g. a vram:null crash).
+ * a blank #root div (observed as a blank page when a null vram
+ * value slipped through).
  */
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   constructor(props: ErrorBoundaryProps) {

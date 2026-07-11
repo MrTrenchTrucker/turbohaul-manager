@@ -49,7 +49,7 @@ affiliated with Ollama.
 
 ## Container base images
 
-- **CUDA variant** (`Dockerfile.cuda`) builds on `nvidia/cuda:12.9.0-runtime-ubuntu22.04`:
+- **CUDA variant** (`Dockerfile.cuda-multi`) builds on `nvidia/cuda:12.9.0-runtime-ubuntu22.04`:
   - **NVIDIA CUDA runtime** — (c) NVIDIA Corporation, under the NVIDIA Deep Learning Container
     License / CUDA EULA. NVIDIA permits redistribution of the CUDA runtime as part of an
     application container (see https://docs.nvidia.com/cuda/eula/ and the NVIDIA Deep Learning

@@ -1,4 +1,4 @@
-"""WebSocket /ws/state - redacted event broadcaster per v0.2 §11.1.
+"""WebSocket /ws/state - redacted event broadcaster.
 
 Subscribers receive STATE-level events only:
   - connected (one-time, on accept) with initial status snapshot

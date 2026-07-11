@@ -5,11 +5,11 @@
 2. SlotEvictedError raised from completion_future when worker_loop sees is_evicted
 3. ACTIVE slot not affected by evict (sanity: happy non-stream path unaffected)
 4. Client disconnect on pending slot → HTTP 499 via FastAPI E2E
-5. pop_matched_thread also flags evicted slots (symmetry, grace-rematch)
+5. pop_matched_thread also flags evicted slots (thread-rematch symmetry, grace-rematch)
 6. Lazy-init disconnect_event=None works pre-attach (BootInventory path)
 7. Evicted slot emits audit event via the pool path (NOT state_db_session)
 8. Consecutive evictions don't starve idle-expiry tick — fire-and-forget
-   asyncio.create_task on _teardown_idle_holder + identity guard
+   asyncio.create_task on _teardown_idle_holder + idle-handle identity guard
 9. _pop_first_non_evicted_from is bounded — incremental drain per call
 """
 import asyncio
@@ -273,7 +273,7 @@ async def test_7_evicted_emits_audit_via_pool_not_state_db(tmp_path):
 @pytest.mark.asyncio
 async def test_8_consecutive_evictions_create_task_fire_and_forget(tmp_path):
     """idle-teardown is asyncio.create_task fire-and-forget; the
-    eviction-branch inline idle-tick fires with an identity guard."""
+    eviction-branch inline idle-tick fires with idle-handle identity guard."""
     app = _make_app(tmp_path)
     mgr = app.state.manager
     teardown_calls: list[str] = []

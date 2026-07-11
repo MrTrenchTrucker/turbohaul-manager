@@ -1,4 +1,4 @@
-"""Tests for state.sqlite schema + helpers (v0.2 §12)."""
+"""Tests for state.sqlite schema + helpers."""
 import json
 
 import pytest
@@ -60,7 +60,7 @@ class TestSlotOps:
                 conn,
                 {
                     "slot_id": "slot-1",
-                    "model_tag": "qwen3.6-35b-moe",
+                    "model_tag": "example-35b-moe",
                     "state": "STAGED",
                 },
             )
@@ -71,7 +71,7 @@ class TestSlotOps:
                 conn,
                 {
                     "slot_id": "slot-1",
-                    "model_tag": "qwen3.6-35b-moe",
+                    "model_tag": "example-35b-moe",
                     "state": "ACTIVE",
                     "pid": 12345,
                     "port": 11500,
