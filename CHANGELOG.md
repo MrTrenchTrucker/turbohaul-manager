@@ -48,7 +48,6 @@ _Covers changes since the v0.5.0-public baseline (2026-06-28). Versions v0.3.xâ€
 - An idempotent completion cache with single-flight de-duplication, so a retried request can't double-run.
 - KV reuse now works when the box serves several models or several context windows at once â€” every save/restore decision routes through one unified policy, and a multi-model path that previously never restored its cache now does.
 - Fully self-contained, offline build â€” the engine source, Python wheels, and frontend (with a committed build) are all vendored in-repo, and `Dockerfile.engine-src` builds the entire stack with no PyPI, npm, or external git access.
-- A prebuilt, runnable image is published to the GitHub Container Registry â€” run `docker pull ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0`, or build offline from source with `Dockerfile.engine-src`.
 
 ### Fixed
 
@@ -148,15 +147,15 @@ _Covers changes since the v0.5.0-public baseline (2026-06-28). Versions v0.3.xâ€
 ### Upgrade path
 
 ```bash
-# Pull the new image (tag may differ depending on registry mirror)
-docker pull ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.2.3
+# Build the image from source (see the README build instructions)
+docker build -f Dockerfile.cuda-multi -t turbohaul-manager:v0.2.3 .
 
 # Stop + remove the old container (state survives because of the bind-mount)
 docker stop turbohaul-manager
 docker rm turbohaul-manager
 
 # Run the new container with the canonical bind-mount layout
-docker run -d --name turbohaul-manager     --restart unless-stopped     --runtime nvidia --gpus all     -p 11401:11401     -p 11434:11434     -v /var/lib/turbohaul:/var/lib/turbohaul     -e TURBOHAUL_IDLE_HOT_SECONDS=600     -e TURBOHAUL_GRACE_SECONDS=30     ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.2.3
+docker run -d --name turbohaul-manager     --restart unless-stopped     --runtime nvidia --gpus all     -p 11401:11401     -p 11434:11434     -v /var/lib/turbohaul:/var/lib/turbohaul     -e TURBOHAUL_IDLE_HOT_SECONDS=600     -e TURBOHAUL_GRACE_SECONDS=30     turbohaul-manager:v0.2.3
 ```
 
 Existing state (`state.sqlite`, `manifests/*.yaml`, `blobs/sha256/*`) is preserved through the bind-mount. First request to a new model may cold-load 30 to 60 seconds; subsequent same-thread follow-ups within the grace + IDLE_HOT windows reuse the warm slot.

@@ -21,16 +21,17 @@ FIFO queue + grace + IDLE_HOT hot-hold + model swap on Nvidia RTX GPU's includin
 ## Quick start
 
 ```bash
-# Run the prebuilt image (Blackwell or older NVIDIA GPU)
+# Clone, build the self-contained image, and run (Blackwell or older NVIDIA GPU)
+git clone https://github.com/MrTrenchTrucker/turbohaul-manager.git
+cd turbohaul-manager
+docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.6.0 .   # fully offline (vendored engine + wheels)
+
 docker run --gpus all -p 11401:11401 \
     -v $(pwd)/state:/var/lib/turbohaul \
     -v $(pwd)/models:/var/lib/turbohaul/import-staging \
-    ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0
+    turbohaul-manager:v0.6.0
 
-# Or build locally (broad NVIDIA arch support: Turing through Blackwell)
-git clone https://github.com/MrTrenchTrucker/turbohaul-manager.git
-cd turbohaul-manager
-docker build -f Dockerfile.cuda-multi -t turbohaul-manager:v0.6.0 .
+# For broad NVIDIA arch support (Turing through Blackwell), build with Dockerfile.cuda-multi instead.
 ```
 
 The `-v $(pwd)/state:/var/lib/turbohaul` mount is **required** for production deployment — without it, `state.sqlite`, `manifests/*.yaml`, and the `blobs/` store live inside the container layer and are destroyed by `docker rm` or container-layer corruption. See [docs/PERSISTENCE_CHECKLIST.md](docs/PERSISTENCE_CHECKLIST.md) for the full hardening checklist.
@@ -88,21 +89,14 @@ MIT (see LICENSE). All third-party deps audited MIT-compatible (see THIRD_PARTY_
 See [CONTRIBUTORS.md](CONTRIBUTORS.md). MrTrench (founder) shipped v0.6.0. Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 
-## Self-contained build + prebuilt image
+## Self-contained offline build
 
 The modified TurboQuant engine source (`engine/llama-cpp-turboquant/`), the Python
 dependency wheels (`vendor/pywheels/`), and the prebuilt frontend all ship in this
 repository, so you can build everything offline -- no external engine clone, PyPI, or
-npm required. A prebuilt runnable image is published on the GitHub Container Registry.
+npm required.
 
-### Fastest: run the prebuilt image
-```bash
-docker run --gpus all -p 127.0.0.1:11401:11401 \
-  -v "$PWD/state:/var/lib/turbohaul" \
-  ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0
-```
-
-### Build from source, fully offline (needs the CUDA base image once)
+### Build the image from source (needs the CUDA base image once)
 ```bash
 docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.6.0 .
 ```

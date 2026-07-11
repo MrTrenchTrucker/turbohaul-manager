@@ -370,7 +370,9 @@ Copy-paste JSON and SDK snippets for every one of these are in [TAGS_AND_IDENTIT
 
 ## Production Setup Notes
 
-### Docker run with sane defaults (CUDA / NVIDIA host)
+### Build and run with sane defaults (CUDA / NVIDIA host)
+
+Build the image first (fully offline): `docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.6.0 .`
 
 ```bash
 docker run -d --name turbohaul \
@@ -381,7 +383,7 @@ docker run -d --name turbohaul \
   -v $(pwd)/models:/var/lib/turbohaul/import-staging \
   -e TURBOHAUL_IDLE_HOT_SECONDS=600 \
   -e TURBOHAUL_GRACE_SECONDS=30 \
-  ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0
+  turbohaul-manager:v0.6.0
 ```
 
 Defaults are reasonable; you only need env-overrides if you want different timing.

@@ -1,12 +1,15 @@
 # Turbohaul-Manager reference docker-compose.
 #
-# Runs the prebuilt self-contained image from the GitHub Container Registry
-# (the TurboQuant engine is baked in -- no separate binary to build or mount).
-# Just: docker compose up -d
+# Builds the self-contained image from source (Dockerfile.engine-src, the TurboQuant
+# engine compiled in-repo -- no external registry, PyPI, npm, or binary mount).
+# Just: docker compose up -d --build
 
 services:
   turbohaul-manager:
-    image: ghcr.io/mrtrenchtrucker/turbohaul-manager:v0.6.0
+    build:
+      context: .
+      dockerfile: Dockerfile.engine-src
+    image: turbohaul-manager:v0.6.0
     container_name: turbohaul-manager
     restart: unless-stopped
     ports:

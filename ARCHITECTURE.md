@@ -78,7 +78,7 @@ Concretely, it is a **standalone HTTP inference manager** that:
 - Presents an **Ollama-compatible + OpenAI-compatible API surface** (`/api/chat`, `/v1/chat/completions`, `/v1/embeddings`, tags/show, pulls/import) so Ollama- or OpenAI-aware clients can point at it transparently (full as-built route table in §7).
 - Supervises **`llama-server` sidecars** built from **[Tom's TurboQuant fork of llama.cpp](https://github.com/TheTom/llama-cpp-turboquant)** (vendored in-repo at `engine/llama-cpp-turboquant/`, pinned by `engine.lock`) — one subprocess per resident model, spawned/health-checked/torn down by the manager.
 - **Differentiator — KV-cache orchestration (§4):** the manager understands *who* each request is (main agent / sub-agent / curator / compression, per session) and *what that means for the precomputed KV cache*: the main agent's KV state is saved at model-swap seams to system RAM, persisted to disk after full unload, and restored on wave-return so follow-up turns re-use up to the full precomputed prefix instead of re-prefilling; disposable roles' KV is isolated per sub-agent and thrown away by contract — concurrent agents can no longer muddy each other's context.
-- Ships **self-contained and offline-usable**: vendored engine source, vendored wheels, a prebuilt image on ghcr.io (README "Self-contained build + prebuilt image").
+- Ships **self-contained and offline-usable**: vendored engine source, vendored wheels, and a committed frontend; builds fully offline via `Dockerfile.engine-src` (README "Self-contained offline build").
 
 Trust model in one line: single-tenant, network-perimeter security (bind address is the boundary; no app-layer auth in v1) — details in §8.
 
