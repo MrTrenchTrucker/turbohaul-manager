@@ -31,6 +31,11 @@ dev = [
     "pytest-mock>=3.14.0",
     "ruff>=0.7.0",
 ]
+# MLX backend support (Apple Silicon only). mlx-lm provides the
+# `python -m mlx_lm server` runner used by the turbohaul MLX backend.
+mlx = [
+    "mlx-lm>=0.21.0",
+]
 
 [project.scripts]
 turbohaul-manager = "turbohaul.__main__:main"
@@ -44,6 +49,9 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+markers = [
+    "e2e: real-engine end-to-end test (needs Apple Silicon + MLX_E2E=1)",
+]
 
 [tool.ruff]
 line-length = 120

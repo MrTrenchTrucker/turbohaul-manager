@@ -82,7 +82,9 @@ def create_app(
     mgr = TurbohaulManager(
         boot,
         runtime,
-        complete_fn=make_llama_server_complete_fn(),
+        complete_fn=make_llama_server_complete_fn(
+            manifests_path=boot.storage.manifests_path,
+        ),
     )
 
     @asynccontextmanager

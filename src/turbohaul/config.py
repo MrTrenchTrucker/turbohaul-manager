@@ -58,6 +58,11 @@ class RuntimePathsConfig(BaseModel):
     llama_server_binary: Path
     llama_server_binary_sha256: str = ""  # empty = skip verify (dev only)
     default_port_base: int = Field(default=11500, ge=1024, le=65000)
+    # MLX backend (Apple Silicon only). mlx_python_binary = interpreter that has
+    # mlx-lm installed (null = the running interpreter). mlx_models_dir = default
+    # local dir for MLX model repos. Ignored on non-Apple-Silicon hosts.
+    mlx_python_binary: Path | None = None
+    mlx_models_dir: Path | None = None
 
 
 class UIConfig(BaseModel):

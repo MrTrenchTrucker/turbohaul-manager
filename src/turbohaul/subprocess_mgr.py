@@ -54,11 +54,16 @@ class SidecarHandle:
         port: int,
         model_tag: str,
         parallel: int = 1,
+        model_id: str | None = None,
     ) -> None:
         self.proc = proc
         self.port = port
         self.model_tag = model_tag
-        # Live concurrency width pinned at spawn from the actual --parallel argv.
+        # Backend-served model identity (for completion proxying). For MLX this is
+        # the --model arg (HF repo id or local path) because mlx_lm server routes
+        # completion requests by the request `model` field and re-resolves it as a
+        # HuggingFace repo; None means "use the Turbohaul tag" (llama.cpp behavior).
+        self.model_id = model_id
         # The manager derives its per-model in-flight admission cap from THIS,
         # never a later manifest read (which can drift across warm-inherit reuse).
         self.parallel = parallel
