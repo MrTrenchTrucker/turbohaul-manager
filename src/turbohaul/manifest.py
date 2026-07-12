@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 
 # === Closed allowlist of safe llama-server flags (flag-injection guard) ===
@@ -588,12 +588,19 @@ class Manifest(BaseModel):
     model_tag: str
     display_name: str = ""
     description: str = ""
-    gguf_blob_sha256: str
+    backend: str = "llama.cpp"  # "llama.cpp" (default) or "mlx"
+    gguf_blob_sha256: str = ""
     gguf_size_bytes: int = Field(default=0, ge=0)
     context_size: int = Field(default=2048, ge=1)
-    expected_vram_bytes: int = Field(default=0, ge=0)  # mandatory for VRAM-fit pre-check
+    expected_vram_bytes: int = Field(default=0, ge=0)  # VRAM-fit pre-check (llama.cpp only)
     revision: int = Field(default=1, ge=1)  # ETag value
     llama_server_flags: dict[str, Any] = Field(default_factory=dict)
+    # MLX backend fields (Apple Silicon only). model_repo = HF repo id;
+    # model_path = local dir; mlx_server_flags = closed allowlist of
+    # mlx_lm.server CLI args.
+    model_repo: str = ""
+    model_path: str = ""
+    mlx_server_flags: dict[str, Any] = Field(default_factory=dict)
     prompt_template: PromptTemplate = Field(default_factory=PromptTemplate)
 
     @field_validator("model_tag")
@@ -602,14 +609,40 @@ class Manifest(BaseModel):
         validate_tag(v)
         return v
 
+    @field_validator("backend")
+    @classmethod
+    def _backend_valid(cls, v: str) -> str:
+        if v not in ("llama.cpp", "mlx"):
+            raise ManifestValidationError(
+                f"backend must be 'llama.cpp' or 'mlx', got {v!r}"
+            )
+        return v
+
     @field_validator("gguf_blob_sha256")
     @classmethod
-    def _sha256_format(cls, v: str) -> str:
+    def _sha256_format(cls, v: str, info: "ValidationInfo") -> str:
+        # MLX models have no GGUF blob, so the empty string is valid for them.
+        # llama.cpp models still require a 64-hex sha256.
+        if v == "":
+            if info.data.get("backend") == "mlx":
+                return v
+            raise ManifestValidationError(
+                "gguf_blob_sha256 must be 64 hex chars for llama.cpp backends; "
+                "MLX backends may use an empty string"
+            )
         if not re.fullmatch(r"[0-9a-f]{64}", v):
             raise ManifestValidationError(
                 f"gguf_blob_sha256 must be 64 hex chars; got {v[:32]}... (len={len(v)})"
             )
         return v
+
+    def is_mlx(self) -> bool:
+        """True if this manifest uses the MLX backend."""
+        return self.backend == "mlx"
+
+    def is_llama_cpp(self) -> bool:
+        """True if this manifest uses the llama.cpp backend."""
+        return self.backend == "llama.cpp"
 
     @field_validator("llama_server_flags")
     @classmethod
@@ -633,6 +666,19 @@ class Manifest(BaseModel):
         # Cross-field: parallel>1 must split ctx_size into per-slot windows that
         # meet PER_SLOT_CTX_FLOOR (runs in the same validation pass).
         _validate_parallel_ctx(v)
+        return v
+
+    @field_validator("mlx_server_flags")
+    @classmethod
+    def _mlx_flags_allowlist(cls, v: dict[str, Any]) -> dict[str, Any]:
+        # Closed allowlist + type check against the MLX backend's SAFE_MLX_FLAGS.
+        # Re-checked at spawn time in mlx_spawn, this is defense-in-depth at parse.
+        from turbohaul.mlx_spawn import validate_mlx_flags
+
+        try:
+            validate_mlx_flags(v)
+        except ValueError as e:
+            raise ManifestValidationError(str(e)) from e
         return v
 
 

@@ -65,6 +65,7 @@ from turbohaul.subprocess_mgr import (
     verify_vram_cleared,
     wait_until_healthy,
 )
+from turbohaul.mlx_spawn import mlx_spawn, mlx_flags_to_argv
 from turbohaul.telemetry import FlapTelemetry, init_telemetry
 
 
@@ -3028,19 +3029,28 @@ class TurbohaulManager:
         then publish r.handle + state=ACTIVE under the lock. On failure: fail the
         slot future and return None (the finally/supervisor reaps the resident)."""
         argv: list[str] = []
+        is_mlx = False
         try:
             manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
-            argv = flags_to_argv(manifest.llama_server_flags)
-            gguf_path = (
-                self.boot.storage.blob_store_path
-                / "sha256"
-                / manifest.gguf_blob_sha256[:2]
-                / manifest.gguf_blob_sha256
-            )
+            is_mlx = manifest.is_mlx()
+            if is_mlx:
+                # MLX: no GGUF blob, no slot-save KV. Build argv from the MLX
+                # closed allowlist (validated again at spawn time in mlx_spawn).
+                argv = mlx_flags_to_argv(manifest.mlx_server_flags)
+            else:
+                argv = flags_to_argv(manifest.llama_server_flags)
+                gguf_path = (
+                    self.boot.storage.blob_store_path
+                    / "sha256"
+                    / manifest.gguf_blob_sha256[:2]
+                    / manifest.gguf_blob_sha256
+                )
         except FileNotFoundError:
             gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
         # Per-model host safety gate (RAM/IO/load + the per-spawn VRAM/KV gate). The
         # CROSS-resident over-commit gate already ran under the lock at reserve.
+        # For MLX, expected_vram_bytes is 0 (unified memory), so the VRAM pre-check
+        # is a no-op and RAM/IO gates still apply.
         if self.runtime.queue.safety_enabled:
             gate_ok = await self._run_spawn_safety_gate(slot)
             if not gate_ok:
@@ -3048,14 +3058,24 @@ class TurbohaulManager:
                     slot, RuntimeError("safety gates refused spawn")
                 )
                 return None
-        handle = self._spawn(
-            self.boot.runtime.llama_server_binary,
-            gguf_path,
-            r.port,
-            slot.model_tag,
-            argv,
-            binary_fd=self._binary_fd,
-        )
+        if is_mlx:
+            handle = mlx_spawn(
+                r.port,
+                slot.model_tag,
+                manifest.model_repo,
+                manifest.model_path,
+                manifest.mlx_server_flags,
+                python_binary=self.boot.runtime.mlx_python_binary,
+            )
+        else:
+            handle = self._spawn(
+                self.boot.runtime.llama_server_binary,
+                gguf_path,
+                r.port,
+                slot.model_tag,
+                argv,
+                binary_fd=self._binary_fd,
+            )
         async with self._registry_lock:
             r.booting_pid = handle.pid  # in the reaper union before handle is set
         slot.port = handle.port
@@ -3078,7 +3098,10 @@ class TurbohaulManager:
             return None
         # Best-effort KV restore after a healthy (re)spawn so the next same-thread
         # request reuses the slot KV (prefix-match) instead of re-prefilling.
-        await self._restore_slot_kv(r.port, r.model_tag, slot)
+        # MLX has no slot-save KV cache (unified memory, no /slot-save-path), so
+        # skip it there.
+        if not is_mlx:
+            await self._restore_slot_kv(r.port, r.model_tag, slot)
         async with self._registry_lock:
             r.handle = handle
             r.booting_pid = None
@@ -3858,19 +3881,25 @@ class TurbohaulManager:
         self._set_latest_keep_alive(None)
 
         try:
-            # Build llama-server argv from manifest if available; tolerate missing
+            # Build backend argv from manifest if available; tolerate missing
             # manifest for testing convenience.
             argv: list[str] = []
+            manifest_is_mlx = False
             manifest_found = True
             try:
                 manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
-                argv = flags_to_argv(manifest.llama_server_flags)
-                gguf_path = (
-                    self.boot.storage.blob_store_path
-                    / "sha256"
-                    / manifest.gguf_blob_sha256[:2]
-                    / manifest.gguf_blob_sha256
-                )
+                manifest_is_mlx = manifest.is_mlx()
+                if manifest_is_mlx:
+                    # MLX: no GGUF blob. Build argv from the MLX closed allowlist.
+                    argv = mlx_flags_to_argv(manifest.mlx_server_flags)
+                else:
+                    argv = flags_to_argv(manifest.llama_server_flags)
+                    gguf_path = (
+                        self.boot.storage.blob_store_path
+                        / "sha256"
+                        / manifest.gguf_blob_sha256[:2]
+                        / manifest.gguf_blob_sha256
+                    )
             except FileNotFoundError:
                 manifest_found = False
                 gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
@@ -4066,6 +4095,7 @@ class TurbohaulManager:
                         manifest_main_gpu = int(
                             m_for_vram.llama_server_flags.get("main_gpu", 0) or 0
                         )
+                        manifest_is_mlx = m_for_vram.is_mlx()
                         # cpu_moe / n_cpu_moe offload experts to RAM -> the closed-form
                         # body=gguf over-counts; the cpu-moe gate branch trusts the
                         # manifest's measured expected_vram for those configs (parity
@@ -4135,14 +4165,25 @@ class TurbohaulManager:
                             ),
                         )
                         return
-                handle = self._spawn(
-                    self.boot.runtime.llama_server_binary,
-                    gguf_path,
-                    port,
-                    slot.model_tag,
-                    argv,
-                    binary_fd=self._binary_fd,
-                )
+                handle: SidecarHandle
+                if manifest_is_mlx:
+                    handle = mlx_spawn(
+                        port,
+                        slot.model_tag,
+                        manifest.model_repo if manifest_found else "",
+                        manifest.model_path if manifest_found else "",
+                        manifest.mlx_server_flags if manifest_found else {},
+                        python_binary=self.boot.runtime.mlx_python_binary,
+                    )
+                else:
+                    handle = self._spawn(
+                        self.boot.runtime.llama_server_binary,
+                        gguf_path,
+                        port,
+                        slot.model_tag,
+                        argv,
+                        binary_fd=self._binary_fd,
+                    )
                 slot.port = handle.port
                 slot.pid = handle.pid
                 self._set_active_handle(handle)
