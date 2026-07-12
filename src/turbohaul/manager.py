@@ -88,6 +88,7 @@ from turbohaul.subprocess_mgr import (
     verify_vram_cleared,
     wait_until_healthy,
 )
+from turbohaul.mlx_spawn import mlx_spawn, mlx_flags_to_argv
 from turbohaul.telemetry import FlapTelemetry, init_telemetry
 
 
@@ -12387,135 +12388,145 @@ class TurbohaulManager:
         manifest (``main_gpu=0``, ``split_mode='layer'``) -- not a new
         behavior, just keeping the existing one from crashing."""
         argv: list[str] = []
+        is_mlx = False
         spawn_flags: dict = {}
         try:
             manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
-            spawn_flags = manifest.llama_server_flags
-            # The reservation-time auto-placer may have overridden
-            # main_gpu/split_mode on r (see _reserve_and_start_locked /
-            # _auto_pick_gpu) — those are the ACTUAL admitted/reserved values.
-            # Re-deriving argv from the raw manifest flags alone would spawn on
-            # the manifest's original main_gpu, silently ignoring the
-            # auto-placement decision (and defeating the whole feature — the
-            # cross-resident gate would have checked one card while the process
-            # binds another).
-            # Override when the placement was OVERRIDDEN, not merely
-            # when the manifest opted into auto-placement. manifest.auto_place
-            # is NOT a complete test for an override: the
-            # auto-placer is not the only thing that can move a resident off
-            # its manifest card. The cross-card relocation sets
-            # main_gpu_override EXCLUSIVELY on the arm the manifest.auto_place proxy excludes --
-            # it is only ever set in the non-auto_place branch of
-            # _route_or_reserve, whose guard is the exact complement of
-            # this one -- so a test on manifest.auto_place alone would keep the
-            # relocated card from reaching argv by construction: the manager
-            # would gate card X while the process bound card Y.
-            # The guarantee: argv reflects the placement the cross-resident VRAM
-            # gate actually admitted, and the manifest's own main_gpu/split_mode
-            # govern argv IF AND ONLY IF nothing overrode them.
-            # Byte-identity is owed to UN-OVERRIDDEN spawns, not to
-            # non-auto_place spawns; those are different sets
-            # whenever a relocation override is in play.
-            # Same scope as
-            # reasoning_budget_override's own claim below.
-            manifest_split = str(
-                spawn_flags.get("split_mode", "layer") or "layer"
-            )
-            if (manifest.auto_place and manifest_split == "none") or (
-                r.placement_overridden
-            ):
-                spawn_flags = {
-                    **spawn_flags,
-                    "main_gpu": r.main_gpu,
-                    "split_mode": r.split_mode,
-                }
-            # Identical hazard/shape to the
-            # main_gpu/split_mode override just above -- the reservation-time
-            # resolution (_reserve_and_start_locked) already decided what the
-            # FIRST caller's reasoning_effort resolves to against this
-            # manifest's own reasoning_budget; r.reasoning_budget_override is
-            # the ACTUAL admitted value. Re-deriving argv from the raw
-            # manifest flags alone would spawn with the manifest's
-            # UNMODIFIED reasoning_budget, silently ignoring what the first
-            # caller asked for. None (no reasoning_effort asked, or nothing
-            # to take a fraction of) leaves the manifest's own value
-            # untouched -- the non-reasoning_effort path stays byte-identical.
-            if r.reasoning_budget_override is not None:
-                spawn_flags = {
-                    **spawn_flags,
-                    "reasoning_budget": r.reasoning_budget_override,
-                }
-            argv = flags_to_argv(spawn_flags)
-            gguf_path = (
-                self.boot.storage.blob_store_path
-                / "sha256"
-                / manifest.gguf_blob_sha256[:2]
-                / manifest.gguf_blob_sha256
-            )
-            # Vision projector (mmproj): resolve the CONTENT-ADDRESSED blob and
-            # inject --mmproj. Manager-derived path only; the raw path-bearing
-            # `mmproj` flag stays in DENIED_FLAGS (no arbitrary file).
-            if manifest.mmproj_blob_sha256:
-                argv += ["--mmproj", str(
+            is_mlx = manifest.is_mlx()
+            if is_mlx:
+                # MLX: no GGUF blob, no auto-placer (unified memory, no
+                # per-card placement), no slot-save KV. Build argv from the MLX
+                # closed allowlist (validated again at spawn time in mlx_spawn).
+                argv = mlx_flags_to_argv(manifest.mlx_server_flags)
+            else:
+                spawn_flags = manifest.llama_server_flags
+                # The reservation-time auto-placer may have overridden
+                # main_gpu/split_mode on r (see _reserve_and_start_locked /
+                # _auto_pick_gpu) — those are the ACTUAL admitted/reserved values.
+                # Re-deriving argv from the raw manifest flags alone would spawn on
+                # the manifest's original main_gpu, silently ignoring the
+                # auto-placement decision (and defeating the whole feature — the
+                # cross-resident gate would have checked one card while the process
+                # binds another).
+                # Override when the placement was OVERRIDDEN, not merely
+                # when the manifest opted into auto-placement. manifest.auto_place
+                # is NOT a complete test for an override: the
+                # auto-placer is not the only thing that can move a resident off
+                # its manifest card. The cross-card relocation sets
+                # main_gpu_override EXCLUSIVELY on the arm the manifest.auto_place proxy excludes --
+                # it is only ever set in the non-auto_place branch of
+                # _route_or_reserve, whose guard is the exact complement of
+                # this one -- so a test on manifest.auto_place alone would keep the
+                # relocated card from reaching argv by construction: the manager
+                # would gate card X while the process bound card Y.
+                # The guarantee: argv reflects the placement the cross-resident VRAM
+                # gate actually admitted, and the manifest's own main_gpu/split_mode
+                # govern argv IF AND ONLY IF nothing overrode them.
+                # Byte-identity is owed to UN-OVERRIDDEN spawns, not to
+                # non-auto_place spawns; those are different sets
+                # whenever a relocation override is in play.
+                # Same scope as
+                # reasoning_budget_override's own claim below.
+                manifest_split = str(
+                    spawn_flags.get("split_mode", "layer") or "layer"
+                )
+                if (manifest.auto_place and manifest_split == "none") or (
+                    r.placement_overridden
+                ):
+                    spawn_flags = {
+                        **spawn_flags,
+                        "main_gpu": r.main_gpu,
+                        "split_mode": r.split_mode,
+                    }
+                # Identical hazard/shape to the
+                # main_gpu/split_mode override just above -- the reservation-time
+                # resolution (_reserve_and_start_locked) already decided what the
+                # FIRST caller's reasoning_effort resolves to against this
+                # manifest's own reasoning_budget; r.reasoning_budget_override is
+                # the ACTUAL admitted value. Re-deriving argv from the raw
+                # manifest flags alone would spawn with the manifest's
+                # UNMODIFIED reasoning_budget, silently ignoring what the first
+                # caller asked for. None (no reasoning_effort asked, or nothing
+                # to take a fraction of) leaves the manifest's own value
+                # untouched -- the non-reasoning_effort path stays byte-identical.
+                if r.reasoning_budget_override is not None:
+                    spawn_flags = {
+                        **spawn_flags,
+                        "reasoning_budget": r.reasoning_budget_override,
+                    }
+                argv = flags_to_argv(spawn_flags)
+                gguf_path = (
                     self.boot.storage.blob_store_path
                     / "sha256"
-                    / manifest.mmproj_blob_sha256[:2]
-                    / manifest.mmproj_blob_sha256
-                )]
-            # Standalone draft model (D-Flash/D-Spark): same
-            # content-addressed pattern as mmproj above -- resolve the blob and
-            # inject --spec-draft-model (engine/.../common/arg.cpp, aliases
-            # -md/--model-draft). Manager-derived path only; the raw path/repo-
-            # bearing spec_draft_model/spec_draft_hf_repo flags are NOT
-            # allowlisted (see manifest.py's field comment + suffix guard).
-            # Gated on spec_type too, not
-            # the hash alone -- the engine's has_dft() keys purely on the draft
-            # path being non-empty and never consults spec_type, so a hash-only
-            # manifest (spec_type omitted, or draft-mtp, which uses a bundled
-            # head and never needs a standalone drafter) would otherwise load a
-            # full second, entirely unbudgeted model at the target's full
-            # ctx_size -- an authorable availability hazard. Logged, not
-            # silently dropped, when the hash is set but spec_type doesn't
-            # qualify.
-            _spec_type_for_draft = str(spawn_flags.get("spec_type", "") or "").strip().lower()
-            if manifest.spec_draft_gguf_blob_sha256:
-                if _spec_type_for_draft in SPEC_TYPES_WITH_STANDALONE_DRAFT_MODEL:
-                    argv += ["--spec-draft-model", str(
+                    / manifest.gguf_blob_sha256[:2]
+                    / manifest.gguf_blob_sha256
+                )
+                # Vision projector (mmproj): resolve the CONTENT-ADDRESSED blob and
+                # inject --mmproj. Manager-derived path only; the raw path-bearing
+                # `mmproj` flag stays in DENIED_FLAGS (no arbitrary file).
+                if manifest.mmproj_blob_sha256:
+                    argv += ["--mmproj", str(
                         self.boot.storage.blob_store_path
                         / "sha256"
-                        / manifest.spec_draft_gguf_blob_sha256[:2]
-                        / manifest.spec_draft_gguf_blob_sha256
+                        / manifest.mmproj_blob_sha256[:2]
+                        / manifest.mmproj_blob_sha256
                     )]
-                else:
-                    log.warning(
-                        "spec_draft_gguf_blob_sha256 set (%s...) but "
-                        "spec_type=%r does not use a standalone draft model "
-                        "-- ignored, no --spec-draft-model injected; "
-                        "model_tag=%s",
-                        manifest.spec_draft_gguf_blob_sha256[:12],
-                        _spec_type_for_draft or None, manifest.model_tag,
-                    )
-                    # This manager-detected downgrade (config
-                    # never even reaches the engine) is the SAME informational
-                    # category as the engine-detected one -- surface it on
-                    # the same channel so the user sees it too, not just the
-                    # log. arch is unknown here (no GGUF read at this point,
-                    # never fabricated); component="draft" reuses the engine's own
-                    # vocabulary since this IS specifically the draft-model
-                    # injection path.
-                    spec_downgrade_log.log_spec_downgrade(
-                        model_tag=manifest.model_tag, source="manager_config",
-                        component="draft", reason_code="spec_type_mismatch",
-                        detail=(
-                            f"spec_draft_gguf_blob_sha256 set but "
-                            f"spec_type={_spec_type_for_draft or None!r} does "
-                            "not use a standalone draft model"
-                        ),
-                    )
+                # Standalone draft model (D-Flash/D-Spark): same
+                # content-addressed pattern as mmproj above -- resolve the blob and
+                # inject --spec-draft-model (engine/.../common/arg.cpp, aliases
+                # -md/--model-draft). Manager-derived path only; the raw path/repo-
+                # bearing spec_draft_model/spec_draft_hf_repo flags are NOT
+                # allowlisted (see manifest.py's field comment + suffix guard).
+                # Gated on spec_type too, not
+                # the hash alone -- the engine's has_dft() keys purely on the draft
+                # path being non-empty and never consults spec_type, so a hash-only
+                # manifest (spec_type omitted, or draft-mtp, which uses a bundled
+                # head and never needs a standalone drafter) would otherwise load a
+                # full second, entirely unbudgeted model at the target's full
+                # ctx_size -- an authorable availability hazard. Logged, not
+                # silently dropped, when the hash is set but spec_type doesn't
+                # qualify.
+                _spec_type_for_draft = str(spawn_flags.get("spec_type", "") or "").strip().lower()
+                if manifest.spec_draft_gguf_blob_sha256:
+                    if _spec_type_for_draft in SPEC_TYPES_WITH_STANDALONE_DRAFT_MODEL:
+                        argv += ["--spec-draft-model", str(
+                            self.boot.storage.blob_store_path
+                            / "sha256"
+                            / manifest.spec_draft_gguf_blob_sha256[:2]
+                            / manifest.spec_draft_gguf_blob_sha256
+                        )]
+                    else:
+                        log.warning(
+                            "spec_draft_gguf_blob_sha256 set (%s...) but "
+                            "spec_type=%r does not use a standalone draft model "
+                            "-- ignored, no --spec-draft-model injected; "
+                            "model_tag=%s",
+                            manifest.spec_draft_gguf_blob_sha256[:12],
+                            _spec_type_for_draft or None, manifest.model_tag,
+                        )
+                        # This manager-detected downgrade (config
+                        # never even reaches the engine) is the SAME informational
+                        # category as the engine-detected one -- surface it on
+                        # the same channel so the user sees it too, not just the
+                        # log. arch is unknown here (no GGUF read at this point,
+                        # never fabricated); component="draft" reuses the engine's own
+                        # vocabulary since this IS specifically the draft-model
+                        # injection path.
+                        spec_downgrade_log.log_spec_downgrade(
+                            model_tag=manifest.model_tag, source="manager_config",
+                            component="draft", reason_code="spec_type_mismatch",
+                            detail=(
+                                f"spec_draft_gguf_blob_sha256 set but "
+                                f"spec_type={_spec_type_for_draft or None!r} does "
+                                "not use a standalone draft model"
+                            ),
+                        )
         except FileNotFoundError:
             gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
         # Per-model host safety gate (RAM/IO/load + the per-spawn VRAM/KV gate). The
         # CROSS-resident over-commit gate already ran under the lock at reserve.
+        # For MLX, expected_vram_bytes is 0 (unified memory), so the VRAM pre-check
+        # is a no-op and RAM/IO gates still apply.
         if self.runtime.queue.safety_enabled:
             # TOCTOU baseline. r.spawn_barrier_active
             # only flips True under the lock below, AFTER this gate's own await
@@ -12619,14 +12630,24 @@ class TurbohaulManager:
                     return None
         prior_port, prior_pid = slot.port, slot.pid
         try:
-            handle = self._spawn(
-                self.boot.runtime.llama_server_binary,
-                gguf_path,
-                r.port,
-                slot.model_tag,
-                argv,
-                binary_fd=self._binary_fd,
-            )
+            if is_mlx:
+                handle = mlx_spawn(
+                    r.port,
+                    slot.model_tag,
+                    manifest.model_repo,
+                    manifest.model_path,
+                    manifest.mlx_server_flags,
+                    python_binary=self.boot.runtime.mlx_python_binary,
+                )
+            else:
+                handle = self._spawn(
+                    self.boot.runtime.llama_server_binary,
+                    gguf_path,
+                    r.port,
+                    slot.model_tag,
+                    argv,
+                    binary_fd=self._binary_fd,
+                )
             # A fresh sidecar on this port invalidates any earlier probe-recorded
             # think-free count for it (different process, possibly different
             # model) -- drop the stale entry per the register's documented
@@ -12728,63 +12749,66 @@ class TurbohaulManager:
             )
         # Best-effort KV restore after a healthy (re)spawn so the next same-thread
         # request reuses the slot KV (prefix-match) instead of re-prefilling.
-        _expected_tokens = await self._restore_slot_kv(r.port, r.model_tag, slot)
-        # This resident-driver restore is the SAME disk-restore
-        # mechanism as the cold single-slot site above (a session return IS the cold
-        # path), and without this call it would emit no LOAD_VERIFY record at all.
-        # trigger="session-return" distinguishes it from the single-slot cold
-        # path's trigger="spawn" in the ring.
-        try:
-            # Pass the engine's own restore-response token count
-            # (if _restore_slot_kv_inner captured one) as the actual_n_past
-            # override -- verify_kv_restored skips its own racy /slots re-GET
-            # entirely when this is provided. None here (no count captured) falls
-            # through to today's GET-based behavior unchanged.
-            _actual_n_past = (getattr(self, "_kv_restore_actual_tokens", {}) or {}).pop(r.port, None)
-            _kv = await load_verify_log.verify_kv_restored(
-                handle, 0, _expected_tokens, actual_n_past=_actual_n_past,
-            )
-            # Derived from the SAME verdict already computed above, mirroring
-            # the model_load site's "ok" if healthy else "failed" pattern --
-            # True is the only pass; None (never established) reads as
-            # "unverified", not "ok" (log_load_verify enforces this same rule
-            # structurally too, so a future regression here still can't ship
-            # a passing status alongside a non-True verdict).
-            _kv_restore_ok = _kv.get("kv_restore_ok")
-            load_verify_log.log_load_verify(
-                event="kv_restore", trigger="session-return",
-                model_tag=r.model_tag, port=r.port,
-                pid=getattr(handle, "pid", None),
-                # process_alive is the SAME read verify_kv_restored just took
-                # (engine liveness at the instant of the /slots read), not a
-                # hardcoded assumption.
-                # health_200/model_resident have no kv_restore-
-                # path equivalent read of their own here either (this is the
-                # third site with this exact pattern; the other two sites
-                # hardcode True for them instead of reading them).
-                # None:
-                # genuinely not measured on THIS record.
-                process_alive=_kv.get("process_alive"), health_200=None, model_resident=None,
-                kv_expected_tokens=_kv.get("kv_expected_tokens"),
-                kv_actual_n_past=_kv.get("kv_actual_n_past"),
-                kv_restore_ok=_kv_restore_ok,
-                restore_attempted=_kv.get("restore_attempted"),
-                kv_expected_reason=_kv.get("kv_expected_reason"),
-                kv_actual_reason=_kv.get("kv_actual_reason"),
-                retry_count=0,
-                final_status=(
-                    "ok" if _kv_restore_ok is True
-                    else "unverified" if _kv_restore_ok is None
-                    else "failed"
-                ),
-                reason=_kv.get("reason"),
-                source=_kv.get("source"),
-                slots_http_status=_kv.get("slots_http_status"),
-                slot_id_found=_kv.get("slot_id_found"),
-                session_id=(slot.client_meta or {}).get("session_id") if isinstance(slot.client_meta, dict) else None,
-            )
-        except Exception:
-            log.debug("LOAD_VERIFY kv_restore (session-return) emit failed (best-effort)", exc_info=True)
+        # MLX has no slot-save KV cache (unified memory, no /slot-save-path), so
+        # skip it there.
+        if not is_mlx:
+            _expected_tokens = await self._restore_slot_kv(r.port, r.model_tag, slot)
+            # This resident-driver restore is the SAME disk-restore
+            # mechanism as the cold single-slot site above (a session return IS the cold
+            # path), and without this call it would emit no LOAD_VERIFY record at all.
+            # trigger="session-return" distinguishes it from the single-slot cold
+            # path's trigger="spawn" in the ring.
+            try:
+                # Pass the engine's own restore-response token count
+                # (if _restore_slot_kv_inner captured one) as the actual_n_past
+                # override -- verify_kv_restored skips its own racy /slots re-GET
+                # entirely when this is provided. None here (no count captured) falls
+                # through to today's GET-based behavior unchanged.
+                _actual_n_past = (getattr(self, "_kv_restore_actual_tokens", {}) or {}).pop(r.port, None)
+                _kv = await load_verify_log.verify_kv_restored(
+                    handle, 0, _expected_tokens, actual_n_past=_actual_n_past,
+                )
+                # Derived from the SAME verdict already computed above, mirroring
+                # the model_load site's "ok" if healthy else "failed" pattern --
+                # True is the only pass; None (never established) reads as
+                # "unverified", not "ok" (log_load_verify enforces this same rule
+                # structurally too, so a future regression here still can't ship
+                # a passing status alongside a non-True verdict).
+                _kv_restore_ok = _kv.get("kv_restore_ok")
+                load_verify_log.log_load_verify(
+                    event="kv_restore", trigger="session-return",
+                    model_tag=r.model_tag, port=r.port,
+                    pid=getattr(handle, "pid", None),
+                    # process_alive is the SAME read verify_kv_restored just took
+                    # (engine liveness at the instant of the /slots read), not a
+                    # hardcoded assumption.
+                    # health_200/model_resident have no kv_restore-
+                    # path equivalent read of their own here either (this is the
+                    # third site with this exact pattern; the other two sites
+                    # hardcode True for them instead of reading them).
+                    # None:
+                    # genuinely not measured on THIS record.
+                    process_alive=_kv.get("process_alive"), health_200=None, model_resident=None,
+                    kv_expected_tokens=_kv.get("kv_expected_tokens"),
+                    kv_actual_n_past=_kv.get("kv_actual_n_past"),
+                    kv_restore_ok=_kv_restore_ok,
+                    restore_attempted=_kv.get("restore_attempted"),
+                    kv_expected_reason=_kv.get("kv_expected_reason"),
+                    kv_actual_reason=_kv.get("kv_actual_reason"),
+                    retry_count=0,
+                    final_status=(
+                        "ok" if _kv_restore_ok is True
+                        else "unverified" if _kv_restore_ok is None
+                        else "failed"
+                    ),
+                    reason=_kv.get("reason"),
+                    source=_kv.get("source"),
+                    slots_http_status=_kv.get("slots_http_status"),
+                    slot_id_found=_kv.get("slot_id_found"),
+                    session_id=(slot.client_meta or {}).get("session_id") if isinstance(slot.client_meta, dict) else None,
+                )
+            except Exception:
+                log.debug("LOAD_VERIFY kv_restore (session-return) emit failed (best-effort)", exc_info=True)
         async with self._registry_lock:
             r.handle = handle
             r.booting_pid = None
@@ -15359,66 +15383,72 @@ class TurbohaulManager:
         self._set_latest_keep_alive(None)
 
         try:
-            # Build llama-server argv from manifest if available; tolerate missing
+            # Build backend argv from manifest if available; tolerate missing
             # manifest for testing convenience.
             argv: list[str] = []
+            manifest_is_mlx = False
             manifest_found = True
             try:
                 manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
-                argv = flags_to_argv(manifest.llama_server_flags)
-                gguf_path = (
-                    self.boot.storage.blob_store_path
-                    / "sha256"
-                    / manifest.gguf_blob_sha256[:2]
-                    / manifest.gguf_blob_sha256
-                )
-                # Vision projector (mmproj): resolve the CONTENT-ADDRESSED blob and
-                # inject --mmproj. Manager-derived path only; the raw path-bearing
-                # `mmproj` flag stays in DENIED_FLAGS (no arbitrary file).
-                if manifest.mmproj_blob_sha256:
-                    argv += ["--mmproj", str(
+                manifest_is_mlx = manifest.is_mlx()
+                if manifest_is_mlx:
+                    # MLX: no GGUF blob. Build argv from the MLX closed allowlist.
+                    argv = mlx_flags_to_argv(manifest.mlx_server_flags)
+                else:
+                    argv = flags_to_argv(manifest.llama_server_flags)
+                    gguf_path = (
                         self.boot.storage.blob_store_path
                         / "sha256"
-                        / manifest.mmproj_blob_sha256[:2]
-                        / manifest.mmproj_blob_sha256
-                    )]
-                # Standalone draft model (D-Flash/D-Spark): same
-                # content-addressed pattern as mmproj above -- see the other
-                # call site for the full rationale. Gated
-                # on spec_type too, not the hash alone -- see the other call
-                # site's comment for why. Logged, not silently dropped, when
-                # ignored.
-                _spec_type_for_draft = str(
-                    manifest.llama_server_flags.get("spec_type", "") or ""
-                ).strip().lower()
-                if manifest.spec_draft_gguf_blob_sha256:
-                    if _spec_type_for_draft in SPEC_TYPES_WITH_STANDALONE_DRAFT_MODEL:
-                        argv += ["--spec-draft-model", str(
+                        / manifest.gguf_blob_sha256[:2]
+                        / manifest.gguf_blob_sha256
+                    )
+                    # Vision projector (mmproj): resolve the CONTENT-ADDRESSED blob and
+                    # inject --mmproj. Manager-derived path only; the raw path-bearing
+                    # `mmproj` flag stays in DENIED_FLAGS (no arbitrary file).
+                    if manifest.mmproj_blob_sha256:
+                        argv += ["--mmproj", str(
                             self.boot.storage.blob_store_path
                             / "sha256"
-                            / manifest.spec_draft_gguf_blob_sha256[:2]
-                            / manifest.spec_draft_gguf_blob_sha256
+                            / manifest.mmproj_blob_sha256[:2]
+                            / manifest.mmproj_blob_sha256
                         )]
-                    else:
-                        log.warning(
-                            "spec_draft_gguf_blob_sha256 set (%s...) but "
-                            "spec_type=%r does not use a standalone draft "
-                            "model -- ignored, no --spec-draft-model "
-                            "injected; model_tag=%s",
-                            manifest.spec_draft_gguf_blob_sha256[:12],
-                            _spec_type_for_draft or None, manifest.model_tag,
-                        )
-                        # See the other call site's comment
-                        # for the full rationale.
-                        spec_downgrade_log.log_spec_downgrade(
-                            model_tag=manifest.model_tag, source="manager_config",
-                            component="draft", reason_code="spec_type_mismatch",
-                            detail=(
-                                f"spec_draft_gguf_blob_sha256 set but "
-                                f"spec_type={_spec_type_for_draft or None!r} "
-                                "does not use a standalone draft model"
-                            ),
-                        )
+                    # Standalone draft model (D-Flash/D-Spark): same
+                    # content-addressed pattern as mmproj above -- see the other
+                    # call site for the full rationale. Gated
+                    # on spec_type too, not the hash alone -- see the other call
+                    # site's comment for why. Logged, not silently dropped, when
+                    # ignored.
+                    _spec_type_for_draft = str(
+                        manifest.llama_server_flags.get("spec_type", "") or ""
+                    ).strip().lower()
+                    if manifest.spec_draft_gguf_blob_sha256:
+                        if _spec_type_for_draft in SPEC_TYPES_WITH_STANDALONE_DRAFT_MODEL:
+                            argv += ["--spec-draft-model", str(
+                                self.boot.storage.blob_store_path
+                                / "sha256"
+                                / manifest.spec_draft_gguf_blob_sha256[:2]
+                                / manifest.spec_draft_gguf_blob_sha256
+                            )]
+                        else:
+                            log.warning(
+                                "spec_draft_gguf_blob_sha256 set (%s...) but "
+                                "spec_type=%r does not use a standalone draft "
+                                "model -- ignored, no --spec-draft-model "
+                                "injected; model_tag=%s",
+                                manifest.spec_draft_gguf_blob_sha256[:12],
+                                _spec_type_for_draft or None, manifest.model_tag,
+                            )
+                            # See the other call site's comment
+                            # for the full rationale.
+                            spec_downgrade_log.log_spec_downgrade(
+                                model_tag=manifest.model_tag, source="manager_config",
+                                component="draft", reason_code="spec_type_mismatch",
+                                detail=(
+                                    f"spec_draft_gguf_blob_sha256 set but "
+                                    f"spec_type={_spec_type_for_draft or None!r} "
+                                    "does not use a standalone draft model"
+                                ),
+                            )
             except FileNotFoundError:
                 manifest_found = False
                 gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
@@ -15702,6 +15732,7 @@ class TurbohaulManager:
                         manifest_main_gpu = int(
                             m_for_vram.llama_server_flags.get("main_gpu", 0) or 0
                         )
+                        manifest_is_mlx = m_for_vram.is_mlx()
                         # cpu_moe / n_cpu_moe offload experts to RAM -> the closed-form
                         # body=gguf over-counts; the cpu-moe gate branch trusts the
                         # manifest's measured expected_vram for those configs (parity
@@ -15806,14 +15837,25 @@ class TurbohaulManager:
                             ),
                         )
                         return
-                handle = self._spawn(
-                    self.boot.runtime.llama_server_binary,
-                    gguf_path,
-                    port,
-                    slot.model_tag,
-                    argv,
-                    binary_fd=self._binary_fd,
-                )
+                handle: SidecarHandle
+                if manifest_is_mlx:
+                    handle = mlx_spawn(
+                        port,
+                        slot.model_tag,
+                        manifest.model_repo if manifest_found else "",
+                        manifest.model_path if manifest_found else "",
+                        manifest.mlx_server_flags if manifest_found else {},
+                        python_binary=self.boot.runtime.mlx_python_binary,
+                    )
+                else:
+                    handle = self._spawn(
+                        self.boot.runtime.llama_server_binary,
+                        gguf_path,
+                        port,
+                        slot.model_tag,
+                        argv,
+                        binary_fd=self._binary_fd,
+                    )
                 # A fresh sidecar on this port invalidates
                 # any earlier probe-recorded think-free count for it (the ordinary
                 # cold-spawn path) — drop the stale entry per the register's
