@@ -4199,7 +4199,9 @@ class TurbohaulManager:
                 # belt-wrapped anyway). The bounded verify+RETRY loop is the follow-up
                 # behavior step once these records show the real failure modes.
                 try:
-                    _mv = await load_verify_log.verify_model_resident(handle)
+                    _mv = await load_verify_log.verify_model_resident(
+                        handle, mlx=manifest_is_mlx
+                    )
                     load_verify_log.log_load_verify(
                         event="model_load", trigger="spawn",
                         model_tag=slot.model_tag, port=port,
