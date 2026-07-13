@@ -120,6 +120,32 @@ conda install -c conda-forge mlx-lm
 
 The macOS helper script is `turbohaul-launcher.sh`.
 
+### Web UI (no Docker needed)
+
+Turbohaul serves its own dashboard from the same port at **`/ui`** — there is
+no separate container or service to run. A built frontend bundle is committed
+to the repo at `src/frontend/dist`, and `ui.static_path` defaults to it
+automatically, so the UI works out of the box on a source checkout or
+`pip install -e .`:
+
+- Open **http://localhost:11401/ui** after starting Turbohaul.
+- No `ui.static_path` entry is needed in your `turbohaul.yaml`; the default
+  resolves to the bundled `src/frontend/dist`.
+
+If you'd rather rebuild the UI from source (e.g. after editing it):
+
+```bash
+cd src/frontend
+npm install
+npm run build            # outputs src/frontend/dist
+# or live-dev with hot reload on Vite's own port (default :5173):
+npm run dev
+```
+
+To disable the UI, set `ui.enabled: false` in `turbohaul.yaml`. (In the Docker
+image the bundle is copied to `/opt/turbohaul/ui_dist` and that path is set
+automatically — you don't need to touch it.)
+
 ## Setting up AI Agents
 
 Pointing an AI agent (langchain, llama-index, LiteLLM, raw OpenAI SDK, Ollama clients, etc.) at Turbohaul is two lines:
