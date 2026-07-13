@@ -1235,6 +1235,13 @@ class TurbohaulManager:
         self._spawn_seq: int = 0
         self.live_generation: dict | None = None  # written ONLY by LiveSlotsPoller
         self.live_output = LiveOutputBuffer()      # fed ONLY by the streaming tee
+        # Stream-derived live inference stats for backends with NO /slots endpoint
+        # (e.g. mlx_lm server). The streaming proxy writes real tok/s + n_decoded
+        # per SSE token chunk here; LiveSlotsPoller mirrors it into live_generation
+        # when /slots is unavailable (so MLX shows live tok/s during streamed
+        # requests). For non-streamed MLX requests there is NO engine-side mid-flight
+        # signal, so this stays None (honest: no fabricated numbers).
+        self._live_stream_stats: dict | None = None  # {gen_id, n_decoded, tok_s, last_t}
         self._live_poller = None
         self._live_poller_task: asyncio.Task | None = None
         # P1e per-resident live-inference monitor (cap>=2). The single
@@ -2065,6 +2072,43 @@ class TurbohaulManager:
             # a later phase: persist KV cache SSD usage snapshot for FE Settings cap display
             "persist_kvcache": self._persist_kvcache_snapshot(),
         }
+
+    def note_stream_token(self, gen_id: str) -> None:
+        """Record one streamed SSE token chunk for the active generation.
+
+        Backend-agnostic: called by the streaming proxy byte loop for EVERY
+        backend (llama.cpp AND mlx_lm). Derives a real instantaneous + EWMA tok/s
+        from inter-chunk arrival time and writes it to ``_live_stream_stats``.
+        LiveSlotsPoller mirrors this into ``live_generation`` for backends without
+        a /slots endpoint (MLX), giving genuine live tok/s during streamed
+        requests. For non-streamed requests this is never called (no token stream
+        to observe) — honest, no fabricated metrics. Fail-open (never raises).
+        """
+        try:
+            now = time.monotonic()
+            sts = self._live_stream_stats
+            if sts is not None and sts.get("gen_id") == gen_id:
+                dt = now - sts.get("last_t", now)
+                if dt > 0:
+                    inst = 1.0 / dt
+                    prev = sts.get("tok_s") or 0.0
+                    sts["tok_s"] = (prev * 0.8 + inst * 0.2) if prev else inst
+                sts["n_decoded"] = int(sts.get("n_decoded", 0)) + 1
+                sts["last_t"] = now
+            else:
+                self._live_stream_stats = {
+                    "gen_id": gen_id,
+                    "n_decoded": 1,
+                    "tok_s": 0.0,
+                    "last_t": now,
+                }
+        except Exception:
+            pass
+
+    def clear_stream_stats(self) -> None:
+        """End-of-stream: drop the live stream stats so the poller falls back to
+        honest idle (no stale tok/s lingering after the generation ends)."""
+        self._live_stream_stats = None
 
     def _singleton_resident_snapshot(
         self,

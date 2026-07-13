@@ -411,6 +411,19 @@ class LiveSlotsPoller:
 
     async def _tick(self) -> None:
         mgr = self._mgr
+        # --- stream-derived live stats (backend-agnostic, MLX-critical) ---
+        # For backends without /slots (mlx_lm) AND for llama.cpp streaming, the
+        # ONLY real live tok/s source is the streamed SSE token stream. The
+        # streaming proxy writes per-token timing into mgr._live_stream_stats.
+        # Surface it FIRST — streaming slots at cap<=1 are tracked via
+        # slot.stream_handle, NOT _active_slot, so _active_slot can be None mid-
+        # stream and the /slots path below would otherwise report "transitioning"
+        # and never show live tok/s. When the stream ends, clear_stream_stats()
+        # drops it and we fall through to the /slots/active path (idle).
+        sts = getattr(mgr, "_live_stream_stats", None)
+        if sts is not None and (time.monotonic() - sts.get("last_t", 0)) < 3.0:
+            self._store(self._stream_gen_block(sts))
+            return
         # --- await-free identity snapshot (the SAME read status_snapshot does) ---
         slot = mgr._active_slot
         handle = mgr._active_handle
@@ -426,6 +439,20 @@ class LiveSlotsPoller:
             cur_spawn_getter=lambda: _read_spawn_seq(mgr),
         )
         self._store(gen)
+
+    def _stream_gen_block(self, sts: dict) -> dict:
+        """Build a live generation dict from fresh stream-derived stats."""
+        gen_id = sts.get("gen_id")
+        tok_s = round(float(sts.get("tok_s") or 0.0), 1)
+        return {
+            **_base_generation("generating", generation_id=gen_id),
+            "tok_s": tok_s,
+            "tok_s_instant": tok_s,
+            "n_decoded": int(sts.get("n_decoded", 0)),
+            "n_remain": None,
+            "max_tokens": None,
+            "eta_s": None,
+        }
 
     async def _fetch_revalidate_compute(
         self, slot, handle, spawn_seq, *, cur_handle_getter, cur_spawn_getter
@@ -456,14 +483,84 @@ class LiveSlotsPoller:
         if state_v not in _ACTIVE_STATES:
             return _base_generation("transitioning")
 
-        # --- fetch /slots (the only place we await on external IO) ---
+        # --- fetch /slots (the only external await) ---
+        # MLX / mlx_lm server has NO /slots endpoint (unlike llama.cpp), so polling
+        # it 404s every tick and we'd never get live tok/s. Cache the probe result
+        # per-handle: first success -> _has_slots=True; first non-200/error ->
+        # _has_slots=False, after which we skip the GET entirely (no 404 spam) and
+        # fall back to stream-derived stats (see _slots_unavailable_gen below).
+        has_slots = getattr(handle, "_has_slots", None)
+        if has_slots is False:
+            return self._slots_unavailable_gen(
+                mgr, pid, spawn_seq, thread_or_slot, state_v
+            )
         try:
             resp = await self._client.get(f"http://127.0.0.1:{port}/slots")
+            if resp.status_code != 200:
+                handle._has_slots = False  # remember: this sidecar lacks /slots
+                return self._slots_unavailable_gen(
+                    mgr, pid, spawn_seq, thread_or_slot, state_v
+                )
+            handle._has_slots = True
             resp_t = time.monotonic()
             data = resp.json()
         except Exception:
             # slot vanished mid-swap/grace/teardown is EXPECTED; never crash.
+            # A persistent failure here (e.g. MLX with no /slots) is downgraded to
+            # the slots-unavailable path on the NEXT tick (after we mark it).
+            if has_slots is None:
+                # First attempt failed -> assume no /slots (MLX) so we don't spam.
+                try:
+                    handle._has_slots = False
+                except Exception:
+                    pass
             return _base_generation("transitioning")
+
+        # --- post-await identity re-validate (fixed-port 11500 reuse race) ---
+        cur_handle = cur_handle_getter()
+        if (
+            cur_handle is not snap_handle
+            or cur_handle is None
+            or getattr(cur_handle, "pid", None) != pid
+            or cur_spawn_getter() != spawn_seq
+        ):
+            return _base_generation("transitioning")
+
+        return self._compute(data, resp_t, pid, spawn_seq, thread_or_slot)
+
+    def _slots_unavailable_gen(
+        self, mgr, pid, spawn_seq, thread_or_slot, state_v
+    ) -> dict:
+        """Live generation for a sidecar WITHOUT /slots (e.g. mlx_lm server).
+
+        mlx_lm exposes no per-slot token-count endpoint, so we cannot poll
+        progress. BUT the streaming proxy writes REAL tok/s into
+        ``mgr._live_stream_stats`` for every streamed token chunk. If a stream is
+        currently in flight for THIS generation, mirror it (genuine live tok/s).
+        Otherwise report an honest non-streaming / idle state — we never fabricate
+        numbers MLX cannot provide.
+        """
+        gen_id = compute_generation_id(pid, spawn_seq, thread_or_slot)
+        sts = getattr(mgr, "_live_stream_stats", None)
+        fresh = (
+            sts is not None
+            and sts.get("gen_id") == gen_id
+            and (time.monotonic() - sts.get("last_t", 0)) < 3.0
+        )
+        if fresh:
+            return {
+                **_base_generation("generating", generation_id=gen_id),
+                "tok_s": round(float(sts.get("tok_s") or 0.0), 1),
+                "tok_s_instant": round(float(sts.get("tok_s") or 0.0), 1),
+                "n_decoded": int(sts.get("n_decoded", 0)),
+                "n_remain": None,
+                "max_tokens": None,
+                "eta_s": None,
+            }
+        # No live token stream observable (non-streamed request, or between
+        # tokens). Honest: no tok/s, no progress. The FSM state_v still reflects
+        # loading/active transitions for the badge.
+        return _base_generation(state_v or "transitioning", generation_id=gen_id)
 
         # --- post-await identity re-validate (fixed-port 11500 reuse race) ---
         cur_handle = cur_handle_getter()
