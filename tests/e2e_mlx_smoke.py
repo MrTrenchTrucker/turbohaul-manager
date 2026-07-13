@@ -135,7 +135,14 @@ def _run() -> None:
         print(f"[e2e] /v1/chat/completions -> {resp.status_code}")
         if resp.status_code != 200:
             raise SystemExit(f"[e2e] FAILED completion: {resp.text[:500]}")
-        content = resp.json()["choices"][0]["message"]["content"]
+        msg = resp.json()["choices"][0]["message"]
+        # Reasoning models (e.g. Darwin-35B-Opus) emit the answer under
+        # `reasoning`/`reasoning_content` and may leave `content` absent. Accept
+        # either field so the e2e test is portable across plain and reasoning
+        # MLX models.
+        content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning")
+        if not content:
+            raise SystemExit(f"[e2e] FAILED: empty response message: {msg!r}")
         print(f"[e2e] model replied: {content!r}")
     finally:
         # Always tear down the spawned server (killpg via start_new_session).
