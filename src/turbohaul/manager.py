@@ -2045,16 +2045,97 @@ class TurbohaulManager:
             # (the supervisor mirrors it); the per-resident blocks ride residents[].
             "generation": self.live_generation or idle_generation(),
             # P1e multi-slot observability. ``residents`` = the live
-            # per-model sidecars (EMPTY at cap<=1: the legacy singleton is excluded —
-            # active/loading/grace above carry that state). ``vram`` = per-GPU free
-            # MiB cached off the hot path by the supervisor (null at cap<=1 / probe-
-            # down). BOTH are await-free + lock-free (status_snapshot stays sync).
-            "residents": self._residents_snapshot(),
+            # per-model sidecars. At cap>=2 it's the registry snapshot; at cap<=1
+            # the singleton resident is synthesized here from the same live FSM
+            # state the FE's synthesizeResident() would use, plus the truthful
+            # model_resident flag (from the latest LOAD_VERIFY record — see Fix A,
+            # which probes /v1/models for MLX). This keeps the Residents panel
+            # populated for single-sidecar installs instead of relying on the FE
+            # fallback. ``vram`` = per-GPU free MiB cached off the hot path by the
+            # supervisor (null at cap<=1 / probe-down).
+            "residents": (
+                self._residents_snapshot()
+                if int(getattr(self.runtime.queue, "max_parallel_sidecars", 1) or 1) >= 2
+                else self._singleton_resident_snapshot(
+                    active_info, loading_info, grace_info, idle_info
+                )
+            ),
             "vram": list(vram_cache) if vram_cache is not None else None,
             "vram_total_mib": list(self._vram_total_mib) if self._vram_total_mib is not None else None,
             # a later phase: persist KV cache SSD usage snapshot for FE Settings cap display
             "persist_kvcache": self._persist_kvcache_snapshot(),
         }
+
+    def _singleton_resident_snapshot(
+        self,
+        active_info: dict | None,
+        loading_info: dict | None,
+        grace_info: dict | None,
+        idle_info: dict | None,
+    ) -> "list[dict]":
+        """cap<=1 Residents panel entry (single-sidecar install observability).
+
+        At cap>=2 the registry snapshot (``_residents_snapshot``) is authoritative.
+        At cap<=1 the singleton resident is intentionally NOT in ``_residents``
+        (Phase-0 scaffold), so build one entry here from the live FSM state. We
+        mirror the FE's ``synthesizeResident`` precedence (active > loading >
+        grace > idle_hot) but pull ``state``/``pid``/``port`` from the REAL handle
+        (``_active_handle`` / ``_idle_handle``) so the panel is fully populated, and
+        fold in the truthful ``model_resident`` flag from the latest LOAD_VERIFY
+        record (Fix A: MLX now reports resident correctly via /v1/models). Matches
+        the frontend ``ResidentModel`` shape field-for-field. Await-free + lock-free
+        (status_snapshot contract).
+        """
+        # Priority of FSM phases → the informative source dict + a state string.
+        if active_info is not None:
+            state_v: str | None = active_info.get("state")
+            src = active_info
+        elif loading_info is not None:
+            state_v = loading_info.get("state")
+            src = loading_info
+        elif grace_info is not None:
+            state_v = "GRACE"
+            src = grace_info
+        elif idle_info is not None:
+            state_v = "IDLE_HOT"
+            src = idle_info
+        else:
+            state_v = None
+            src = None
+
+        # Real handle (warm sidecar): idle holder at cap<=1, else the active one.
+        handle = self._idle_handle or self._active_handle
+        if src is None and handle is not None:
+            # No transitional phase active but a sidecar is alive → treat as idle-hot.
+            state_v = "IDLE_HOT"
+            src = {"model_tag": self._idle_model_tag}
+
+        if state_v is None or src is None:
+            return []
+
+        model_resident: bool | None = None
+        for rec in reversed(load_verify_log.get_recent(20) or []):
+            if rec.get("model_resident") is not None:
+                model_resident = rec["model_resident"]
+                break
+        idle_in = None
+        if state_v in ("GRACE", "IDLE_HOT"):
+            idle_in = src.get("remaining_s")
+        return [{
+            "model_tag": src.get("model_tag"),
+            "state": state_v,
+            "port": int(src.get("port") or (handle.port if handle is not None else 0) or 0),
+            "pid": int(src.get("pid") or (handle.pid if handle is not None else 0) or 0),
+            "spawn_seq": getattr(self, "_spawn_seq", 0) or 0,
+            "reserved_need_mib": 0,
+            "parallel": 1,
+            "main_gpu": 0,
+            "split_mode": "single",
+            "inflight": len(self._inflight),
+            "idle_expires_in_s": idle_in,
+            "model_resident": model_resident,
+            "generation": self.live_generation or idle_generation(),
+        }]
 
     def _residents_snapshot(self) -> "list[dict]":
         """Await-free per-resident view for /status (cap>=2 multi-slot observability).
