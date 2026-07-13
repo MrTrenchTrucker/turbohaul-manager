@@ -1255,6 +1255,13 @@ async def _openai_chat_completions_stream(
                                     mgr.live_output.feed(gen_id_for_tee, chunk_bytes)
                                 except Exception:
                                     pass
+                                # Real live tok/s for backends without /slots (MLX):
+                                # count this streamed token + measure inter-arrival.
+                                # Backend-agnostic — also sharpens llama.cpp streaming.
+                                try:
+                                    mgr.note_stream_token(gen_id_for_tee)
+                                except Exception:
+                                    pass
                                 # Parse the SSE deltas to accumulate the
                                 # generated content + reasoning (for warm_chain). Yield
                                 # + tee happen FIRST; this is passive + fail-open and
@@ -1371,6 +1378,10 @@ async def _openai_chat_completions_stream(
             if gen_id_for_tee is not None:
                 with contextlib.suppress(Exception):
                     mgr.live_output.mark_done(gen_id_for_tee)
+                # Drop the stream-derived stats so the poller falls back to honest
+                # idle (no stale tok/s after the generation ends).
+                with contextlib.suppress(Exception):
+                    mgr.clear_stream_stats()
 
     return StreamingResponse(
         stream_gen(),
