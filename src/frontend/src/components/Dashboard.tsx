@@ -754,6 +754,23 @@ function ResidentCard({
             {engineOp.toUpperCase()}
           </span>
         )}
+        {/* Residency pill: truthful model_resident flag from the backend
+            (Fix A: MLX now reports resident via /v1/models; null = unknown). */}
+        {model.model_resident === true && (
+          <span className="text-xs font-medium px-2 py-0.5 rounded bg-emerald-800 text-emerald-100">
+            resident
+          </span>
+        )}
+        {model.model_resident === false && (
+          <span className="text-xs font-medium px-2 py-0.5 rounded bg-rose-800 text-rose-100">
+            not resident
+          </span>
+        )}
+        {model.model_resident == null && (
+          <span className="text-xs font-medium px-2 py-0.5 rounded bg-slate-800 text-slate-400">
+            resident ?
+          </span>
+        )}
         <span className="text-xs text-slate-500">
           GPU{model.main_gpu} · pid {model.pid} · port {model.port}
         </span>

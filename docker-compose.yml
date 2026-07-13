@@ -4,8 +4,14 @@
 # engine compiled in-repo -- no external registry, PyPI, npm, or binary mount).
 # Just: docker compose up -d --build
 
+# CUDA builds are Linux/amd64 + NVIDIA GPU ONLY. On macOS / Apple Silicon /
+# non-amd64 hosts this image CANNOT run (no NVIDIA Container Toolkit), so we
+# pin the platform to keep `docker compose` from pulling the ~8GB nvidia/cuda
+# base image on a machine that will never execute it.
+# For Apple Silicon use the MLX backend natively (no Docker, no CUDA).
 services:
   turbohaul-manager:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile.engine-src

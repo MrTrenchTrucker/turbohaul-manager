@@ -58,15 +58,37 @@ class RuntimePathsConfig(BaseModel):
     llama_server_binary: Path
     llama_server_binary_sha256: str = ""  # empty = skip verify (dev only)
     default_port_base: int = Field(default=11500, ge=1024, le=65000)
+    # MLX backend (Apple Silicon only). mlx_python_binary = interpreter that has
+    # mlx-lm installed (null = the running interpreter). mlx_models_dir = default
+    # local dir for MLX model repos. Ignored on non-Apple-Silicon hosts.
+    mlx_python_binary: Path | None = None
+    mlx_models_dir: Path | None = None
+
+
+def _default_ui_static_path() -> Path:
+    """Resolve the committed frontend bundle (src/frontend/dist).
+
+    Works out of the box on a source checkout or `pip install -e` (macOS /
+    non-Docker) so the `/ui` route needs no config. The Docker image overrides
+    `ui.static_path` to `/opt/turbohaul/ui_dist`.
+    """
+    return Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
 class UIConfig(BaseModel):
-    """Boot-only: UI static path."""
+    """Boot-only: UI static path.
+
+    `static_path` defaults to the bundled frontend build committed at
+    `src/frontend/dist` (resolved relative to this package). That makes the
+    `/ui` route work out of the box on a source checkout or `pip install -e`
+    (macOS / non-Docker) with no config. The Docker image overrides it to
+    `/opt/turbohaul/ui_dist` (where the build stage copies the bundle).
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     enabled: bool = True
-    static_path: Path
+    static_path: Path = Field(default_factory=_default_ui_static_path)
 
 
 class QueueConfig(BaseModel):

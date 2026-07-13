@@ -21,11 +21,15 @@ RUN npm ci --no-audit --no-fund
 COPY src/frontend/. ./
 RUN npm run typecheck && npm run build
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Stage 2: Compile the vendored TurboQuant engine from source for 6 GPU arches.
 # CUDA_ARCHITECTURES is expanded to cover Turing through Blackwell.
-# ----------------------------------------------------------------------------
-FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS llama-binary
+# CUDA builds are Linux/amd64 + NVIDIA GPU ONLY -- on macOS / Apple Silicon /
+# non-amd64 hosts this cannot run (no NVIDIA Container Toolkit) and building it
+# would pull the ~8GB nvidia/cuda base for nothing. The --platform pin makes an
+# accidental build on the wrong arch fail fast instead of downloading CUDA.
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 nvidia/cuda:12.9.0-devel-ubuntu22.04 AS llama-binary
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs
@@ -62,10 +66,11 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
       --target llama-server \
  && strip /opt/turboquant/build/bin/llama-server || true
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Stage 3: Runtime (CUDA 12.9 runtime + Python 3.11 + Turbohaul)
-# ----------------------------------------------------------------------------
-FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
+# CUDA builds are Linux/amd64 + NVIDIA GPU ONLY -- see Stage 2 note.
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

@@ -97,6 +97,7 @@ export interface ResidentModel {
   split_mode: string;
   inflight: number;
   idle_expires_in_s: number | null;
+  model_resident: boolean | null;
   generation: GenerationInfo | null;
 }
 

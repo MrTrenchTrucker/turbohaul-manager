@@ -51,6 +51,101 @@ Compatible with Ollama-shape clients:
 - `POST /api/import` -- import a local GGUF file
 - `GET /status` -- live queue + active + idle_hot snapshot
 
+## MLX backend (macOS / Apple Silicon)
+
+Turbohaul can run models two ways, chosen per model in the manifest with the
+`backend` field:
+
+- `llama.cpp` (default) — the TurboQuant `llama-server` binary. Works on Linux
+  with a GPU, or on macOS using Metal. Needs a GGUF file.
+- `mlx` — **Apple Silicon only.** Runs `python -m mlx_lm server` (the MLX
+  framework), so the model runs natively on the Mac's GPU/Neural Engine with no
+  CUDA and no Docker image. No GGUF file needed.
+
+**Any MLX model works — nothing is hardcoded.** You tell Turbohaul which model to
+use in the manifest; it does not ship or assume any particular model. Point it at:
+
+- `model_repo` — a Hugging Face MLX model id (e.g. `mlx-community/Qwen3-1.7B-4B`), or
+- `model_path` — a local folder with the model files already on disk.
+
+If you set neither, the manifest is rejected with a clear error. This works with the
+Qwen family (Qwen2.5 / Qwen3, Instruct and base, 4-bit and 8-bit MLX builds),
+Llama, Mistral, Phi, Gemma — anything `mlx_lm` can load.
+
+MLX is **Apple Silicon + macOS only**. On any other machine an `mlx` manifest
+refuses to start (clear error), while `llama.cpp` manifests keep working as before.
+
+How it fits in: `mlx_lm server` already speaks the same OpenAI-style API
+(`/health` + `/v1/chat/completions`) that Turbohaul uses for llama.cpp, so health
+checks and completion need no MLX-specific code. Any extra `mlx_server_flags` you
+set are checked against a fixed allowlist (`SAFE_MLX_FLAGS` in
+`src/turbohaul/mlx_spawn.py`) before they reach the command line, so a manifest
+can't inject arbitrary flags.
+
+Register a model — example: Qwen3 1.7B pulled from the Hugging Face hub:
+
+```bash
+curl -s -X PUT http://localhost:11401/api/manifests/qwen3-1.7b \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_tag": "qwen3-1.7b",
+    "backend": "mlx",
+    "model_repo": "mlx-community/Qwen3-1.7B-4B",
+    "mlx_server_flags": { "max_tokens": 4096, "use_default_chat_template": true }
+  }'
+```
+
+Other ways to point at a model:
+
+```jsonc
+// A larger Qwen pulled from the hub:
+{ "backend": "mlx", "model_repo": "mlx-community/Qwen3-8B-4bit" }
+
+// A model you already have on disk (no download):
+{ "backend": "mlx", "model_path": "/Volumes/Models/mlx-community/Qwen3-1.7B-4B" }
+
+// Speculative decoding for more speed (draft + target both MLX):
+{ "backend": "mlx", "model_repo": "mlx-community/Qwen3-1.7B-4B",
+  "mlx_server_flags": { "draft_model": "mlx-community/Qwen3-0.6B-4bit",
+                        "num_draft_tokens": 4 } }
+```
+
+Install on the Mac:
+
+```bash
+pip install -e ".[mlx]"        # adds mlx-lm to Turbohaul's environment
+# or, if mlx-lm is already available (e.g. via oMLX):
+conda install -c conda-forge mlx-lm
+```
+
+The macOS helper script is `turbohaul-launcher.sh`.
+
+### Web UI (no Docker needed)
+
+Turbohaul serves its own dashboard from the same port at **`/ui`** — there is
+no separate container or service to run. A built frontend bundle is committed
+to the repo at `src/frontend/dist`, and `ui.static_path` defaults to it
+automatically, so the UI works out of the box on a source checkout or
+`pip install -e .`:
+
+- Open **http://localhost:11401/ui** after starting Turbohaul.
+- No `ui.static_path` entry is needed in your `turbohaul.yaml`; the default
+  resolves to the bundled `src/frontend/dist`.
+
+If you'd rather rebuild the UI from source (e.g. after editing it):
+
+```bash
+cd src/frontend
+npm install
+npm run build            # outputs src/frontend/dist
+# or live-dev with hot reload on Vite's own port (default :5173):
+npm run dev
+```
+
+To disable the UI, set `ui.enabled: false` in `turbohaul.yaml`. (In the Docker
+image the bundle is copied to `/opt/turbohaul/ui_dist` and that path is set
+automatically — you don't need to touch it.)
+
 ## Setting up AI Agents
 
 Pointing an AI agent (langchain, llama-index, LiteLLM, raw OpenAI SDK, Ollama clients, etc.) at Turbohaul is two lines:

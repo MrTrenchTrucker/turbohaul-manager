@@ -3,8 +3,13 @@
 # NO PyPI, NO npm, NO external git. Only external = the CUDA base OS image (mirror to local registry
 # for full air-gap). Build: docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.6.0 .
 
+# CUDA builds are Linux/amd64 + NVIDIA GPU ONLY. On macOS / Apple Silicon /
+# non-amd64 hosts this image cannot run (no NVIDIA Container Toolkit), and
+# building it there would pull the ~8GB nvidia/cuda base for nothing. Pin the
+# platform so an accidental build on the wrong arch fails fast instead of
+# downloading CUDA. For Apple Silicon use the MLX backend natively.
 # ---- Stage 1: Compile the VENDORED turboquant llama.cpp engine from source ----
-FROM nvcr.io/nvidia/cuda:12.9.1-devel-ubuntu22.04 AS llama-build
+FROM --platform=linux/amd64 nvcr.io/nvidia/cuda:12.9.1-devel-ubuntu22.04 AS llama-build
 ARG CUDA_ARCH="89;120"
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,7 +29,7 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
  && cmake --build build --config Release -j$(nproc) --target llama-server llama-bench llama-cli
 
 # ---- Stage 2: Runtime (vendored wheels + committed FE dist + compiled engine) ----
-FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
+FROM --platform=linux/amd64 nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       python3.11 python3.11-venv python3.11-dev ca-certificates curl procps libgomp1 \

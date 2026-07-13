@@ -65,6 +65,7 @@ from turbohaul.subprocess_mgr import (
     verify_vram_cleared,
     wait_until_healthy,
 )
+from turbohaul.mlx_spawn import mlx_spawn, mlx_flags_to_argv
 from turbohaul.telemetry import FlapTelemetry, init_telemetry
 
 
@@ -1234,6 +1235,13 @@ class TurbohaulManager:
         self._spawn_seq: int = 0
         self.live_generation: dict | None = None  # written ONLY by LiveSlotsPoller
         self.live_output = LiveOutputBuffer()      # fed ONLY by the streaming tee
+        # Stream-derived live inference stats for backends with NO /slots endpoint
+        # (e.g. mlx_lm server). The streaming proxy writes real tok/s + n_decoded
+        # per SSE token chunk here; LiveSlotsPoller mirrors it into live_generation
+        # when /slots is unavailable (so MLX shows live tok/s during streamed
+        # requests). For non-streamed MLX requests there is NO engine-side mid-flight
+        # signal, so this stays None (honest: no fabricated numbers).
+        self._live_stream_stats: dict | None = None  # {gen_id, n_decoded, tok_s, last_t}
         self._live_poller = None
         self._live_poller_task: asyncio.Task | None = None
         # P1e per-resident live-inference monitor (cap>=2). The single
@@ -2044,16 +2052,134 @@ class TurbohaulManager:
             # (the supervisor mirrors it); the per-resident blocks ride residents[].
             "generation": self.live_generation or idle_generation(),
             # P1e multi-slot observability. ``residents`` = the live
-            # per-model sidecars (EMPTY at cap<=1: the legacy singleton is excluded —
-            # active/loading/grace above carry that state). ``vram`` = per-GPU free
-            # MiB cached off the hot path by the supervisor (null at cap<=1 / probe-
-            # down). BOTH are await-free + lock-free (status_snapshot stays sync).
-            "residents": self._residents_snapshot(),
+            # per-model sidecars. At cap>=2 it's the registry snapshot; at cap<=1
+            # the singleton resident is synthesized here from the same live FSM
+            # state the FE's synthesizeResident() would use, plus the truthful
+            # model_resident flag (from the latest LOAD_VERIFY record — see Fix A,
+            # which probes /v1/models for MLX). This keeps the Residents panel
+            # populated for single-sidecar installs instead of relying on the FE
+            # fallback. ``vram`` = per-GPU free MiB cached off the hot path by the
+            # supervisor (null at cap<=1 / probe-down).
+            "residents": (
+                self._residents_snapshot()
+                if int(getattr(self.runtime.queue, "max_parallel_sidecars", 1) or 1) >= 2
+                else self._singleton_resident_snapshot(
+                    active_info, loading_info, grace_info, idle_info
+                )
+            ),
             "vram": list(vram_cache) if vram_cache is not None else None,
             "vram_total_mib": list(self._vram_total_mib) if self._vram_total_mib is not None else None,
             # a later phase: persist KV cache SSD usage snapshot for FE Settings cap display
             "persist_kvcache": self._persist_kvcache_snapshot(),
         }
+
+    def note_stream_token(self, gen_id: str) -> None:
+        """Record one streamed SSE token chunk for the active generation.
+
+        Backend-agnostic: called by the streaming proxy byte loop for EVERY
+        backend (llama.cpp AND mlx_lm). Derives a real instantaneous + EWMA tok/s
+        from inter-chunk arrival time and writes it to ``_live_stream_stats``.
+        LiveSlotsPoller mirrors this into ``live_generation`` for backends without
+        a /slots endpoint (MLX), giving genuine live tok/s during streamed
+        requests. For non-streamed requests this is never called (no token stream
+        to observe) — honest, no fabricated metrics. Fail-open (never raises).
+        """
+        try:
+            now = time.monotonic()
+            sts = self._live_stream_stats
+            if sts is not None and sts.get("gen_id") == gen_id:
+                dt = now - sts.get("last_t", now)
+                if dt > 0:
+                    inst = 1.0 / dt
+                    prev = sts.get("tok_s") or 0.0
+                    sts["tok_s"] = (prev * 0.8 + inst * 0.2) if prev else inst
+                sts["n_decoded"] = int(sts.get("n_decoded", 0)) + 1
+                sts["last_t"] = now
+            else:
+                self._live_stream_stats = {
+                    "gen_id": gen_id,
+                    "n_decoded": 1,
+                    "tok_s": 0.0,
+                    "last_t": now,
+                }
+        except Exception:
+            pass
+
+    def clear_stream_stats(self) -> None:
+        """End-of-stream: drop the live stream stats so the poller falls back to
+        honest idle (no stale tok/s lingering after the generation ends)."""
+        self._live_stream_stats = None
+
+    def _singleton_resident_snapshot(
+        self,
+        active_info: dict | None,
+        loading_info: dict | None,
+        grace_info: dict | None,
+        idle_info: dict | None,
+    ) -> "list[dict]":
+        """cap<=1 Residents panel entry (single-sidecar install observability).
+
+        At cap>=2 the registry snapshot (``_residents_snapshot``) is authoritative.
+        At cap<=1 the singleton resident is intentionally NOT in ``_residents``
+        (Phase-0 scaffold), so build one entry here from the live FSM state. We
+        mirror the FE's ``synthesizeResident`` precedence (active > loading >
+        grace > idle_hot) but pull ``state``/``pid``/``port`` from the REAL handle
+        (``_active_handle`` / ``_idle_handle``) so the panel is fully populated, and
+        fold in the truthful ``model_resident`` flag from the latest LOAD_VERIFY
+        record (Fix A: MLX now reports resident correctly via /v1/models). Matches
+        the frontend ``ResidentModel`` shape field-for-field. Await-free + lock-free
+        (status_snapshot contract).
+        """
+        # Priority of FSM phases → the informative source dict + a state string.
+        if active_info is not None:
+            state_v: str | None = active_info.get("state")
+            src = active_info
+        elif loading_info is not None:
+            state_v = loading_info.get("state")
+            src = loading_info
+        elif grace_info is not None:
+            state_v = "GRACE"
+            src = grace_info
+        elif idle_info is not None:
+            state_v = "IDLE_HOT"
+            src = idle_info
+        else:
+            state_v = None
+            src = None
+
+        # Real handle (warm sidecar): idle holder at cap<=1, else the active one.
+        handle = self._idle_handle or self._active_handle
+        if src is None and handle is not None:
+            # No transitional phase active but a sidecar is alive → treat as idle-hot.
+            state_v = "IDLE_HOT"
+            src = {"model_tag": self._idle_model_tag}
+
+        if state_v is None or src is None:
+            return []
+
+        model_resident: bool | None = None
+        for rec in reversed(load_verify_log.get_recent(20) or []):
+            if rec.get("model_resident") is not None:
+                model_resident = rec["model_resident"]
+                break
+        idle_in = None
+        if state_v in ("GRACE", "IDLE_HOT"):
+            idle_in = src.get("remaining_s")
+        return [{
+            "model_tag": src.get("model_tag"),
+            "state": state_v,
+            "port": int(src.get("port") or (handle.port if handle is not None else 0) or 0),
+            "pid": int(src.get("pid") or (handle.pid if handle is not None else 0) or 0),
+            "spawn_seq": getattr(self, "_spawn_seq", 0) or 0,
+            "reserved_need_mib": 0,
+            "parallel": 1,
+            "main_gpu": 0,
+            "split_mode": "single",
+            "inflight": len(self._inflight),
+            "idle_expires_in_s": idle_in,
+            "model_resident": model_resident,
+            "generation": self.live_generation or idle_generation(),
+        }]
 
     def _residents_snapshot(self) -> "list[dict]":
         """Await-free per-resident view for /status (cap>=2 multi-slot observability).
@@ -3028,19 +3154,28 @@ class TurbohaulManager:
         then publish r.handle + state=ACTIVE under the lock. On failure: fail the
         slot future and return None (the finally/supervisor reaps the resident)."""
         argv: list[str] = []
+        is_mlx = False
         try:
             manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
-            argv = flags_to_argv(manifest.llama_server_flags)
-            gguf_path = (
-                self.boot.storage.blob_store_path
-                / "sha256"
-                / manifest.gguf_blob_sha256[:2]
-                / manifest.gguf_blob_sha256
-            )
+            is_mlx = manifest.is_mlx()
+            if is_mlx:
+                # MLX: no GGUF blob, no slot-save KV. Build argv from the MLX
+                # closed allowlist (validated again at spawn time in mlx_spawn).
+                argv = mlx_flags_to_argv(manifest.mlx_server_flags)
+            else:
+                argv = flags_to_argv(manifest.llama_server_flags)
+                gguf_path = (
+                    self.boot.storage.blob_store_path
+                    / "sha256"
+                    / manifest.gguf_blob_sha256[:2]
+                    / manifest.gguf_blob_sha256
+                )
         except FileNotFoundError:
             gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
         # Per-model host safety gate (RAM/IO/load + the per-spawn VRAM/KV gate). The
         # CROSS-resident over-commit gate already ran under the lock at reserve.
+        # For MLX, expected_vram_bytes is 0 (unified memory), so the VRAM pre-check
+        # is a no-op and RAM/IO gates still apply.
         if self.runtime.queue.safety_enabled:
             gate_ok = await self._run_spawn_safety_gate(slot)
             if not gate_ok:
@@ -3048,14 +3183,24 @@ class TurbohaulManager:
                     slot, RuntimeError("safety gates refused spawn")
                 )
                 return None
-        handle = self._spawn(
-            self.boot.runtime.llama_server_binary,
-            gguf_path,
-            r.port,
-            slot.model_tag,
-            argv,
-            binary_fd=self._binary_fd,
-        )
+        if is_mlx:
+            handle = mlx_spawn(
+                r.port,
+                slot.model_tag,
+                manifest.model_repo,
+                manifest.model_path,
+                manifest.mlx_server_flags,
+                python_binary=self.boot.runtime.mlx_python_binary,
+            )
+        else:
+            handle = self._spawn(
+                self.boot.runtime.llama_server_binary,
+                gguf_path,
+                r.port,
+                slot.model_tag,
+                argv,
+                binary_fd=self._binary_fd,
+            )
         async with self._registry_lock:
             r.booting_pid = handle.pid  # in the reaper union before handle is set
         slot.port = handle.port
@@ -3078,7 +3223,10 @@ class TurbohaulManager:
             return None
         # Best-effort KV restore after a healthy (re)spawn so the next same-thread
         # request reuses the slot KV (prefix-match) instead of re-prefilling.
-        await self._restore_slot_kv(r.port, r.model_tag, slot)
+        # MLX has no slot-save KV cache (unified memory, no /slot-save-path), so
+        # skip it there.
+        if not is_mlx:
+            await self._restore_slot_kv(r.port, r.model_tag, slot)
         async with self._registry_lock:
             r.handle = handle
             r.booting_pid = None
@@ -3858,19 +4006,25 @@ class TurbohaulManager:
         self._set_latest_keep_alive(None)
 
         try:
-            # Build llama-server argv from manifest if available; tolerate missing
+            # Build backend argv from manifest if available; tolerate missing
             # manifest for testing convenience.
             argv: list[str] = []
+            manifest_is_mlx = False
             manifest_found = True
             try:
                 manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
-                argv = flags_to_argv(manifest.llama_server_flags)
-                gguf_path = (
-                    self.boot.storage.blob_store_path
-                    / "sha256"
-                    / manifest.gguf_blob_sha256[:2]
-                    / manifest.gguf_blob_sha256
-                )
+                manifest_is_mlx = manifest.is_mlx()
+                if manifest_is_mlx:
+                    # MLX: no GGUF blob. Build argv from the MLX closed allowlist.
+                    argv = mlx_flags_to_argv(manifest.mlx_server_flags)
+                else:
+                    argv = flags_to_argv(manifest.llama_server_flags)
+                    gguf_path = (
+                        self.boot.storage.blob_store_path
+                        / "sha256"
+                        / manifest.gguf_blob_sha256[:2]
+                        / manifest.gguf_blob_sha256
+                    )
             except FileNotFoundError:
                 manifest_found = False
                 gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
@@ -4066,6 +4220,7 @@ class TurbohaulManager:
                         manifest_main_gpu = int(
                             m_for_vram.llama_server_flags.get("main_gpu", 0) or 0
                         )
+                        manifest_is_mlx = m_for_vram.is_mlx()
                         # cpu_moe / n_cpu_moe offload experts to RAM -> the closed-form
                         # body=gguf over-counts; the cpu-moe gate branch trusts the
                         # manifest's measured expected_vram for those configs (parity
@@ -4135,14 +4290,25 @@ class TurbohaulManager:
                             ),
                         )
                         return
-                handle = self._spawn(
-                    self.boot.runtime.llama_server_binary,
-                    gguf_path,
-                    port,
-                    slot.model_tag,
-                    argv,
-                    binary_fd=self._binary_fd,
-                )
+                handle: SidecarHandle
+                if manifest_is_mlx:
+                    handle = mlx_spawn(
+                        port,
+                        slot.model_tag,
+                        manifest.model_repo if manifest_found else "",
+                        manifest.model_path if manifest_found else "",
+                        manifest.mlx_server_flags if manifest_found else {},
+                        python_binary=self.boot.runtime.mlx_python_binary,
+                    )
+                else:
+                    handle = self._spawn(
+                        self.boot.runtime.llama_server_binary,
+                        gguf_path,
+                        port,
+                        slot.model_tag,
+                        argv,
+                        binary_fd=self._binary_fd,
+                    )
                 slot.port = handle.port
                 slot.pid = handle.pid
                 self._set_active_handle(handle)
@@ -4158,7 +4324,9 @@ class TurbohaulManager:
                 # belt-wrapped anyway). The bounded verify+RETRY loop is the follow-up
                 # behavior step once these records show the real failure modes.
                 try:
-                    _mv = await load_verify_log.verify_model_resident(handle)
+                    _mv = await load_verify_log.verify_model_resident(
+                        handle, mlx=manifest_is_mlx
+                    )
                     load_verify_log.log_load_verify(
                         event="model_load", trigger="spawn",
                         model_tag=slot.model_tag, port=port,
