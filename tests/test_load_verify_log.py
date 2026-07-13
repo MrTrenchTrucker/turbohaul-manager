@@ -90,3 +90,75 @@ def test_verify_dead_engine_never_raises():
     assert r["model_resident"] is False and r["reason"]
     k = _run(lv.verify_kv_restored(_Handle(port=1), 0, 100))
     assert k["kv_restore_ok"] is None and k["reason"]
+
+
+class _FakeResp:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeAsyncClient:
+    """Stand-in for httpx.AsyncClient: route /health + /slots + /v1/models."""
+
+    def __init__(self, *_, **__):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, **_):
+        if url.endswith("/health"):
+            return _FakeResp(200)
+        if url.endswith("/slots"):
+            # llama.cpp shape: one slot with a real n_ctx
+            return _FakeResp(200, [{"n_ctx": 4096}])
+        if url.endswith("/v1/models"):
+            # mlx_lm server shape: lists the loaded model(s)
+            return _FakeResp(200, {"object": "list", "data": [{"id": "/models/foo"}]})
+        return _FakeResp(404)
+
+
+def _patch_httpx(monkeypatch):
+    import turbohaul.load_verify_log as _lv
+    monkeypatch.setattr(_lv.httpx, "AsyncClient", _FakeAsyncClient)
+
+
+def test_verify_model_resident_mlx_false_slots_true(monkeypatch):
+    # MLX: /slots is absent, so the probe must use /v1/models. The fake returns
+    # /slots anyway (should be ignored under mlx=True) and /v1/models with one
+    # model -> resident True despite no /slots n_ctx.
+    _patch_httpx(monkeypatch)
+    r = _run(lv.verify_model_resident(_Handle(port=11500, pid=1), mlx=True))
+    assert r["health_200"] is True
+    assert r["model_resident"] is True, r
+
+
+def test_verify_model_resident_default_still_uses_slots(monkeypatch):
+    # Non-MLX keeps the llama.cpp /slots path (n_ctx > 0 -> resident True).
+    _patch_httpx(monkeypatch)
+    r = _run(lv.verify_model_resident(_Handle(port=11500, pid=1), mlx=False))
+    assert r["model_resident"] is True and r["n_ctx"] == 4096
+
+
+def test_verify_model_resident_mlx_empty_models_false(monkeypatch):
+    # MLX with an empty /v1/models list -> not resident.
+    import turbohaul.load_verify_log as _lv
+
+    class _EmptyModels(_FakeAsyncClient):
+        async def get(self, url, **_):
+            if url.endswith("/v1/models"):
+                return _FakeResp(200, {"object": "list", "data": []})
+            return await super().get(url, **_)
+
+    monkeypatch.setattr(_lv.httpx, "AsyncClient", _EmptyModels)
+    r = _run(lv.verify_model_resident(_Handle(port=11500, pid=1), mlx=True))
+    assert r["model_resident"] is False
+    assert "v1/models" in (r["reason"] or "")
+
