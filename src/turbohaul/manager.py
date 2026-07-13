@@ -15886,7 +15886,9 @@ class TurbohaulManager:
                 # belt-wrapped anyway). The bounded verify+RETRY loop is the follow-up
                 # behavior step once these records show the real failure modes.
                 try:
-                    _mv = await load_verify_log.verify_model_resident(handle)
+                    _mv = await load_verify_log.verify_model_resident(
+                        handle, mlx=manifest_is_mlx
+                    )
                     # The identity instrument -- verify_model_resident
                     # above proves *A* model is up (health_200 and n_ctx>0); it can
                     # never say WHICH one. verify_model_identity reads the engine's
