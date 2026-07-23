@@ -1,7 +1,7 @@
 # Turbohaul-Manager -- FULLY SELF-CONTAINED build (every dependency vendored in one repo).
 # Engine compiled from VENDORED source; Python from VENDORED wheels; frontend from COMMITTED dist.
 # NO PyPI, NO npm, NO external git. Only external = the CUDA base OS image (mirror to local registry
-# for full air-gap). Build: docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.6.0 .
+# for full air-gap). Build: docker build -f Dockerfile.engine-src -t turbohaul-manager:engine-src .
 
 # ---- Stage 1: Compile the VENDORED turboquant llama.cpp engine from source ----
 FROM nvcr.io/nvidia/cuda:12.9.1-devel-ubuntu22.04 AS llama-build

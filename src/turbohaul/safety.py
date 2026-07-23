@@ -292,6 +292,9 @@ def estimate_kv_cache_mib(
     gguf_size_bytes: int,
     kv_cache_quant: str = "f16",
     kv_cache_quant_v: str | None = None,
+    hybrid_kv_ratio: float = 1.0,
+    attn_dims: "object | None" = None,
+    kv_bytes_per_token: "float | None" = None,
 ) -> int:
     """Closed-form KV-cache size estimate in MiB.
 
@@ -303,6 +306,29 @@ def estimate_kv_cache_mib(
     K + heavily-quantized V (e.g. K=f16 + V=turbo3) as full-f16 for the whole KV
     and wrongly refusing a spawn that fits.
 
+    hybrid_kv_ratio scales the per-token KV estimate for
+    SSM+attention hybrid models (arch == "qwen35"). SSM layers store a fixed
+    recurrent state (constant per-token, not a growing per-token KV cache), so
+    only the attention-layer fraction contributes to per-token KV growth.
+    hybrid_kv_ratio == 1.0 (default) → byte-identical to today for all existing
+    models. hybrid_kv_ratio < 1.0 → the attention-fraction of per-token KV.
+
+    Dimension-aware fix: the file-size heuristic below derives KV
+    bytes/token from the model FILE size — calibrated on Q4 models, it badly
+    UNDER-counts ultra-low-bit models (e.g. a 7 GB file for a 27B model whose
+    true attention dims are much larger), so the gate can admit an over-commit
+    that OOMs at high ctx. Two additive, higher-precedence paths fix this:
+      1. ``kv_bytes_per_token`` — an operator-MEASURED effective KV bytes/token
+         (e.g. from nvidia-smi). Authoritative when set.
+      2. ``attn_dims`` — real GGUF attention dims (n_attn_layers, n_head_kv,
+         key/value_length). Computes per-token KV from first principles.
+    Precedence: measured override > parsed dims > file-size heuristic. BOTH new
+    paths deliberately IGNORE hybrid_kv_ratio (n_attn_layers already counts only
+    the growing attention layers; multiplying again would 4x under-count).
+    hybrid_kv_ratio applies ONLY to the legacy file-size path. When attn_dims
+    and kv_bytes_per_token are both None (every existing model), behaviour is
+    byte-identical to the prior file-size path.
+
     Assumes quantized KV is paired with flash_attn (llama.cpp requires
     --flash-attn for quantized K/V); a manifest with a quantized cache_type
     but no flash_attn would be over-credited here -- but llama-server refuses
@@ -310,15 +336,40 @@ def estimate_kv_cache_mib(
     """
     if ctx_size <= 0 or gguf_size_bytes <= 0:
         return 0
+    scale_k = _KV_QUANT_SCALE.get(kv_cache_quant.lower(), 1.0)
+    scale_v = _KV_QUANT_SCALE.get((kv_cache_quant_v or kv_cache_quant).lower(), 1.0)
+
+    # === Measured-override and dimension-aware paths ===========================
+    # Precedence: measured override > parsed dims > legacy file-size heuristic.
+    # NEITHER path applies hybrid_kv_ratio (they already reflect only the growing
+    # attention-layer KV; re-applying it would double-discount). hybrid_kv_ratio
+    # is confined to the legacy path below.
+    if kv_bytes_per_token is not None and kv_bytes_per_token > 0:
+        # Operator-measured EFFECTIVE KV bytes/token (already post quant + hybrid).
+        # Used verbatim — no quant scale, no hybrid multiply.
+        total_bytes = int(kv_bytes_per_token * ctx_size)
+        return total_bytes // (1024 * 1024)
+    if attn_dims is not None and getattr(attn_dims, "n_attn_layers", 0) > 0:
+        # f16 KV bytes/token from real dims, attention layers only; K and V
+        # halves each scaled by their own cache_type. No hybrid multiply.
+        n_attn = attn_dims.n_attn_layers
+        k_bytes_f16 = n_attn * attn_dims.n_head_kv * attn_dims.key_length * 2
+        v_bytes_f16 = n_attn * attn_dims.n_head_kv * attn_dims.value_length * 2
+        eff_bytes_per_token = k_bytes_f16 * scale_k + v_bytes_f16 * scale_v
+        total_bytes = int(eff_bytes_per_token * ctx_size)
+        return total_bytes // (1024 * 1024)
+
+    # === Legacy file-size heuristic (BYTE-IDENTICAL to prior behaviour) ========
     gguf_mib = gguf_size_bytes // (1024 * 1024)
     # f16 baseline: ~9 KB/token per GiB of model body. Per-token in KB:
     bytes_per_token_kb_f16 = (9 * gguf_mib) // 1024
-    scale_k = _KV_QUANT_SCALE.get(kv_cache_quant.lower(), 1.0)
-    scale_v = _KV_QUANT_SCALE.get((kv_cache_quant_v or kv_cache_quant).lower(), 1.0)
     # KV is ~50% K + 50% V; scale each half by its own cache_type.
     scale = (scale_k + scale_v) / 2.0
     bytes_per_token_kb = int(bytes_per_token_kb_f16 * scale)
-    total_kib = bytes_per_token_kb * ctx_size  # KB total
+    # Apply hybrid_kv_ratio to per-token KV (SSM layers don't grow).
+    # Clamped to [0.0, 1.0] at the manifest level (Field ge=0.0, le=1.0).
+    # When hybrid_kv_ratio == 1.0 (default), this is a no-op multiply.
+    total_kib = int(bytes_per_token_kb * ctx_size * hybrid_kv_ratio)  # KB total
     return total_kib // 1024  # MiB
 
 
@@ -334,6 +385,9 @@ def check_kv_cache_fit(
     main_gpu: int = 0,
     expected_vram_mib: int = 0,
     cpu_moe_offload: bool = False,
+    hybrid_kv_ratio: float = 1.0,
+    attn_dims: "object | None" = None,
+    kv_bytes_per_token: "float | None" = None,
 ) -> GateResult:
     """Refuse spawn if (body + KV-cache + overhead) > free VRAM.
 
@@ -343,6 +397,11 @@ def check_kv_cache_fit(
     bumps ctx_size from 4096 to 65536 in the manifest, this gate refuses
     the spawn if the resulting KV cache won't fit on local hardware
     (regardless of whether expected_vram_bytes was hand-tuned to match).
+
+    hybrid_kv_ratio (default 1.0) is passed through to
+    estimate_kv_cache_mib(). When the model is a qwen35 hybrid (SSM+attn),
+    the manifest sets kv_hybrid_ratio < 1.0 and arch == "qwen35", which
+    scales the per-token KV estimate down proportionally.
 
     no_kv_offload (llama-server --no-kv-offload): when set, the KV cache lives
     in HOST RAM, not VRAM. The VRAM prediction then DROPS the KV term (only
@@ -376,7 +435,8 @@ def check_kv_cache_fit(
         return GateResult("kv_cache_fit", True, "passed-no-probe")
     gguf_mib = gguf_size_bytes // (1024 * 1024)
     kv_mib = estimate_kv_cache_mib(
-        ctx_size, gguf_size_bytes, kv_cache_quant, kv_cache_quant_v)
+        ctx_size, gguf_size_bytes, kv_cache_quant, kv_cache_quant_v, hybrid_kv_ratio,
+        attn_dims=attn_dims, kv_bytes_per_token=kv_bytes_per_token)
     q_label = (
         kv_cache_quant
         if not kv_cache_quant_v or kv_cache_quant_v == kv_cache_quant
@@ -486,6 +546,9 @@ def all_safety_gates(
     split_mode: str = "layer",
     main_gpu: int = 0,
     cpu_moe_offload: bool = False,
+    hybrid_kv_ratio: float = 1.0,
+    attn_dims: "object | None" = None,
+    kv_bytes_per_token: "float | None" = None,
 ) -> list[GateResult]:
     """Run all gates; return their results in order. Caller decides on failures.
 
@@ -497,6 +560,11 @@ def all_safety_gates(
     KV cache + model body + overhead exceeds free VRAM. When ctx_size or
     gguf_size_bytes is unknown (0), the gate passes (caller still has the
     other VRAM gate via manifest_expected_vram_bytes).
+
+    hybrid_kv_ratio (default 1.0) is passed through to
+    check_kv_cache_fit → estimate_kv_cache_mib(). For qwen35 hybrid models
+    the manifest sets kv_hybrid_ratio < 1.0, which scales the per-token
+    KV estimate down proportionally.
     """
     return [
         check_free_ram(min_free_ram_mib),
@@ -513,6 +581,9 @@ def all_safety_gates(
             main_gpu=main_gpu,
             expected_vram_mib=int(manifest_expected_vram_bytes // (1024 * 1024)),
             cpu_moe_offload=cpu_moe_offload,
+            hybrid_kv_ratio=hybrid_kv_ratio,
+            attn_dims=attn_dims,
+            kv_bytes_per_token=kv_bytes_per_token,
         ),
         check_load_avg(max_load_per_core),
         check_iowait(max_iowait_percent, sample_window_s=iowait_sample_window_s),

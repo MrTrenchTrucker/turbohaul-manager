@@ -32,12 +32,14 @@ from turbohaul.config import KEEP_ALIVE_MAX_S, BootConfig, RuntimeConfig
 from turbohaul.fsm import LEGAL_TRANSITIONS, InvalidTransition, is_terminal, transition
 from turbohaul.live_monitor import LiveOutputBuffer, idle_generation
 from turbohaul.manifest import flags_to_argv, read_manifest
+from turbohaul._gguf_meta import read_kv_dims
 from turbohaul.queue import GraceTimer, IdleHotTimer, TurbohaulQueue
 from turbohaul.safety import (
     all_safety_gates,
     estimate_kv_cache_mib,
     PER_SLOT_COMPUTE_FLOOR_MIB,
     _vram_budget,
+    _read_free_vram_all_mib,
 )
 from turbohaul.singleton import (
     boot_orphan_reaper,
@@ -1025,6 +1027,10 @@ class TurbohaulManager:
     ) -> None:
         self.boot = boot
         self.runtime = runtime
+        # Cache of parsed GGUF attention dims for the dimension-aware
+        # KV-fit estimate, keyed by content-addressed blob sha (immutable, so the
+        # parse happens at most once per unique GGUF, off the hot spawn path).
+        self._attn_dims_cache: dict[str, object] = {}
         self.queue = TurbohaulQueue(
             staging_max=runtime.queue.staging_queue_depth,
             acceptance_max=runtime.queue.acceptance_buffer_max,
@@ -1176,7 +1182,7 @@ class TurbohaulManager:
         # port -> {thread_hash, model_tag, pid, chain, prompt_len, stamp}. Written by
         # _probe_and_save_clean_kv after EVERY successful per-turn normalizing
         # prefill (which physically overwrites the engine slot -> keyed by port).
-        # Read by _maybe_force_clean_restore (staleness/ownership gate) + the the classifier
+        # Read by _maybe_force_clean_restore (staleness/ownership gate) + the classifier
         # classifier overlay. pid stamps the sidecar generation: a respawned engine
         # on the same port has a different pid -> record automatically FOREIGN (no
         # invalidation hooks). NEVER persisted: restart = empty = cold path.
@@ -2288,8 +2294,8 @@ class TurbohaulManager:
                 # concurrent reset (request promotion repopulates _idle_expires_at to a
                 # fresh T+120 window) would otherwise be wiped by our stale-T0 debounce
                 # → teardown fires on a legitimate fresh window → warm holder killed
-                # mid-promotion. PL #16848 mandate.
-                # RC stuck-handle design note (a review REQUIRED): proactive DEAD-idle sweep.
+                # mid-promotion.
+                # Stuck-handle design note: proactive DEAD-idle sweep.
                 # The observed death was BETWEEN requests (llama-server died ~2min
                 # after a wave-return while idle-hot); the reactive warm_inherit
                 # is_alive gate only fires on the NEXT request. Sweep holder
@@ -2384,7 +2390,7 @@ class TurbohaulManager:
                         f"slot {slot.slot_id} evicted: client disconnect"
                     ),
                 )
-                # a design note: audit-emit via the the design pool path; NO sync
+                # a design note: audit-emit via the design pool path; NO sync
                 # state_db_session(mark_slot_ended) on the hot path —
                 # SQLite fsync 1-3s stalls would bypass the pool entirely.
                 # State-row finalization defers to terminal-park
@@ -2661,9 +2667,22 @@ class TurbohaulManager:
         placeholder (reserving its budget against concurrent reserves), and start
         its driver. The slow spawn+health happen OUTSIDE the lock inside the driver
         (the placeholder already reserves the budget)."""
-        need, parallel, main_gpu, split_mode, sleep_idle_s = self._read_model_footprint(
+        need, parallel, main_gpu, split_mode, sleep_idle_s, auto_place = self._read_model_footprint(
             slot.model_tag
         )
+        if auto_place and split_mode == "none":
+            # Smart GPU auto-placer. Override the manifest's pinned
+            # main_gpu with the least-loaded fitting card (or a layer-split
+            # fallback) BEFORE the cross-resident gate runs, so the gate checks
+            # (and the Resident records) the card we're actually about to use.
+            # None -> keep the manifest's original main_gpu/split_mode: this is
+            # simultaneously the documented "probe unreadable -> degrade to
+            # manifest pin" behavior AND correct when nothing fits at all (an
+            # unpicked pin that doesn't fit anywhere still gets refused below,
+            # same as today).
+            auto_gpu, auto_split = self._auto_pick_gpu(need)
+            if auto_gpu is not None:
+                main_gpu, split_mode = auto_gpu, auto_split
         if not self._vram_admits_locked(need, parallel, main_gpu, split_mode):
             # Refuse (cross-resident over-commit) — mirror the safety-gate refusal.
             log.warning(
@@ -2706,26 +2725,78 @@ class TurbohaulManager:
             lambda t, rr=r: self._on_driver_done(rr, t)
         )
 
+    def _attn_kv_dims_for(self, m: "object") -> "object | None":
+        """Parsed GGUF attention dims for the dimension-aware KV-fit
+        estimate, or None to fall back to the legacy file-size + hybrid_kv_ratio
+        path (byte-identical). Returns None for non-qwen35 models and on ANY parse
+        failure (missing blob, malformed header). Parsed at most once per
+        content-addressed blob sha (cached; the sha is immutable so it never
+        re-parses), keeping the GGUF read off the hot spawn path."""
+        if (getattr(m, "arch", "") or "") != "qwen35":
+            return None
+        sha = getattr(m, "gguf_blob_sha256", "") or ""
+        if not sha:
+            return None
+        if sha in self._attn_dims_cache:
+            return self._attn_dims_cache[sha]
+        dims = None
+        try:
+            path = (
+                self.boot.storage.blob_store_path
+                / "sha256"
+                / sha[:2]
+                / sha
+            )
+            dims = read_kv_dims(path)
+        except Exception:
+            dims = None
+        # Positive-cache only. A successful parse of an immutable
+        # content-addressed sha is deterministic → cache it permanently. A None
+        # (transient: blob still materializing / locked) is NOT cached, so a later
+        # spawn re-parses once the blob is complete rather than being pinned to the
+        # legacy under-count for the manager's whole lifetime.
+        if dims is not None:
+            self._attn_dims_cache[sha] = dims
+        return dims
+
     def _read_model_footprint(
         self, model_tag: "str | None"
-    ) -> "tuple[int, int, int, str, int]":
-        """(reserved_need_mib, parallel, main_gpu, split_mode, sleep_idle_seconds)
-        from the manifest. Sync file read; the dispatcher calls it under the lock
-        so the placeholder's reserved budget is exact. Missing manifest ->
-        (0,1,0,'layer',0) = degrade-open for the footprint (the per-spawn
-        all_safety_gates still runs in the driver). sleep_idle_seconds=0 means
-        'use global default' — the driver falls back to
-        runtime.queue.idle_hot_load_seconds."""
+    ) -> "tuple[int, int, int, str, int, bool]":
+        """(reserved_need_mib, parallel, main_gpu, split_mode, sleep_idle_seconds,
+        auto_place) from the manifest. Sync file read; the dispatcher calls it
+        under the lock so the placeholder's reserved budget is exact. Missing
+        manifest -> (0,1,0,'layer',0,False) = degrade-open for the footprint (the
+        per-spawn all_safety_gates still runs in the driver). sleep_idle_seconds=0
+        means 'use global default' — the driver falls back to
+        runtime.queue.idle_hot_load_seconds. auto_place is the
+        manifest's opt-in smart-placer flag (see _auto_pick_gpu / the caller's
+        wiring in _reserve_and_start_locked)."""
         try:
             m = read_manifest(self.boot.storage.manifests_path, model_tag)
         except FileNotFoundError:
-            return 0, 1, 0, "layer", 0
+            return 0, 1, 0, "layer", 0, False
         flags = m.llama_server_flags or {}
         gguf_mib = int((m.gguf_size_bytes or 0) // (1024 * 1024))
         ctx = int(flags.get("ctx_size") or m.context_size or 0)
         kv_quant = flags.get("cache_type_k") or "f16"
         kv_quant_v = flags.get("cache_type_v") or kv_quant
-        kv_mib = estimate_kv_cache_mib(ctx, m.gguf_size_bytes or 0, kv_quant, kv_quant_v)
+        # hybrid_kv_ratio is only activated when arch == "qwen35".
+        # All existing models (arch == "" or any other value) hit hybrid_kv_ratio == 1.0
+        # → byte-identical to today. The manifest field hybrid_kv_ratio is clamped
+        # to [0.0, 1.0] by the Pydantic Field validator.
+        hybrid_kv = m.hybrid_kv_ratio if (m.arch or "") == "qwen35" else 1.0
+        # The RESERVATION footprint must use the SAME dimension-aware /
+        # measured-override KV estimate as the per-spawn gate — otherwise the
+        # cross-resident over-commit gate (_vram_admits_locked, which sums this
+        # reserved_need over RESERVED_LOADING siblings not yet visible to
+        # nvidia-smi) under-reserves a booting sibling ~4x and admits a
+        # co-resident against phantom headroom. Same cached helper; non-qwen35 /
+        # parse-failure → None → legacy path → byte-identical for existing models.
+        madims = self._attn_kv_dims_for(m)
+        mkbpt = getattr(m, "kv_bytes_per_token", None)
+        kv_mib = estimate_kv_cache_mib(
+            ctx, m.gguf_size_bytes or 0, kv_quant, kv_quant_v, hybrid_kv,
+            attn_dims=madims, kv_bytes_per_token=mkbpt)
         parallel = max(1, int(flags.get("parallel", 1) or 1))
         # par_extra: the marginal per-slot compute floor for parallel>1, ON TOP of
         # the model footprint (the red-team's fix: reserve the FULL body+KV, not
@@ -2750,44 +2821,41 @@ class TurbohaulManager:
         main_gpu = int(flags.get("main_gpu", 0) or 0)
         split_mode = str(flags.get("split_mode", "layer") or "layer")
         sleep_idle_s = int(flags.get("sleep_idle_seconds") or 0)
-        return need, parallel, main_gpu, split_mode, sleep_idle_s
+        auto_place = bool(m.auto_place)
+        return need, parallel, main_gpu, split_mode, sleep_idle_s, auto_place
 
     def _vram_admits_locked(
         self, need: int, parallel: int, main_gpu: int, split_mode: str
     ) -> bool:
         """CALLER HOLDS _registry_lock. Cross-resident over-commit gate.
 
-        N1 (interim): co-residence is supported ONLY for single-GPU-pinned
-        (``split_mode='none'``) models on DISTINCT cards. A layer/row/tensor-split
-        sibling spans every visible GPU, so no "free distinct card" can be
-        guaranteed AND the aggregate-budget reserve math would double-count an
-        already-loaded sibling (B1). Until per-card layer-split accounting lands,
-        refuse-blind any co-residence that isn't tensor-isolated on distinct cards.
+        N2: per-card VRAM accounting for split_mode='none' co-residence.
+        Multiple tensor-isolated (split_mode='none') models may share a single GPU
+        as long as the per-card VRAM budget permits — the nvidia-smi probe reads
+        live free VRAM on the target card, and the reserve term subtracts
+        RESERVED_LOADING siblings whose weights are not yet reflected in the probe.
+        ACTIVE/GRACE/IDLE_EVICTABLE siblings are already loaded and thus already
+        absent from the free reading; subtracting them would double-count.
+
+        Layer-split (layer/row/tensor) models are still refuse-blind for co-residence:
+        a layer-split sibling spans every visible GPU, so per-card budgeting cannot
+        guarantee the incoming model has enough on its target card.
+
         The FIRST resident (no sibling) admits regardless of split_mode — it keeps
         the legacy degrade-open(parallel:1)/refuse-blind(parallel>1) doctrine via
         the per-spawn all_safety_gates in the driver.
-
-        B1: for the admitted (split=none/distinct-card) shape the reserve only
-        charges siblings whose VRAM is NOT YET reflected in the live nvidia-smi
-        probe — i.e. those still RESERVED_LOADING (spawned, weights not loaded) on
-        THIS card. An ACTIVE/GRACE/IDLE_EVICTABLE sibling is already loaded =>
-        already absent from the free reading; also subtracting its reserved_need_mib
-        double-charges it and wrong-refuses the steady state (two warm models is the
-        whole point of the feature). With N1 every admitted sibling is on a distinct
-        card so this normally contributes 0; the same-card term is defensive against
-        a future relaxation."""
+        """
         siblings = self._model_residents()
         new_split = (split_mode or "layer").lower()
         if siblings:
-            # N1 refuse-blind: incoming must be tensor-isolated...
+            # Co-residence requires incoming model to be tensor-isolated (split=none).
             if new_split != "none":
                 return False
             for r in siblings:
-                # ...and every existing sibling must be tensor-isolated on a
-                # DIFFERENT card (else its weights occupy this card too).
+                # Every existing sibling must also be tensor-isolated — a
+                # layer/row/tensor-split sibling occupies all cards, so per-card
+                # budgeting cannot guarantee safe co-residence.
                 if (r.split_mode or "layer").lower() != "none":
-                    return False
-                if r.main_gpu == main_gpu:
                     return False
         free_fit, _min_card, _n = _vram_budget(split_mode, main_gpu)
         if free_fit is None:
@@ -2801,6 +2869,67 @@ class TurbohaulManager:
             if r.state is ResidentState.RESERVED_LOADING and r.main_gpu == main_gpu:
                 reserve += r.reserved_need_mib
         return (free_fit - reserve) >= need
+
+    def _auto_pick_gpu(self, need_mib: int) -> "tuple[int | None, str]":
+        """CALLER HOLDS _registry_lock. Smart GPU auto-placer for
+        manifest.auto_place models (split_mode='none' at the manifest). Spreads
+        small models evenly across visible GPUs instead of piling everything on
+        the manifest's main_gpu default (0).
+
+        Mirrors _vram_admits_locked's per-card reserve accounting (RESERVED_LOADING
+        siblings on that card are subtracted; ACTIVE/GRACE/IDLE_EVICTABLE siblings
+        are already loaded and thus already reflected in the live nvidia-smi
+        reading, so they are NOT subtracted again here — same doctrine, no
+        double-count).
+
+        Returns (chosen_gpu, split_mode):
+          - A card fits (free[g] - RESERVED_LOADING-siblings-on-g -
+            safety_min_free_vram_mib >= need_mib): the MOST-FREE such card,
+            ("none",). Picking most-free (not first-fit) is what spreads load —
+            as one card fills, the other becomes the most-free pick next time.
+          - No single card fits, but the aggregate (each card's free minus the
+            floor, summed) does: (0, "layer") — split THIS model across every
+            card. (The pre-existing cross-resident co-residence gate in
+            _vram_admits_locked still refuse-blinds a layer-split spawn against
+            any tensor-isolated siblings — unchanged, out of scope here.)
+          - Nothing fits, or the nvidia-smi probe is unavailable: (None, "none").
+            The caller's contract on None is to NOT override main_gpu/split_mode
+            — keep the manifest's original pin. That is simultaneously the
+            documented "probe unreadable -> degrade to manifest pin" behavior,
+            and still correctly refuses via the existing _vram_admits_locked
+            over-commit gate when nothing genuinely fits anywhere (if it doesn't
+            fit in aggregate across every card, it can't fit on one specific
+            card either).
+        """
+        vals = _read_free_vram_all_mib()
+        if not vals:
+            return None, "none"
+        floor = self.runtime.queue.safety_min_free_vram_mib
+        siblings = self._model_residents()
+        reserved_by_gpu: dict[int, int] = {}
+        # Unlike _vram_admits_locked, this sum doesn't filter siblings by
+        # split_mode=='none' before reserving them per-card. Safe because a
+        # layer-split resident can only ever be admitted with ZERO siblings
+        # (the existing cross-resident co-residence gate refuses any
+        # layer+none mix) -- so a layer sibling and a 'none' sibling can never
+        # coexist in self._residents today. If that co-residence gate is ever
+        # relaxed, this loop would need the same split_mode=='none' filter.
+        for r in siblings:
+            if r.state is ResidentState.RESERVED_LOADING:
+                reserved_by_gpu[r.main_gpu] = (
+                    reserved_by_gpu.get(r.main_gpu, 0) + r.reserved_need_mib
+                )
+        avail = [
+            vals[g] - reserved_by_gpu.get(g, 0) - floor
+            for g in range(len(vals))
+        ]
+        candidates = [g for g in range(len(vals)) if avail[g] >= need_mib]
+        if candidates:
+            chosen = max(candidates, key=lambda g: avail[g])
+            return chosen, "none"
+        if sum(vals) - floor * len(vals) >= need_mib:
+            return 0, "layer"
+        return None, "none"
 
     def _begin_evict_locked(self, r: "Resident") -> None:
         """CALLER HOLDS _registry_lock. LRU-evict (or driver-death reap): drain any
@@ -3030,19 +3159,49 @@ class TurbohaulManager:
         argv: list[str] = []
         try:
             manifest = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
-            argv = flags_to_argv(manifest.llama_server_flags)
+            spawn_flags = manifest.llama_server_flags
+            # The reservation-time auto-placer may have overridden
+            # main_gpu/split_mode on r (see _reserve_and_start_locked /
+            # _auto_pick_gpu) — those are the ACTUAL admitted/reserved values.
+            # Re-deriving argv from the raw manifest flags alone would spawn on
+            # the manifest's original main_gpu, silently ignoring the
+            # auto-placement decision (and defeating the whole feature — the
+            # cross-resident gate would have checked one card while the process
+            # binds another). Only override when this model went through
+            # auto-placement (manifest.auto_place + manifest split_mode=='none')
+            # so the non-auto_place path stays byte-identical.
+            manifest_split = str(
+                spawn_flags.get("split_mode", "layer") or "layer"
+            )
+            if manifest.auto_place and manifest_split == "none":
+                spawn_flags = {
+                    **spawn_flags,
+                    "main_gpu": r.main_gpu,
+                    "split_mode": r.split_mode,
+                }
+            argv = flags_to_argv(spawn_flags)
             gguf_path = (
                 self.boot.storage.blob_store_path
                 / "sha256"
                 / manifest.gguf_blob_sha256[:2]
                 / manifest.gguf_blob_sha256
             )
+            # Vision projector (mmproj): resolve the CONTENT-ADDRESSED blob and
+            # inject --mmproj. Manager-derived path only; the raw path-bearing
+            # `mmproj` flag stays in DENIED_FLAGS (no arbitrary file).
+            if manifest.mmproj_blob_sha256:
+                argv += ["--mmproj", str(
+                    self.boot.storage.blob_store_path
+                    / "sha256"
+                    / manifest.mmproj_blob_sha256[:2]
+                    / manifest.mmproj_blob_sha256
+                )]
         except FileNotFoundError:
             gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
         # Per-model host safety gate (RAM/IO/load + the per-spawn VRAM/KV gate). The
         # CROSS-resident over-commit gate already ran under the lock at reserve.
         if self.runtime.queue.safety_enabled:
-            gate_ok = await self._run_spawn_safety_gate(slot)
+            gate_ok = await self._run_spawn_safety_gate(r, slot)
             if not gate_ok:
                 self._fail_completion_future(
                     slot, RuntimeError("safety gates refused spawn")
@@ -3087,10 +3246,24 @@ class TurbohaulManager:
             r.spawn_seq += 1  # live-monitor: new active handle on this resident
         return handle
 
-    async def _run_spawn_safety_gate(self, slot: Slot) -> bool:
+    async def _run_spawn_safety_gate(self, r: "Resident", slot: Slot) -> bool:
         """Run all_safety_gates for slot.model_tag exactly as the cap<=1 path does
-        (manifest-derived params). Returns True on all-pass, False on any refusal
-        (logged + audited)."""
+        (manifest-derived params, FRESH read — same as before this change). Returns
+        True on all-pass, False on any refusal (logged + audited).
+
+        split_mode/main_gpu default to this fresh read (byte-identical
+        to the previous behavior, including picking up a manifest edited/deleted in the
+        reserve->spawn window — the driver runs as a separate asyncio task, so
+        that window is real). ONLY when this fresh read shows auto_place=True and
+        its own split_mode=='none' do we substitute r.main_gpu/r.split_mode — the
+        reservation's settled auto-placed values — so the gate checks the SAME
+        card the cross-resident gate already admitted against. Mirrors
+        _spawn_for_resident's argv-override condition exactly, so the gate and
+        the actual spawn command always agree with each other. An earlier
+        version of this method used r.main_gpu/r.split_mode unconditionally,
+        which was wrong for auto_place=False: it gated on the RESERVATION-time
+        manifest read instead of a fresh one, silently diverging from historical
+        behavior if the manifest changed in that window."""
         mv = mc = mg = 0
         mq = "f16"
         mqv = "f16"
@@ -3099,6 +3272,9 @@ class TurbohaulManager:
         msm = "layer"
         mmg = 0
         mcm = False
+        mhkr = 1.0
+        madims = None
+        mkbpt = None
         try:
             m = read_manifest(self.boot.storage.manifests_path, slot.model_tag)
             mv = m.expected_vram_bytes or 0
@@ -3114,6 +3290,14 @@ class TurbohaulManager:
                 m.llama_server_flags.get("cpu_moe")
                 or int(m.llama_server_flags.get("n_cpu_moe", 0) or 0) > 0
             )
+            # hybrid_kv_ratio from manifest, gated on arch.
+            mhkr = m.hybrid_kv_ratio if (m.arch or "") == "qwen35" else 1.0
+            # Dimension-aware KV dims (cached) + measured override.
+            madims = self._attn_kv_dims_for(m)
+            mkbpt = getattr(m, "kv_bytes_per_token", None)
+            if m.auto_place and msm == "none":
+                msm = r.split_mode
+                mmg = r.main_gpu
         except FileNotFoundError:
             mv = 0
         gates = await asyncio.to_thread(all_safety_gates,
@@ -3127,6 +3311,9 @@ class TurbohaulManager:
             kv_cache_quant_v=mqv,
             no_kv_offload=mnk, parallel=mp, split_mode=msm, main_gpu=mmg,
             cpu_moe_offload=mcm,
+            hybrid_kv_ratio=mhkr,
+            attn_dims=madims,
+            kv_bytes_per_token=mkbpt,
         )
         failed = [g for g in gates if not g.ok]
         if failed:
@@ -3871,6 +4058,16 @@ class TurbohaulManager:
                     / manifest.gguf_blob_sha256[:2]
                     / manifest.gguf_blob_sha256
                 )
+                # Vision projector (mmproj): resolve the CONTENT-ADDRESSED blob and
+                # inject --mmproj. Manager-derived path only; the raw path-bearing
+                # `mmproj` flag stays in DENIED_FLAGS (no arbitrary file).
+                if manifest.mmproj_blob_sha256:
+                    argv += ["--mmproj", str(
+                        self.boot.storage.blob_store_path
+                        / "sha256"
+                        / manifest.mmproj_blob_sha256[:2]
+                        / manifest.mmproj_blob_sha256
+                    )]
             except FileNotFoundError:
                 manifest_found = False
                 gguf_path = self.boot.storage.blob_store_path / "missing.gguf"
@@ -4019,6 +4216,9 @@ class TurbohaulManager:
                     manifest_split_mode = "layer"
                     manifest_main_gpu = 0
                     manifest_cpu_moe = False
+                    manifest_hybrid_kv = 1.0
+                    manifest_attn_dims = None
+                    manifest_kv_bpt = None
                     try:
                         m_for_vram = read_manifest(
                             self.boot.storage.manifests_path,
@@ -4077,6 +4277,17 @@ class TurbohaulManager:
                             )
                             > 0
                         )
+                        # hybrid_kv_ratio from manifest, gated on arch.
+                        manifest_hybrid_kv = (
+                            m_for_vram.hybrid_kv_ratio
+                            if (m_for_vram.arch or "") == "qwen35"
+                            else 1.0
+                        )
+                        # Dimension-aware KV dims (cached) + override.
+                        manifest_attn_dims = self._attn_kv_dims_for(m_for_vram)
+                        manifest_kv_bpt = getattr(
+                            m_for_vram, "kv_bytes_per_token", None
+                        )
                     except FileNotFoundError:
                         manifest_vram = 0
                     gates = await asyncio.to_thread(all_safety_gates,
@@ -4095,6 +4306,9 @@ class TurbohaulManager:
                         split_mode=manifest_split_mode,
                         main_gpu=manifest_main_gpu,
                         cpu_moe_offload=manifest_cpu_moe,
+                        hybrid_kv_ratio=manifest_hybrid_kv,
+                        attn_dims=manifest_attn_dims,
+                        kv_bytes_per_token=manifest_kv_bpt,
                     )
                     failed = [g for g in gates if not g.ok]
                     if failed:
@@ -5719,7 +5933,7 @@ class TurbohaulManager:
                 # SPEC-V2 consistency stamp: NEVER log saved/GREW on an unconfirmed
                 # save — the pre-Phase-1 era unconditionally logged GREW 29..49 while
                 # the on-disk meta was honest at 25 (the '49-turn meta' misreport).
-                # FP design note (a later phase gate): ROLL BACK the optimistic anchor stamp —
+                # Note (a later phase gate): ROLL BACK the optimistic anchor stamp —
                 # leaving it AHEAD of the on-disk bin makes the a later phase
                 # skip-redundant-restore chain check miss on every later turn
                 # (anchor chain != disk chain), permanently re-arming the
@@ -6440,7 +6654,7 @@ class TurbohaulManager:
                     # force_clean save that resolved to _eff_force_clean=False (i.e.
                     # len(populated) != 1) would stamp clean_prefix=False below and
                     # OVERWRITE the anchor bin -> demote clean_prefix True->False.
-                    # _find_clean_bin + the GC pin then lose the anchor, the the classifier
+                    # _find_clean_bin + the GC pin then lose the anchor, the classifier
                     # classifier disarms, and EVERY request goes FRESH (worse than the
                     # sawtooth lag). Abort THIS slot's save when a clean anchor already
                     # exists for this (model_tag, thread_hash, port). (The force_clean=
@@ -6875,7 +7089,7 @@ class TurbohaulManager:
         if decision.get("forced_clean_restore"):
             self._kv_classifier_forced += 1
         self._kv_classifier_last = decision
-        log.info("the classifier classifier decision: %s", decision)
+        log.info("classifier decision: %s", decision)
 
     # ============================================================
     # shadow byte-match self-check (DORMANT — observability ONLY)
@@ -8596,7 +8810,7 @@ class TurbohaulManager:
                     if not _cfn.endswith(".bin.ckpt"):
                         continue
                     _cfp = os.path.join(SLOT_SAVE_DIR, _cfn)
-                    # FP design note (a later phase gate): existence-check the bin at SWEEP time,
+                    # Note (a later phase gate): existence-check the bin at SWEEP time,
                     # NOT via the entries snapshot — a pair finalizing between the
                     # snapshot and this sweep must not lose its ladder. Plus a
                     # 10-min age floor so an engine-side finalization in flight is
@@ -8935,7 +9149,7 @@ class TurbohaulManager:
     def _purge_protected_basenames(self) -> set:
         """Basenames (no extension) of KV bins the LIVE idle holder is anchored on
         RIGHT NOW — never delete these even on a fingerprint miss. Yanking a live
-        warm-path anchor mid-flight silently disarms the the classifier classifier (the exact
+        warm-path anchor mid-flight silently disarms the classifier (the exact
         harm the GC's clean-pin guards against,:_gc_kv_cache). A current-build
         anchor is ALSO preserved by the fingerprint match; this is the extra belt
         for a legacy (unstamped) anchor a live idle thread still depends on.
@@ -9307,7 +9521,7 @@ class TurbohaulManager:
 
         the design a design note deferred state-row finalization OFF the
         worker_loop hot path to avoid the 1-3s SQLite fsync stall that
-        bypassed the the design audit pool. Audit-emit fires immediately via
+        bypassed the design audit pool. Audit-emit fires immediately via
         ``_audit_event_only_async``; the state-row finalize lands here.
 
         Loop: every ``background_sweep_interval_s`` (default 60s — matches

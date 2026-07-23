@@ -589,9 +589,41 @@ class Manifest(BaseModel):
     display_name: str = ""
     description: str = ""
     gguf_blob_sha256: str
+    # OPTIONAL vision projector as a CONTENT-ADDRESSED blob sha (NOT a path). The
+    # manager resolves it to the blob store and injects --mmproj at spawn; the raw
+    # path-bearing `mmproj` CLI flag stays in DENIED_FLAGS. Empty = text-only.
+    mmproj_blob_sha256: str = ""
     gguf_size_bytes: int = Field(default=0, ge=0)
     context_size: int = Field(default=2048, ge=1)
     expected_vram_bytes: int = Field(default=0, ge=0)  # mandatory for VRAM-fit pre-check
+    # Opt-in smart GPU auto-placer. False (default) = today's behavior,
+    # honor llama_server_flags.main_gpu verbatim. True + split_mode:none = the
+    # manager picks the least-loaded card at admit time (manager._auto_pick_gpu).
+    # A plain top-level field (NOT a llama_server_flag) -- model_config
+    # extra="forbid" above means it must be declared here to be legal.
+    auto_place: bool = False
+    # Additive hybrid (qwen35 SSM+attn) support.
+    # arch: model architecture identifier. Empty string = unknown/legacy (existing
+    #   models ship with no arch field → default ""). The hybrid KV-fit branch in
+    #   safety.py activates ONLY when arch == "qwen35".
+    arch: str = ""
+    # hybrid_kv_ratio: fraction of layers that contribute to per-token KV growth
+    #   (1.0 = pure attention, <1.0 for SSM+attn hybrids). SSM layers store a
+    #   fixed recurrent state (constant per-token), NOT a growing per-token KV
+    #   cache, so only the attention-layers' fraction contributes to per-token KV.
+    #   Default 1.0 = byte-identical to today for any manifest without this field.
+    #   Note: name matches the safety.py function param for direct passthrough.
+    hybrid_kv_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    # OPTIONAL operator-measured effective KV cache cost, in BYTES
+    #   per token (already post-quant + post-hybrid — e.g. derived from an
+    #   nvidia-smi measurement: marginal_KV_MiB * 1048576 / ctx_size). When set,
+    #   it OVERRIDES both the dimension-aware estimate and the file-size heuristic
+    #   for this model's KV-fit gate — authoritative because a live measurement
+    #   beats a first-principles estimate (same rationale as expected_vram_bytes
+    #   winning for cpu_moe configs). Default None = disabled = byte-identical to
+    #   the hybrid-support behavior. Units are BYTES/token (NOT KB/token): e.g. a
+    #   measured 13.5 KiB/token is 13824.0 here.
+    kv_bytes_per_token: float | None = Field(default=None, ge=1024.0)  # floor rejects a KiB-vs-bytes typo (a value <1 KiB/token would silently under-count -> gate always passes)
     revision: int = Field(default=1, ge=1)  # ETag value
     llama_server_flags: dict[str, Any] = Field(default_factory=dict)
     prompt_template: PromptTemplate = Field(default_factory=PromptTemplate)
@@ -608,6 +640,17 @@ class Manifest(BaseModel):
         if not re.fullmatch(r"[0-9a-f]{64}", v):
             raise ManifestValidationError(
                 f"gguf_blob_sha256 must be 64 hex chars; got {v[:32]}... (len={len(v)})"
+            )
+        return v
+
+    @field_validator("mmproj_blob_sha256")
+    @classmethod
+    def _mmproj_sha256_format(cls, v: str) -> str:
+        # Empty = text-only. Else must be a 64-hex blob sha (NOT a path), so the
+        # manager can only ever resolve it inside the content-addressed blob store.
+        if v and not re.fullmatch(r"[0-9a-f]{64}", v):
+            raise ManifestValidationError(
+                f"mmproj_blob_sha256 must be empty or 64 hex chars; got {v[:32]}... (len={len(v)})"
             )
         return v
 

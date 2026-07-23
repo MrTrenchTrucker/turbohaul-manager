@@ -475,7 +475,8 @@ class LiveSlotsPoller:
         ):
             return _base_generation("transitioning")
 
-        return self._compute(data, resp_t, pid, spawn_seq, thread_or_slot)
+        admission_ctx_len = getattr(slot, "admission_ctx_len", None) or 0
+        return self._compute(data, resp_t, pid, spawn_seq, thread_or_slot, admission_ctx_len)
 
     def _reset_samples(self) -> None:
         self._samples.clear()
@@ -487,7 +488,8 @@ class LiveSlotsPoller:
             self._schema_warned = True
             log.warning("live poller: /slots schema mismatch (%s) — tok/s null until parser updated", what)
 
-    def _compute(self, data, resp_t: float, pid, spawn_seq, thread_or_slot) -> dict:
+    def _compute(self, data, resp_t: float, pid, spawn_seq, thread_or_slot,
+                 admission_ctx_len: int = 0) -> dict:
         gen_id = compute_generation_id(pid, spawn_seq, thread_or_slot)
         proc = [s for s in (data or []) if isinstance(s, dict) and s.get("is_processing")]
         if not proc:
@@ -540,6 +542,7 @@ class LiveSlotsPoller:
                     "last_change_t": resp_t,
                     "last_n_prompt_proc": n_prompt_proc,
                     "dproc": 0,
+                    "max_n_prompt": n_prompt or 0,
                 }
                 inst = 0.0
             else:
@@ -561,6 +564,10 @@ class LiveSlotsPoller:
                 smp["last_n_prompt_proc"] = n_prompt_proc
                 smp["last_n_decoded"] = n_decoded
                 smp["last_t"] = resp_t
+                # Track peak n_prompt so we have a stable denominator
+                # even when the engine momentarily clears prompt.tokens (KV eviction)
+                _old_max = smp.get("max_n_prompt", 0) or 0
+                smp["max_n_prompt"] = max(_old_max, n_prompt or 0)
             total_inst += inst
 
             if headline is None or (n_decoded or 0) > headline["n_decoded"]:
@@ -573,6 +580,8 @@ class LiveSlotsPoller:
                     "dproc": self._samples[id_task].get("dproc", 0),
                     "n_prompt_cache": n_prompt_cache,
                     "last_change_t": self._samples[id_task]["last_change_t"],
+                    "admission_ctx_len": admission_ctx_len,
+                    "max_n_prompt": self._samples[id_task].get("max_n_prompt", 0),
                 }
 
         # GC vanished tasks
@@ -638,9 +647,19 @@ class LiveSlotsPoller:
         # is absent. DISTINCT from prompt_progress (fraction, prefill-state only).
         n_prompt_hd = hd["n_prompt"] or 0
         n_prompt_proc_hd = hd["n_prompt_proc"]
-        # Respin: proc counts only NEW prompt tokens; the reused prefix lives in
-        # n_prompt_tokens_cache. A truthful % = (cache+proc)/n_prompt, clamped
-        # (n_prompt grows during decode, drifting the ratio down).
+        # Use admission_ctx_len (TRUE total prompt tokens known at
+        # request admission) as the denominator, NOT hd["n_prompt"] which is the
+        # running processed-count from the engine and equals (proc+cache) during
+        # prefill — making pct always 100.
+        # Near end-of-prefill the engine can clear prompt.tokens
+        # (KV cache eviction) causing n_prompt to momentarily go to 0. Also
+        # admission_ctx_len can be 0 (empty messages or failed KV policy path).
+        # Fallback chain: admission_ctx_len > max_n_prompt > n_prompt_hd.
+        _total_prompt = (
+            hd.get("admission_ctx_len")
+            or hd.get("max_n_prompt")
+            or n_prompt_hd
+        )
         _cache_hd = hd.get("n_prompt_cache")
         _pref_num = (
             n_prompt_proc_hd + _cache_hd
@@ -648,8 +667,8 @@ class LiveSlotsPoller:
             else n_prompt_proc_hd
         )
         prefill_pct = (
-            round(min(_pref_num / n_prompt_hd, 1.0) * 100)
-            if (n_prompt_hd > 0 and _pref_num is not None)
+            round(min(_pref_num / _total_prompt, 1.0) * 100)
+            if (_total_prompt > 0 and _pref_num is not None)
             else None
         )
         pct = round(min(max(nd / effective_max * 100.0, 0.0), 100.0), 1) if effective_max else None

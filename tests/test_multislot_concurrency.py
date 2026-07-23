@@ -347,7 +347,7 @@ class TestVramGate:
                 "cache_type_k": "turbo2"},
         }))
         mgr = TurbohaulManager(boot, runtime, **_mocks([]))
-        need, parallel, main_gpu, split_mode = mgr._read_model_footprint("cm")
+        need, parallel, main_gpu, split_mode, _sleep, _auto = mgr._read_model_footprint("cm")
         assert need == 19 * 1024 + (2 - 1) * 256, f"cpu-moe must trust measured, got {need}"
         assert parallel == 2 and main_gpu == 1 and split_mode == "none"
         await mgr.shutdown()

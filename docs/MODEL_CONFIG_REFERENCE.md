@@ -26,11 +26,14 @@ A manifest is one YAML file per model at `<manifests_path>/<model_tag>.yaml` (pr
 |---|---|---|---|---|
 | `model_tag` | `str` | **required** | Primary key + filename stem. Must match `TAG_RE` = `^[a-z0-9][a-z0-9._-]{0,63}$`. | Lowercase ASCII only, 1–64 chars, must start with `[a-z0-9]`, no `/`, no leading dot/dash, no `..` traversal. Re-validated at *every* path resolution (read/write/delete), not just on create (anti-traversal). An uppercase letter or a slash → `ManifestValidationError`. |
 | `display_name` | `str` | `""` | Free-text human label shown in the UI. | Cosmetic; no validation beyond being a string. Typical values are descriptive labels like `'35B MoE parallel:2 RAM-KV MTP'`. |
-| `description` | `str` | `""` | Free-text notes (provenance, quant, RC ref). | Cosmetic only. |
+| `description` | `str` | `""` | Free-text notes (provenance, quant, ticket ref). | Cosmetic only. |
 | `gguf_blob_sha256` | `str` | **required** | Content-address of the model blob in the store; ties the manifest to an exact GGUF. | Must `fullmatch` `[0-9a-f]{64}` — **lowercase hex, exactly 64 chars**. A pasted uppercase digest is rejected; lowercase it first. Wrong length or any non-hex char → `ManifestValidationError`. |
 | `gguf_size_bytes` | `int ≥ 0` | `0` | Declared blob size (bookkeeping / sanity). | Pydantic `ge=0`; a negative value is a validation error. Not load-bearing for spawn. |
 | `context_size` | `int ≥ 1` | `2048` | Manifest-level declared model context length. | **DISTINCT from the `ctx_size` *flag*.** This top-level field is model metadata (`ge=1`, default 2048); `llama_server_flags.ctx_size` is what actually gets passed to `llama-server` as `--ctx-size`. In production they are usually set to the *same* number (e.g. both `250000`), but nothing in the schema forces them to agree — the field and the flag are validated independently. Do not assume setting one sets the other. |
 | `expected_vram_bytes` | `int ≥ 0` | `0` | Footprint used by the VRAM-fit pre-check gate before a model is allowed to spawn. | `ge=0`. **A default of `0` effectively disables the VRAM gate for that model** (a zero footprint always "fits"); set a real value for the gate to protect you. Production values are the true device budget, e.g. `22500000000`, `24000000000`. |
+| `arch` | `str` | `""` | Declares the model's architecture family so the manager can size a non-standard KV shape correctly. Set `arch: "qwen35"` for a qwen35 hybrid (state-space/SSM + attention); leave it `""` for an ordinary pure-attention model. | The default `""` is byte-identical to prior behaviour (pure attention). Setting `arch: "qwen35"` is now **load-bearing on its own**: it triggers the manager to parse the model's real GGUF attention dims and size the KV cache from them (the dimension-aware path in Section 4), independent of `hybrid_kv_ratio`. |
+| `hybrid_kv_ratio` | `float` `0.0`–`1.0` | `1.0` | The fraction of layers that contribute a **growing** per-token KV cache. In a qwen35 hybrid the SSM layers keep a fixed-size recurrent state (not a growing cache), so the model's per-token KV is smaller than a pure-attention model of the same size. **This ratio scales the file-size *fallback* estimate path only** (Section 4). | Bounded `0.0..1.0`. **Default `1.0` = pure attention = byte-identical sizing for every existing model.** For a `qwen35` model whose GGUF dims parse, the dimension-aware path (Section 4) takes over and **ignores `hybrid_kv_ratio`** — it then only matters as the fallback when dims can't be parsed and no `kv_bytes_per_token` override is set. |
+| `kv_bytes_per_token` | `float ≥ 1024.0` or unset | *(unset)* | An operator-**measured** effective KV cache cost, in **BYTES per token**, used verbatim by the KV-fit estimate (Section 4) as the highest-precedence override. Derive it from a real measurement, e.g. `measured_marginal_MiB * 1048576 / ctx_size`. | **Units are BYTES/token, NOT KiB** — a measured 13.5 KiB/token is `13824.0`. A **1 KiB/token floor** (`Field ge=1024.0`) rejects a KiB-vs-bytes typo at load. Applied **verbatim**: no quant-scale, no `hybrid_kv_ratio` multiply. Leave **unset** for every existing model (the default) — byte-identical. |
 | `revision` | `int ≥ 1` | `1` | The ETag value for optimistic-concurrency writes; server-incremented on every atomic update. | `ge=1`. You do not hand-manage this — `GET` returns it as `ETag: "<revision>"`, you echo it back in `If-Match` on `PUT`, and the server bumps it. Seen climbing in production (e.g. `revision: 21`, `25`) as manifests are re-tuned. A stale `If-Match` → HTTP 412. |
 | `llama_server_flags` | `map` | `{}` (empty) | The closed allowlist of `llama-server` spawn flags — see Section 2. | Every key/value is gauntlet-validated. Unknown key → reject. This is where all the real tuning lives. |
 | `prompt_template` | `object` | empty `PromptTemplate` | Server-side prompt scaffolding: `{system_default: str, stop_tokens: [str]}`. | Its own `extra="forbid"` model — unknown sub-keys are rejected. `system_default` is a plain system-prompt string (default `""`); `stop_tokens` is a list of stop strings (default `[]`, e.g. `["<|im_end|>", "<|endoftext|>"]`). |
@@ -65,6 +68,24 @@ So the loop is: `GET` → read `ETag: "<n>"` → edit → `PUT` with `If-Match: 
 - `stop_tokens: list[str]` (default `[]`) — stop strings, e.g. `["<|im_end|>", "<|endoftext|>"]`.
 
 Most production manifests leave it empty (`system_default: ''`, `stop_tokens: []`) and let the model's chat template handle stops. Any key other than these two inside `prompt_template` is a validation error.
+
+### `arch` and `hybrid_kv_ratio` — hybrid (SSM + attention) model sizing
+
+Two fields describe models whose KV footprint is **not** a plain function of size: hybrids that interleave state-space (SSM) layers with attention layers, such as the `qwen35` hybrid family.
+
+- **`arch`** (`str`, default `""`) — the architecture family. Empty for an ordinary pure-attention model (the default, unchanged). Set `arch: "qwen35"` for a qwen35 hybrid.
+- **`hybrid_kv_ratio`** (`float`, default `1.0`, bounded `0.0..1.0`) — the fraction of layers that grow a per-token KV cache. In a qwen35 hybrid the SSM layers hold a **fixed-size recurrent state** rather than a cache that grows with context, so only the attention layers contribute the linear-in-tokens KV term. Setting `hybrid_kv_ratio` to that attention-layer fraction lets the KV-fit estimator scale the per-token KV down, so the VRAM/RAM gate doesn't over-estimate a hybrid's cache (see Section 4 for the exact math).
+
+**The default `1.0` is a no-op.** A ratio of `1.0` means "every layer grows KV" = pure attention = the exact sizing every existing manifest already gets. Lower it only for a real hybrid. The two fields are used as a pair: set `arch` to the hybrid family **and** `hybrid_kv_ratio` to the growing-KV fraction together.
+
+**Nothing new in `llama_server_flags`.** A hybrid model is content-addressed by `gguf_blob_sha256` like any other model, and its weight quant (existing quant types such as `TURBO2_0` and `TQ4_1S` are unchanged) is auto-detected by the engine from the GGUF header field `general.file_type`. There is no new spawn flag to set and nothing added to the allowlist for it. Hybrids also reuse the existing TurboQuant KV-cache types (`turbo2`/`turbo3`/`turbo4` in `cache_type_k`/`cache_type_v`); there is no new KV type. So configuring one is just: point `gguf_blob_sha256` at the blob, set `arch` + `hybrid_kv_ratio`, and carry the usual doctrine flags.
+
+```yaml
+# hybrid-model top-level fields (illustrative ratio):
+arch: "qwen35"          # SSM + attention hybrid
+hybrid_kv_ratio: 0.5    # only ~this fraction of layers grow a per-token KV cache;
+                        # SSM layers hold a fixed recurrent state. 1.0 = pure attention (no change).
+```
 
 ---
 
@@ -273,12 +294,21 @@ cont_batching: true
 
 The manager estimates fit **without loading the model** — the `check_kv_cache_fit` gate (3rd of 5 safety gates). KV size:
 
+**KV-fit precedence.** The KV estimate is whichever of these applies first:
+1. an explicit **measured `kv_bytes_per_token`** override — used verbatim (no quant-scale, no hybrid multiply);
+2. **parsed GGUF attention dims** for a `qwen35` model — sized from the real attention layers, and **ignores `hybrid_kv_ratio`** (the layer count already reflects the hybrid fraction);
+3. the **legacy file-size heuristic** below — the *only* path that applies `hybrid_kv_ratio`.
+
+The formula below is tier 3, the file-size fallback. Every non-`qwen35` model with no override uses it, byte-identically:
+
 ```
 gguf_mib          = gguf_size_bytes / (1024*1024)
 bytes_per_tok_f16 = (9 * gguf_mib) / 1024            # ≈ 9 KB/token per GiB of model body, at f16
 bytes_per_tok     = bytes_per_tok_f16 * quant_factor  # quant_factor from the cache_type_k table
-kv_cache_mib      = (bytes_per_tok * ctx_size) / 1024
+kv_cache_mib      = (bytes_per_tok * ctx_size) / 1024 * hybrid_kv_ratio   # hybrid_kv_ratio applies to THIS fallback path only; 1.0 (default) = no change
 ```
+
+**Hybrid models (`arch: "qwen35"`).** For a `qwen35` model the manager parses the real GGUF attention dims and sizes `kv_cache_mib` from the actual attention layers (tier 2 above) — this is the accurate path and it does **not** apply `hybrid_kv_ratio`. `hybrid_kv_ratio` matters only on the **file-size fallback** (tier 3): when the GGUF dims can't be parsed and no `kv_bytes_per_token` override is set, the estimator multiplies the per-token KV term by `hybrid_kv_ratio` so a hybrid's fallback `kv_cache_mib` is proportionally smaller than a pure-attention model of the same body size. The default `hybrid_kv_ratio: 1.0` leaves that factor at 1 — every existing pure-attention model is sized exactly as before.
 
 **KV resident in VRAM (default):**
 ```

@@ -416,6 +416,57 @@ The **`jinja: true`** flag is load-bearing for two things:
 
 If you copy a manifest, keep this flag.
 
+#### Hybrid (SSM + attention) models — three optional manifest fields
+
+Most models need nothing beyond the fields above. Three **optional** top-level manifest
+fields exist for models whose architecture is not a pure-attention transformer — for
+example a `qwen35` hybrid, which interleaves state-space (SSM) layers with attention layers:
+
+```yaml
+model_tag: my-hybrid-27b
+gguf_path: /var/lib/turbohaul/blobs/my-hybrid-27b.gguf
+context_length: 92160
+gpu_layers: 999
+arch: qwen35              # architecture hint; default "" (pure attention)
+hybrid_kv_ratio: 0.5      # fraction of layers with a GROWING KV cache; default 1.0
+
+llama_server_flags:
+  ctx_size: 92160
+  n_gpu_layers: 999
+  cache_type_k: q4_0
+  cache_type_v: q4_0
+  n_predict: -1
+  jinja: true
+```
+
+- **`arch`** (string, default `""`): the model's architecture family. Set it to `qwen35`
+  for an SSM/attention hybrid. Left empty, Turbohaul treats the model as a pure-attention
+  transformer — byte-identical to every model configured before this field existed.
+- **`hybrid_kv_ratio`** (float 0.0–1.0, default `1.0`): the fraction of layers that
+  contribute a **growing** per-token KV cache. In a hybrid, the SSM layers keep a
+  fixed-size recurrent state instead of a cache that grows with context, so the model's
+  per-token KV footprint is smaller than a pure-attention model of the same size.
+  Turbohaul scales its VRAM / KV-fit estimate by this ratio, so a hybrid packs more
+  context (or shares a card more comfortably) than the raw parameter count would suggest.
+  `1.0` = pure attention = the original estimate, unchanged for every existing model.
+- **`kv_bytes_per_token`** (float, optional, minimum `1024.0`): an operator-**measured**
+  effective KV cost in **bytes per token**. This is the highest-precedence input to the
+  KV-fit estimate — when set, it is used directly instead of any derived figure. Reach for
+  it when the size-derived estimate is wrong for your model and you have measured the real
+  cost; it is the difference between a large-context hybrid being admitted and being
+  refused. Note the unit: bytes, not KiB. A measured 13.5 KiB/token is `13824.0` here, and
+  values below 1 KiB/token are rejected so a KiB-vs-bytes typo cannot silently under-count.
+
+**Quant is auto-detected — no new flag needed.** Turbohaul reads the weight quant straight
+from the GGUF header (`general.file_type`), so there is nothing to add to
+`llama_server_flags` for a new quant — the GGUF loads through the same manifest shape as
+any other, on both CPU and CUDA.
+
+**Why these fields exist.** Without them, the KV-fit safety gate estimates a hybrid's cache
+from the model's file size, which assumes every layer grows a cache per token. On a hybrid
+that over-counts badly — enough to refuse a spawn that would have fit comfortably. See
+[SAFETY_GATE_VRAM_MATH.md](SAFETY_GATE_VRAM_MATH.md) for the arithmetic and a worked example.
+
 ### Multi-model deployment
 
 You can load multiple manifests; Turbohaul will swap models on demand (tears down the warm holder for one model when a request for a different model arrives). Default is single-slot (one model active at a time), preserving the single-sidecar invariant. Multi-slot residency is a v0.3 roadmap item.

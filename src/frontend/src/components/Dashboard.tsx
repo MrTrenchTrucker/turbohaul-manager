@@ -443,12 +443,22 @@ function PrefillBar({ gen, sessionTotal }: { gen: GenerationInfo; sessionTotal: 
   const nowRaw = (gen.n_prompt_cache ?? 0) + (gen.n_prompt_proc ?? 0);
   if (nowRaw > 0) holdVal.current = nowRaw; // hold through /slots-starvation ticks
   const now = holdVal.current;
-  // Denominator = the LAST COMPLETED turn's prompt total, learned by
-  // the always-mounted parent (this component only exists during 'prefill' —
-  // n_prompt_tokens fills DURING prefill on this fork, so learning it here
-  // pegged the % at ~99 while the count grew, e.g. 24,576->42,648
-  // both '~99%'). First-ever turn: sessionTotal=0 -> indeterminate pulse.
-  const pct = sessionTotal > 0 ? Math.min(99, Math.max(1, (now / sessionTotal) * 100)) : null;
+  // Use the backend's prefill_pct when available (correct denominator: the
+  // current n_prompt from live_monitor.py). Fall back to sessionTotal — the
+  // LAST COMPLETED turn's prompt total, learned by the always-mounted parent
+  // (this component only exists during 'prefill' — n_prompt_tokens fills
+  // DURING prefill on this fork, so learning it here pegged the % at ~99 while
+  // the count grew, e.g. 24,576->42,648 both '~99%'). If sessionTotal is also 0
+  // but we have live token counts (now > 0), still render the bar with the
+  // growing token count and a meaningful fill — clamp at 99% since we lack the
+  // true denominator. The w-1/3 pulse is ONLY for the true indeterminate state
+  // (no token data at all). The 99% clamp keeps the bar from reading 100%
+  // during prefill.
+  const pct = gen.prefill_pct != null
+      ? Math.min(99, Math.max(1, gen.prefill_pct))
+      : sessionTotal > 0
+        ? Math.min(99, Math.max(1, (now / sessionTotal) * 100))
+        : now > 0 ? 99 : null;
   return (
     <div className="rounded-lg border border-blue-700 bg-blue-950/30 p-4">
       <div className="flex items-baseline justify-between mb-2">

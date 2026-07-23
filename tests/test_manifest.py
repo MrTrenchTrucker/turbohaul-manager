@@ -111,6 +111,19 @@ class TestManifestSchema:
         with pytest.raises(PydanticValidationError, match="expects bool"):
             make_manifest(llama_server_flags={"mlock": 1})
 
+    def test_kv_bytes_per_token_floor(self):
+        # kv_bytes_per_token is the highest-precedence KV-fit
+        # override, used VERBATIM as effective BYTES/token. Its only guard is a
+        # 1 KiB/token floor (Field ge=1024.0) that rejects a KiB-vs-bytes typo
+        # (a <1 KiB value would silently under-count → the gate would always pass).
+        with pytest.raises(PydanticValidationError):
+            make_manifest(kv_bytes_per_token=13.5)     # typed KiB, meant bytes → rejected
+        with pytest.raises(PydanticValidationError):
+            make_manifest(kv_bytes_per_token=1023.9)   # just below the floor → rejected
+        assert make_manifest(kv_bytes_per_token=1024.0).kv_bytes_per_token == 1024.0  # floor accepts
+        assert make_manifest(kv_bytes_per_token=13824.0).kv_bytes_per_token == 13824.0  # measured value
+        assert make_manifest().kv_bytes_per_token is None  # unset default → byte-identical
+
 
 class TestAtomicWriteAndRead:
     def test_write_then_read(self, tmp_path):

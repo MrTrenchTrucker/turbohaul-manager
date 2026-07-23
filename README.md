@@ -76,6 +76,22 @@ The Turbohaul manifest schema includes five spawn-time TurboQuant flags that sho
 
 See [docs/TURBOQUANT_FLAGS.md](docs/TURBOQUANT_FLAGS.md) for the spawn-vs-request distinction, patching recipe, and verification recipe.
 
+## Hybrid (SSM + attention) models
+
+Turbohaul serves hybrid models — architectures that combine state-space (SSM) layers with attention layers — in every existing mode: single, series-parallel (`--parallel N`), and double-parallel (multiple resident models). Because SSM layers keep a fixed-size recurrent state instead of a growing per-token cache, a hybrid's KV footprint is smaller than a pure-attention model of the same size, and the manifest fields below let the VRAM / KV-fit estimate account for that.
+
+### Manifest fields
+
+Three optional manifest fields let you describe a hybrid model so the VRAM / KV-fit estimate stays accurate. For a `qwen35` hybrid the fit is **dimension-derived by default** — the manager reads the model's real GGUF attention dims — with `kv_bytes_per_token` available as a measured override (details in [MODEL_CONFIG_REFERENCE](docs/MODEL_CONFIG_REFERENCE.md)):
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `arch` | string | `""` | Model architecture hint (e.g. `qwen35` for an SSM/attention hybrid). |
+| `hybrid_kv_ratio` | float 0.0–1.0 | `1.0` | Fraction of layers that contribute a **growing** per-token KV cache. SSM layers keep a fixed-size recurrent state rather than a growing cache, so a hybrid's per-token KV is smaller than a pure-attention model of the same size. Scales the **file-size fallback** estimate only (for a parseable `qwen35` model the dimension-aware path is used instead). |
+| `kv_bytes_per_token` | float ≥ 1024.0 or unset | *(unset)* | Optional operator-**measured** effective KV cost in **BYTES/token** (highest precedence, used verbatim; 1 KiB/token floor rejects a KiB-vs-bytes typo). Leave unset for existing models. |
+
+The defaults (`arch: ""`, `hybrid_kv_ratio: 1.0`) mean **pure attention** and are byte-identical to prior behaviour for every existing model. Hybrid models reuse the existing KV-cache types — no new KV type is introduced.
+
 ## Persistence
 
 Production deployments must bind-mount `/var/lib/turbohaul`, ship an image tarball backup, mirror configs to a separate host, and have an auto-recovery entry. See [docs/PERSISTENCE_CHECKLIST.md](docs/PERSISTENCE_CHECKLIST.md) for the full Turbohaul-specific hardening audit.
@@ -89,16 +105,15 @@ MIT (see LICENSE). All third-party deps audited MIT-compatible (see THIRD_PARTY_
 See [CONTRIBUTORS.md](CONTRIBUTORS.md). MrTrench (founder) shipped v0.6.0. Release notes in [CHANGELOG.md](CHANGELOG.md).
 
 
-## Self-contained offline build
+## Offline use — everything vendored in one repository
 
-The modified TurboQuant engine source (`engine/llama-cpp-turboquant/`), the Python
-dependency wheels (`vendor/pywheels/`), and the prebuilt frontend all ship in this
-repository, so you can build everything offline -- no external engine clone, PyPI, or
-npm required.
+Turbohaul Manager ships **fully vendored** in this single Git repository — engine
+source, Python deps (wheels), and frontend. No external repo, registry, PyPI, or npm
+required.
 
-### Build the image from source (needs the CUDA base image once)
+### Build from source (needs the CUDA base image once)
 ```bash
-docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.6.0 .
+docker build -f Dockerfile.engine-src -t turbohaul-manager:engine-src .
 ```
 Compiles the vendored engine (`engine/llama-cpp-turboquant/`) from source, installs Python
 from the vendored wheels (`vendor/pywheels/`), and serves the committed frontend `dist` --

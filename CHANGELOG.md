@@ -6,6 +6,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 GitHub (`https://github.com/MrTrenchTrucker/turbohaul-manager`) is the canonical public repository.
 
+## [v0.7.0] - 2026-07-23
+
+### Highlights
+
+- **Hybrid state-space/attention models now serve end to end.** The manager gains manifest fields for describing a hybrid architecture plus a dimension-aware KV-fit estimate, so a `qwen35` hybrid loads and serves through the same single, series-parallel, and double-parallel paths as any other model. The addition is strictly additive: every existing model is byte-for-byte unchanged, and no existing deployment has to change anything to keep running as before.
+- **Large contexts on hybrid models are no longer refused for a phantom shortfall.** The old estimate derived a hybrid's KV cache from its file size, which assumes every layer grows a cache per token. On a state-space hybrid that over-counts badly — in one measured case by roughly 3.4×, enough to refuse a 250,000-token context that in fact fits comfortably. The dimension-aware estimate reads the model's real attention dimensions instead, and an operator can override it outright with a measured figure. See [docs/SAFETY_GATE_VRAM_MATH.md](docs/SAFETY_GATE_VRAM_MATH.md).
+- **Multi-GPU placement is now automatic.** Co-resident models can be spread across cards instead of piling onto the manifest's pinned default, with per-card VRAM accounted separately so one card's headroom is never mistaken for another's. See [docs/MULTI_GPU_PLACEMENT.md](docs/MULTI_GPU_PLACEMENT.md).
+- **Vision models are supported.** A vision projector is supplied as a content-addressed blob, keeping the path-bearing raw flag denied. See [docs/VISION_MODELS.md](docs/VISION_MODELS.md).
+
+### Added
+
+- **Smart GPU auto-placer (`auto_place`).** Opt-in per manifest (default `false` — existing behavior is unchanged). When enabled, the manager picks the GPU for a co-resident model at spawn time by choosing the card with the most suitable free VRAM, rather than always honoring the manifest's pinned default. Each card keeps its own safety floor free, and a spawn is refused rather than blindly admitted when no card can hold the model. Documented in [docs/MULTI_GPU_PLACEMENT.md](docs/MULTI_GPU_PLACEMENT.md).
+- **Per-card VRAM accounting for multi-model co-residence.** VRAM headroom is now tracked per GPU rather than in aggregate, so two models sharing a host are each costed against the card they will actually land on. Aggregate accounting could previously see "enough free VRAM" across the host while the specific target card had none.
+- **Content-addressed vision-projector support (`mmproj_blob_sha256`).** An optional manifest field naming the projector as a blob checksum in the content-addressed store; the manager resolves it and injects the projector at spawn. The raw path-bearing projector flag remains in the denied set, so a manifest still cannot smuggle an arbitrary host path into the engine command line. Documented in [docs/VISION_MODELS.md](docs/VISION_MODELS.md).
+
+- **Hybrid `qwen35` model support.** A `qwen35` model is a hybrid — a mix of state-space (SSM) and attention layers. It serves in every existing residency mode: single, series-parallel (`--parallel N`), and double-parallel (several models resident at once).
+- **New manifest fields `arch` and `hybrid_kv_ratio` for hybrid models.** `arch` (string, default `""`) names the model architecture — set `arch: "qwen35"` for a state-space/attention hybrid; this is load-bearing (it triggers the dimension-aware KV-fit path below). `hybrid_kv_ratio` (float, `0.0`–`1.0`, default `1.0`) is the fraction of layers that contribute a growing per-token KV cache; it scales the KV term on the **file-size fallback** estimate path only (see the dimension-aware bullet below). The default of `1.0` means pure attention — byte-identical behavior for every existing model.
+- **New manifest field `kv_bytes_per_token` — an operator-measured KV-fit override.** Optional (`float | None`, default `None`). When set it is the model's **measured effective KV cache cost in BYTES per token** (e.g. from an `nvidia-smi` reading) and is used **verbatim** by the KV-fit estimate — no quant-scale, no `hybrid_kv_ratio` multiply. It carries a **1 KiB/token floor** (`Field(ge=1024.0)`) so a KiB-vs-bytes typo (e.g. `13.5`) is rejected at manifest-load rather than silently under-counting. Default `None` disables it — byte-identical for every existing model.
+- **Dimension-aware KV-fit estimate for hybrid / low-bit models.** For a `qwen35` model the manager parses the real GGUF attention dims (via the new `src/turbohaul/_gguf_meta.py` KV-header reader) and sizes the KV cache from them. The estimate follows a strict precedence: **measured `kv_bytes_per_token` override → parsed GGUF attention dims → legacy file-size heuristic.** The first two paths deliberately **ignore `hybrid_kv_ratio`** (the attention-layer count already reflects the hybrid fraction, so re-applying the ratio would under-count). Any non-`qwen35` model — or one whose GGUF can't be parsed and has no override — uses the legacy file-size heuristic unchanged (byte-identical). This closes an under-count where an ultra-low-bit model's small file size made the heuristic badly under-estimate its KV cache.
+- **New GGUF metadata reader `src/turbohaul/_gguf_meta.py`.** A small, stdlib-only, read-only parser of the GGUF key/value header (never tensor data) that extracts a model's attention dims for the dimension-aware KV-fit estimate. It never raises to its caller — any malformed/missing input returns `None` and falls back to the legacy path.
+
+### Changed
+
+- **KV-fit and VRAM estimates are now dimension-aware for hybrids, with `hybrid_kv_ratio` as the file-size fallback.** For a `qwen35` model the estimate is derived from the real GGUF attention dims (or an explicit measured `kv_bytes_per_token`); `hybrid_kv_ratio` now scales **only** the legacy file-size fallback path — the one used when the GGUF dims can't be parsed and no override is set. A model without any of these fields (the defaults) is estimated exactly as before.
+
+### Fixed
+
+- **Pre-fill meter reported a misleading percentage.** The dashboard's pre-fill bar derived its percentage from a denominator that did not match the context actually being admitted, so the bar could sit pegged near the top while the token count kept climbing. It now uses the backend-reported pre-fill percentage, falling back to the admitted context length, and finally to the largest prompt seen. A run with no usable denominator shows a bounded indeterminate state instead of a misleading full bar.
+- **Duplicate tracking of the largest observed prompt** in the live monitor, which could report the wrong denominator for the pre-fill meter.
+- **Cosmetic defects in source comments and one log line.** A log message read `"the classifier classifier decision"`, and several comments contained a doubled word. These were text-only and affected no behavior.
+
+### Compatibility
+
+- **No new server flags.** The engine detects a model's weight quant automatically from the GGUF header (`general.file_type`), so nothing is added to the safe server-flag allowlist; existing manifests and spawn recipes are unaffected, and no manifest or flag change is required to serve a hybrid model.
+- **No new KV-cache type.** Hybrid models reuse the existing turbo KV-cache types — the KV cache path is unchanged.
+- **Every new manifest field is optional and defaults to previous behavior.** `arch` (`""`), `hybrid_kv_ratio` (`1.0`), `kv_bytes_per_token` (unset), `auto_place` (`false`) and `mmproj_blob_sha256` (unset) all leave an existing manifest estimated, placed and spawned exactly as before. No migration is required.
+
+---
+
+
 ---
 
 ## [v0.6.0] - 2026-07-10
