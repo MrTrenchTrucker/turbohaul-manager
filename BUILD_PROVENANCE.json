@@ -14,7 +14,7 @@
   "cuda_arch": "sm_86",
   "gpu_target": "RTX 3090 (Ampere, compute 8.6)",
   "dockerfile": "Dockerfile.sm86",
-  "live_image_replaced": false,
+  "live_image_replaced": true,
   "live_image_arch_bug": "built with arches 89;120 (Blackwell), missing sm_86",
   "engine_source": "engine/llama-cpp-turboquant (vendored in-repo, compiled in-image)",
   "tests_added": [
@@ -28,16 +28,18 @@
     "tests/test_disconnect_eviction.py::test_3_active_slot_not_affected_by_evict",
     "tests/test_disconnect_eviction.py::test_4_client_disconnect_evicts_pending_returns_499"
   ],
-  "live_image_current": {
+  "rollback_image": {
     "tag": "turbohaul-manager:v0.7.0-p12fix",
     "digest": "sha256:d5c2b2a2f90b1515a9336d5872e042b92aa152a384441c4f4ead4ad367bda0df",
     "arch_bug": "built with arches 89;120 (Blackwell), missing sm_86",
-    "status": "running and healthy at pre-activation capture; preserved as the rollback target"
+    "container": "turbohaul-p12-rollback-pre-sm86-20260726",
+    "container_id": "a417bf57124955beff664db41aa87524ff16012ba46fe8aa88128372f3878733",
+    "status": "exited and preserved for rollback"
   },
   "candidate_image": {
     "tag": "turbohaul-manager:v0.7.0-sm86-candidate",
-    "status": "built and verified (not started)",
-    "relation": "verified activation candidate; live_image_current remains active until controlled swap"
+    "status": "active and healthy",
+    "relation": "running as the live Turbohaul manager; rollback_image remains preserved"
   },
   "candidate_image_built": true,
   "candidate_image_digest": "sha256:3a74cd6788b806330add66cc8566cfb98f0d3c519516b3a9961d52f1cac1e74f",
@@ -54,7 +56,79 @@
     "entrypoint": "turbohaul-manager",
     "healthcheck": "curl -fsS http://127.0.0.1:11401/health",
     "oci_labels_correct": true,
-    "image_not_started": true,
-    "gpu_model_load_not_run": true
+    "image_not_started": false,
+    "gpu_model_load_not_run": false
+  },
+  "activation": {
+    "activated_at": "2026-07-26T12:17:06Z",
+    "restart_verified_at": "2026-07-26T12:52:46Z",
+    "recorded_at": "2026-07-26T14:02:12+01:00",
+    "container": "turbohaul",
+    "container_id": "cd5542bfd44ca3aecf4e039ab9454c2558a289b25d229ffb4178f383a7d62ddd",
+    "image_id": "sha256:3a74cd6788b806330add66cc8566cfb98f0d3c519516b3a9961d52f1cac1e74f",
+    "bind": "127.0.0.1:11401",
+    "state": "running",
+    "health": "healthy",
+    "restart_persistence_verified": true,
+    "gpu_release_verified": true,
+    "state_backup": "/var/lib/turbohaul/backups/state.sqlite.20260726-pre-sm86.bak",
+    "manifest_backup": "/var/lib/turbohaul/backups/manifests.20260726-pre-sm86.zip"
+  },
+  "live_canaries": {
+    "grm-2.6": {
+      "context_tokens": 131072,
+      "gpu": 0,
+      "generation_tokens_per_second": 32.10218124289614,
+      "verdict": "PASS_MAIN_BAR"
+    },
+    "prism-27b-dq": {
+      "context_tokens": 131072,
+      "gpu": 0,
+      "generation_tokens_per_second": 26.530102961671464,
+      "verdict": "FUNCTIONAL_BELOW_MAIN_BAR",
+      "higher_context_result": "generation failed at 229376 and 262144 tokens"
+    },
+    "darwin-28b-coder": {
+      "context_tokens": 131072,
+      "gpu": 0,
+      "generation_tokens_per_second": 27.65842877652076,
+      "verdict": "FUNCTIONAL_BELOW_MAIN_BAR"
+    },
+    "carwin-moe": {
+      "context_tokens": 262144,
+      "gpu": 1,
+      "generation_tokens_per_second": 119.51893628146709,
+      "verdict": "PASS_AUX_BAR",
+      "coexistence": "speech active; manual ComfyUI stopped and mutually exclusive while resident"
+    },
+    "qwythos-9b": {
+      "context_tokens": 262144,
+      "gpu": 1,
+      "generation_tokens_per_second": 69.73637471097543,
+      "verdict": "PASS_AUX_FALLBACK"
+    }
+  },
+  "live_manifest_revisions": {
+    "grm-2.6": 3,
+    "prism-27b-dq": 6,
+    "darwin-28b-coder": 4,
+    "carwin-moe": 1,
+    "qwythos-9b": 3
+  },
+  "routing_correction": {
+    "stale_model": "qwopus3.6-27b-q4",
+    "replacement": "qwythos-9b",
+    "keys": [
+      "auxiliary.web_extract.model",
+      "auxiliary.compression.model"
+    ],
+    "config_check_passed": true
+  },
+  "source_promotion": {
+    "fork": "Sahil-SS9/turbohaul-manager",
+    "branch": "p12/v07-sm86-candidate-20260726",
+    "upstream_pull_request": "https://github.com/MrTrenchTrucker/turbohaul-manager/pull/7",
+    "upstream_main_merged": false,
+    "blocker": "Sahil-SS9 token has no direct write permission to MrTrenchTrucker/turbohaul-manager"
   }
 }
