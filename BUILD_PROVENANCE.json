@@ -35,9 +35,24 @@
   },
   "candidate_image": {
     "tag": "turbohaul-manager:v0.7.0-sm86-candidate",
-    "status": "not built -- prior attempts failed at frontend typecheck; this remediation builds it",
+    "status": "built and verified (not started)",
     "relation": "candidate intended to replace live_image_current once built and verified"
   },
-  "candidate_image_built": false,
-  "candidate_image_digest": null
+  "candidate_image_built": true,
+  "candidate_image_digest": "sha256:3a74cd6788b806330add66cc8566cfb98f0d3c519516b3a9961d52f1cac1e74f",
+  "candidate_image_id": "3a74cd6788b8",
+  "candidate_image_size": "6.95GB",
+  "candidate_image_built_at": "2026-07-26T12:48:05+01:00",
+  "candidate_image_verified": {
+    "cuda_arch": "sm_86 only (208 ELF cubins + 208 PTX files, no 89/120)",
+    "manager_py_sha256": "272fcd257fc2e00562bae4845aa1eb2748f36d6893291d92176056ac76efa881",
+    "build_arch_txt": "sm86",
+    "llama_server_present": true,
+    "ui_dist_index_html_present": true,
+    "entrypoint": "turbohaul-manager",
+    "healthcheck": "curl -fsS http://127.0.0.1:11401/health",
+    "oci_labels_correct": true,
+    "image_not_started": true,
+    "gpu_model_load_not_run": true
+  }
 }
