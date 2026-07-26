@@ -19,7 +19,8 @@
   "engine_source": "engine/llama-cpp-turboquant (vendored in-repo, compiled in-image)",
   "tests_added": [
     "tests/test_p12_idle_status_fix.py",
-    "tests/sm86/test_sm86_arch.py"
+    "tests/sm86/test_sm86_arch.py",
+    "tests/sm86/test_sm86_frontend_contract.py"
   ],
   "test_updated": "tests/test_manager.py::TestStatusSnapshot::test_idle_state_reflected",
   "pre_existing_failures_unrelated": [
@@ -29,20 +30,21 @@
   ],
   "live_image_current": {
     "tag": "turbohaul-manager:v0.7.0-p12fix",
-    "digest": "sha256:d5c2b2a2f90b",
+    "digest": "sha256:d5c2b2a2f90b1515a9336d5872e042b92aa152a384441c4f4ead4ad367bda0df",
     "arch_bug": "built with arches 89;120 (Blackwell), missing sm_86",
-    "status": "still active -- NOT replaced by this candidate (no candidate image built yet)"
+    "status": "running and healthy at pre-activation capture; preserved as the rollback target"
   },
   "candidate_image": {
     "tag": "turbohaul-manager:v0.7.0-sm86-candidate",
     "status": "built and verified (not started)",
-    "relation": "candidate intended to replace live_image_current once built and verified"
+    "relation": "verified activation candidate; live_image_current remains active until controlled swap"
   },
   "candidate_image_built": true,
   "candidate_image_digest": "sha256:3a74cd6788b806330add66cc8566cfb98f0d3c519516b3a9961d52f1cac1e74f",
-  "candidate_image_id": "3a74cd6788b8",
-  "candidate_image_size": "6.95GB",
-  "candidate_image_built_at": "2026-07-26T12:48:05+01:00",
+  "candidate_image_id": "sha256:3a74cd6788b806330add66cc8566cfb98f0d3c519516b3a9961d52f1cac1e74f",
+  "candidate_image_size_bytes": 2607172068,
+  "candidate_image_build_label_date_utc": "2026-07-26T11:42:07Z",
+  "candidate_image_verified_at": "2026-07-26T12:48:05+01:00",
   "candidate_image_verified": {
     "cuda_arch": "sm_86 only (208 ELF cubins + 208 PTX files, no 89/120)",
     "manager_py_sha256": "272fcd257fc2e00562bae4845aa1eb2748f36d6893291d92176056ac76efa881",
