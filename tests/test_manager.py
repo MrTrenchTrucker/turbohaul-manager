@@ -279,9 +279,22 @@ class TestStatusSnapshot:
         assert snap["grace"]["thread_id_prefix"] == "thr-abc1"
 
     def test_idle_state_reflected(self, boot_and_runtime):
+        """P12 idle-status fix: legacy IdleHotTimer alone must NOT surface as
+        idle_hot in /status. Only a real idle holder (_idle_handle + unexpired
+        _idle_expires_at) reports idle_hot."""
+        import time
         boot, runtime = boot_and_runtime
         mgr = TurbohaulManager(boot, runtime)
+        # Legacy timer started but no real holder -> idle_hot must be None.
         mgr.idle.start("example-coder")
+        snap = mgr.status_snapshot()
+        assert snap["idle_hot"] is None, (
+            "legacy IdleHotTimer must not surface as idle_hot without a real holder"
+        )
+        # With a real holder, idle_hot is reported.
+        mgr._idle_handle = object()
+        mgr._idle_expires_at = time.monotonic() + 300
+        mgr._idle_model_tag = "example-coder"
         snap = mgr.status_snapshot()
         assert snap["idle_hot"] is not None
         assert snap["idle_hot"]["model_tag"] == "example-coder"

@@ -1923,13 +1923,10 @@ class TurbohaulManager:
                 "remaining_s": int(self._idle_expires_at - time.monotonic()),
                 "model_tag": self._idle_model_tag,
             }
-        elif not self.idle.expired():
-            # Backward compat: when idle_seconds=0 (test mode) the warm
-            # holder is not used and self.idle still tracks "last model".
-            idle_info = {
-                "remaining_s": int(self.idle.remaining_s()),
-                "model_tag": self.idle.model_tag,
-            }
+        # P12 idle-status fix (carried from v0.5.0 base overlay):
+        # A warm state is only valid while the manager owns a live idle handle.
+        # self.idle records historical model affinity after immediate teardown
+        # and must not be exposed as an active warm sidecar in /status.
 
         # Cache the vram ref ONCE so the null-check + list see the same value.
         # (status_snapshot is a sync def with no await, so single-threaded asyncio
@@ -4966,14 +4963,11 @@ class TurbohaulManager:
                 finally:
                     _ih_conn.close()
             else:
-                # idle disabled (idle_seconds=0) or no handle -- immediate teardown.
+                # No warm holder exists after immediate teardown. Clear the legacy
+                # affinity timer too: it cannot truthfully represent a live sidecar.
+                # P12 idle-status fix (carried from v0.5.0 base overlay).
                 await self._teardown(slot, "grace-expired")
-                self.idle.start(slot.model_tag)
-                await self._audit_event_only_async(
-                    slot.slot_id,
-                    "idle_hot_enter",
-                    {"model_tag": slot.model_tag},
-                )
+                self.idle.reset()
         finally:
             # fix (closes a high-priority item + a medium-priority item) + design fix:
             # If unwind reaches here with a live handle, the IDLE_HOT

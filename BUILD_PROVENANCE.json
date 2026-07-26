@@ -1,0 +1,30 @@
+{
+  "candidate": "turbohaul-manager:v0.7.0-sm86-candidate",
+  "source_base": "v0.7.0",
+  "source_base_commit": "905b4506883313b17e1d4e0480a8e6ca6c63399b",
+  "patch": "p12-idle-status-fix",
+  "patched_file": "src/turbohaul/manager.py",
+  "patched_file_sha256_live_overlay": "272fcd257fc2e00562bae4845aa1eb2748f36d6893291d92176056ac76efa881",
+  "v070_manager_py_sha256": "532d8ede862875dbd365c9d6b2dee08b8c6d76a1e066a8947421ab4b54730055",
+  "unmodified_files": {
+    "manifest.py_sha256": "0223222176f8cede7b62a1af8de11c9a3f5e78a7d6866bf0202fbe72eb8b406d",
+    "safety.py_sha256": "071010b9b2732a27aa2831a694d40480958ff94872e75f102cf29f2a374e2203",
+    "chat_completion.py_sha256": "d3af7d0da43f20b11a35ed9d107ad7cb994ccd043dd6b36d5d8fe32f9f327975"
+  },
+  "cuda_arch": "sm_86",
+  "gpu_target": "RTX 3090 (Ampere, compute 8.6)",
+  "dockerfile": "Dockerfile.sm86",
+  "live_image_replaced": "turbohaul-manager:v0.7.0-p12fix (sha256:d5c2b2a2f90b...)",
+  "live_image_arch_bug": "built with arches 89;120 (Blackwell), missing sm_86",
+  "engine_source": "engine/llama-cpp-turboquant (vendored in-repo, compiled in-image)",
+  "tests_added": [
+    "tests/test_p12_idle_status_fix.py",
+    "tests/sm86/test_sm86_arch.py"
+  ],
+  "test_updated": "tests/test_manager.py::TestStatusSnapshot::test_idle_state_reflected",
+  "pre_existing_failures_unrelated": [
+    "tests/test_manager.py::TestWorkerLoopSkeleton::test_worker_loop_consumes_queue",
+    "tests/test_disconnect_eviction.py::test_3_active_slot_not_affected_by_evict",
+    "tests/test_disconnect_eviction.py::test_4_client_disconnect_evicts_pending_returns_499"
+  ]
+}
