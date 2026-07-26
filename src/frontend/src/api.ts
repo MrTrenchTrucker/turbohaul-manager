@@ -96,6 +96,9 @@ export interface ResidentModel {
   main_gpu: number;
   split_mode: string;
   inflight: number;
+  // Named engine operation for the Dashboard pill (synthesized from
+  // active/loading when cap<=1; backend Slot.engine_op since v0.6 bc8b8f8).
+  engine_op?: string;
   idle_expires_in_s: number | null;
   generation: GenerationInfo | null;
 }

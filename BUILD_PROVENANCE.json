@@ -14,7 +14,7 @@
   "cuda_arch": "sm_86",
   "gpu_target": "RTX 3090 (Ampere, compute 8.6)",
   "dockerfile": "Dockerfile.sm86",
-  "live_image_replaced": "turbohaul-manager:v0.7.0-p12fix (sha256:d5c2b2a2f90b...)",
+  "live_image_replaced": false,
   "live_image_arch_bug": "built with arches 89;120 (Blackwell), missing sm_86",
   "engine_source": "engine/llama-cpp-turboquant (vendored in-repo, compiled in-image)",
   "tests_added": [
@@ -26,5 +26,18 @@
     "tests/test_manager.py::TestWorkerLoopSkeleton::test_worker_loop_consumes_queue",
     "tests/test_disconnect_eviction.py::test_3_active_slot_not_affected_by_evict",
     "tests/test_disconnect_eviction.py::test_4_client_disconnect_evicts_pending_returns_499"
-  ]
+  ],
+  "live_image_current": {
+    "tag": "turbohaul-manager:v0.7.0-p12fix",
+    "digest": "sha256:d5c2b2a2f90b",
+    "arch_bug": "built with arches 89;120 (Blackwell), missing sm_86",
+    "status": "still active -- NOT replaced by this candidate (no candidate image built yet)"
+  },
+  "candidate_image": {
+    "tag": "turbohaul-manager:v0.7.0-sm86-candidate",
+    "status": "not built -- prior attempts failed at frontend typecheck; this remediation builds it",
+    "relation": "candidate intended to replace live_image_current once built and verified"
+  },
+  "candidate_image_built": false,
+  "candidate_image_digest": null
 }

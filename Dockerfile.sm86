@@ -1,15 +1,13 @@
-# Turbohaul-Manager cuda-multi -- broad-architecture variant.
+# Turbohaul-Manager SM86 candidate -- single-architecture variant (Ampere sm_86).
 # Compiles the vendored TurboQuant engine (engine/llama-cpp-turboquant) FROM SOURCE
-# with CUDA arches covering Turing through Blackwell
-# (sm_75 / sm_80 / sm_86 / sm_89 / sm_90 / sm_120).
-# One image, works on ~99% of CUDA-capable consumer/prosumer NVIDIA cards
-# 2018+ (GTX 16-series and later).
+# with CUDA arch fixed to sm_86 only (RTX 3090 / Ampere compute 8.6).
+# No multi-arch kernel bloat; one image, one target arch.
 #
-# Build time: ~30-40 min (NVCC compile for 6 architectures).
-# Image size: slightly larger than a single-arch build (extra compiled kernels).
+# Build time: ~10-15 min (NVCC compile for 1 architecture).
+# Image size: smaller than the broad-arch build (single kernel set).
 #
 # Build:
-#   docker build -f Dockerfile.cuda-multi -t turbohaul-manager:v0.6.0 .
+#   docker build -f Dockerfile.sm86 -t turbohaul-manager:v0.7.0-sm86-candidate .
 
 # ----------------------------------------------------------------------------
 # Stage 1: Frontend (same as the slim Dockerfile)
@@ -22,8 +20,8 @@ COPY src/frontend/. ./
 RUN npm run typecheck && npm run build
 
 # ----------------------------------------------------------------------------
-# Stage 2: Compile the vendored TurboQuant engine from source for 6 GPU arches.
-# CUDA_ARCHITECTURES is expanded to cover Turing through Blackwell.
+# Stage 2: Compile the vendored TurboQuant engine from source for sm_86 only.
+# CUDA_ARCHITECTURES is pinned to 86 (Ampere, compute 8.6).
 # ----------------------------------------------------------------------------
 FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS llama-binary
 
@@ -56,6 +54,7 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
       -DGGML_CUDA_FA_ALL_QUANTS=ON \
       -DCMAKE_BUILD_TYPE=Release \
       -DLLAMA_BUILD_UI=OFF \
+      -DLLAMA_USE_PREBUILT_UI=OFF \
       -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
       -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
       -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \

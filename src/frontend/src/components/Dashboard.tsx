@@ -48,8 +48,8 @@ function synthesizeResident(data: StatusSnapshot): ResidentModel | null {
         ? (data.grace?.remaining_s ?? data.idle_hot?.remaining_s ?? null)
         : null,
     generation: data.generation,
-    // engine_op from active/loading info
-    engine_op: (source as any).engine_op,
+    // engine_op from active/loading info (ActiveInfo/LoadingInfo only)
+    engine_op: 'engine_op' in source ? source.engine_op : undefined,
   };
 }
 
@@ -746,7 +746,7 @@ function ResidentCard({
   const gen = model.generation;
   // engine_op from active/loading info (synthesized resident)
   // We get this from the data.active or data.loading engine_op via synthesis
-  const engineOp = (model as any).engine_op;
+  const engineOp = model.engine_op;
   return (
     <Card title={model.model_tag} tone={stateTone(model.state)}>
       <div className="flex items-center gap-2 mb-2">
