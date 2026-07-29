@@ -605,11 +605,7 @@ class TestSseHeartbeat:
 
 
 class TestParseKeepAlive:
-    """parse_keep_alive returns int|None per Ollama-style input.
-
-    Single-layer clamp: this helper normalises types only; clamping to
-    KEEP_ALIVE_MAX_S lives in TurbohaulManager (one source of truth).
-    """
+    """parse_keep_alive returns Turbohaul's capped Ollama-style retention value."""
 
     def test_none_returns_none(self):
         from turbohaul.api.chat_completion import parse_keep_alive
@@ -619,18 +615,18 @@ class TestParseKeepAlive:
         from turbohaul.api.chat_completion import parse_keep_alive
         assert parse_keep_alive(60) == 60
         assert parse_keep_alive(0) == 0
-        assert parse_keep_alive(-1) == -1
+        assert parse_keep_alive(-1) == 1800  # negative means capped pin-warm
         assert parse_keep_alive(10000) == 10000  # caller clamps
 
     def test_float_truncates_to_int(self):
         from turbohaul.api.chat_completion import parse_keep_alive
         assert parse_keep_alive(60.7) == 60
-        assert parse_keep_alive(-1.0) == -1
+        assert parse_keep_alive(-1.0) == 1800
 
     def test_string_int_forms(self):
         from turbohaul.api.chat_completion import parse_keep_alive
         assert parse_keep_alive("0") == 0
-        assert parse_keep_alive("-1") == -1
+        assert parse_keep_alive("-1") == 1800
         assert parse_keep_alive("60") == 60
         assert parse_keep_alive(" 60 ") == 60  # strip
         assert parse_keep_alive("") is None
