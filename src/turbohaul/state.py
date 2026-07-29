@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA: list[str] = [
     """CREATE TABLE IF NOT EXISTS schema_version (
@@ -28,6 +28,7 @@ _SCHEMA: list[str] = [
         state TEXT NOT NULL,
         port INTEGER,
         pid INTEGER,
+        engine_starttime INTEGER,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         ended_at TEXT,
@@ -35,6 +36,11 @@ _SCHEMA: list[str] = [
         extension_count INTEGER NOT NULL DEFAULT 0,
         client_meta_json TEXT
     )""",
+    # v2 migration: add engine_starttime to pre-v2 slots tables. ALTER is
+    # idempotent via PRAGMA table_info guard (SQLite re-ALTER raises, so we
+    # check the column list first). This runs on every open_state_db call,
+    # which is fine: the guard short-circuits once the column exists.
+    "ALTER-v2-engine_starttime",  # sentinel; handled below, not executed as SQL
     "CREATE INDEX IF NOT EXISTS idx_slots_state ON slots(state)",
     "CREATE INDEX IF NOT EXISTS idx_slots_pid ON slots(pid)",
     "CREATE INDEX IF NOT EXISTS idx_slots_thread ON slots(thread_id)",
@@ -96,6 +102,17 @@ def open_state_db(
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")  # retry-wait on transient SQLITE_BUSY
     for stmt in _SCHEMA:
+        if stmt == "ALTER-v2-engine_starttime":
+            # Idempotent v2 migration: add engine_starttime column if absent.
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(slots)").fetchall()
+            }
+            if "engine_starttime" not in cols:
+                conn.execute(
+                    "ALTER TABLE slots ADD COLUMN engine_starttime INTEGER"
+                )
+            continue
         conn.execute(stmt)
     cur = conn.execute(
         "SELECT version FROM schema_version WHERE version = ?", (SCHEMA_VERSION,)
@@ -257,6 +274,71 @@ def upsert_slot(conn: sqlite3.Connection, slot: dict[str, Any]) -> None:
             "client_meta_json": json.dumps(slot.get("client_meta", {})),
         },
     )
+
+
+def record_engine_identity(
+    conn: sqlite3.Connection,
+    slot_id: str,
+    pid: int,
+    port: int,
+    engine_starttime: int | None,
+) -> None:
+    """DURABLE ENGINE IDENTITY (v2 schema): persist the Turbohaul-spawned
+    engine's (pid, port, starttime) atomically with the slot row.
+
+    This is the ONLY ownership proof that survives a manager crash and
+    prevents PID reuse. ``pid`` alone is recyclable after a process exits;
+    ``engine_starttime`` (jiffies-since-boot from /proc/<pid>/stat field 22)
+    is unique per process instance on a given boot and never changes for the
+    life of a process, so (pid, starttime) uniquely identifies a process
+    instance. ``port`` is a redundant cross-check (the engine's --port).
+
+    The identity triple is written atomically by this single SQL UPDATE in its
+    own state-db transaction. It is called by the manager immediately after
+    spawn_sidecar returns and the live starttime is read from /proc. It is not
+    atomically coupled to process creation: a manager crash between spawn and
+    this update leaves an unrecorded engine report-only at recovery time.
+
+    ``engine_starttime`` may be None on non-Linux / when /proc is unavailable
+    (dev/test); in that case the column is NULL and the identity proof
+    degrades to report-only (a NULL starttime can never match a live one,
+    so the candidate is never reaped — the conservative contract holds).
+    """
+    conn.execute(
+        "UPDATE slots SET engine_starttime=?, port=?, pid=?, updated_at=? "
+        "WHERE slot_id=?",
+        (engine_starttime, port, pid, utcnow_iso(), slot_id),
+    )
+
+
+def known_engine_identities(conn: sqlite3.Connection) -> set[tuple[int, int, int]]:
+    """DURABLE ENGINE IDENTITY (v2 schema): the set of (pid, port, starttime)
+    triples recorded for slots that should still be running.
+
+    This is the durable ownership proof consumed by boot_orphan_reaper: a
+    live /proc llama-server candidate is Turbohaul-owned ONLY if its live
+    (pid, port, starttime) matches one of these recorded triples. A NULL
+    engine_starttime is excluded (no proof) — the candidate is report-only.
+
+    Mirrors known_active_pids' state filter (NOT POPPED/COLD, ended_at NULL)
+    so an ended slot's identity is not treated as live proof.
+    """
+    cur = conn.execute(
+        """SELECT pid, port, engine_starttime FROM slots
+           WHERE pid IS NOT NULL
+             AND port IS NOT NULL
+             AND engine_starttime IS NOT NULL
+             AND state NOT IN ('POPPED', 'COLD')
+             AND ended_at IS NULL"""
+    )
+    out: set[tuple[int, int, int]] = set()
+    for row in cur.fetchall():
+        pid = row["pid"]
+        port = row["port"]
+        st = row["engine_starttime"]
+        if pid is not None and port is not None and st is not None:
+            out.add((int(pid), int(port), int(st)))
+    return out
 
 
 def known_active_pids(conn: sqlite3.Connection) -> set[int]:
