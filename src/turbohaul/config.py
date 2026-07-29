@@ -88,6 +88,11 @@ class QueueConfig(BaseModel):
     #     overriding affinity. 0.0 means "starve immediately" => strict FIFO.
     max_consecutive_same_model: int = Field(default=3, ge=1, le=1000)
     max_other_model_wait_s: float = Field(default=20.0, ge=0.0, le=3600.0)
+    # Queue-level reservation for interactive main traffic. This is admission
+    # control, not a second sidecar: when main is queued, it is popped before
+    # auxiliary work after the current request completes.
+    main_lane_reserved: bool = True
+    main_lane_identity_keys: list[str] = Field(default_factory=lambda: ["is_main"])
     grace_seconds: int = Field(default=30, ge=0, le=3600)
     # Default bumped 120 → 300 so multi-turn agents (OpenAI-SDK class clients)
     # with client-side tool-exec / reflection gaps in the 2-5min range keep their

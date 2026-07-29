@@ -130,6 +130,23 @@ class TestTurbohaulQueue:
         # Staging full, s2 lands in accept buffer
         assert s2.state == SlotState.ACCEPT_BUFFER
 
+    async def test_main_lane_reservation_preempts_queued_auxiliary_work(self):
+        q = TurbohaulQueue(staging_max=10, main_lane_reserved=True)
+        aux = Slot.new("aux", client_meta={"is_sub_agent": True})
+        main = Slot.new("main", client_meta={"is_main": True})
+        await q.enqueue(aux)
+        await q.enqueue(main)
+        assert (await q.pop_next()).slot_id == main.slot_id
+        assert (await q.pop_next()).slot_id == aux.slot_id
+
+    async def test_disabled_main_reservation_preserves_fifo(self):
+        q = TurbohaulQueue(staging_max=10, main_lane_reserved=False)
+        aux = Slot.new("aux", client_meta={"is_sub_agent": True})
+        main = Slot.new("main", client_meta={"is_main": True})
+        await q.enqueue(aux)
+        await q.enqueue(main)
+        assert (await q.pop_next()).slot_id == aux.slot_id
+
     # === model residency / affinity ======================================
 
     async def test_head_model_tag_peek_is_non_destructive(self):

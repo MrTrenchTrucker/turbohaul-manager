@@ -38,6 +38,8 @@ class TurbohaulQueue:
         *,
         max_consecutive_same_model: int = 1,
         max_other_model_wait_s: float = 0.0,
+        main_lane_reserved: bool = True,
+        main_lane_identity_keys: tuple[str, ...] = ("is_main",),
     ) -> None:
         self.staging_max = staging_max
         self.acceptance_max = acceptance_max
@@ -51,6 +53,8 @@ class TurbohaulQueue:
         # immediately. Real values come from QueueConfig via the manager ctor.
         self.max_consecutive_same_model = max_consecutive_same_model
         self.max_other_model_wait_s = max_other_model_wait_s
+        self.main_lane_reserved = main_lane_reserved
+        self.main_lane_identity_keys = tuple(main_lane_identity_keys)
         # Run-length bookkeeping for the affinity path. Sole mutator is
         # pop_next (under self._lock); no second concurrent writer.
         self._consecutive_same_model: int = 0
@@ -148,6 +152,29 @@ class TurbohaulQueue:
             return slot
         return None
 
+    def _is_main_lane(self, slot: Slot) -> bool:
+        """True when explicit client metadata identifies interactive main work."""
+        meta = slot.client_meta or {}
+        return any(bool(meta.get(key)) for key in self.main_lane_identity_keys)
+
+    def _pop_first_main_locked(self) -> Slot | None:
+        """Remove the oldest main-lane request across staging then acceptance.
+
+        Main admission is a queue-level reservation only: it does not interrupt
+        an active sidecar and therefore preserves the single-sidecar invariant.
+        """
+        for buf in (self._staging, self._accept_buf):
+            for i, slot in enumerate(buf):
+                if not self._is_main_lane(slot):
+                    continue
+                del buf[i]
+                if slot.state is SlotState.ACCEPT_BUFFER:
+                    fsm_transition(slot, SlotState.STAGED)
+                if slot.disconnect_event is not None and slot.disconnect_event.is_set():
+                    slot.is_evicted = True
+                return slot
+        return None
+
     async def pop_next(self, *, warm_model_tag: str | None = None) -> Slot | None:
         """Pop the next STAGED slot for activation. Returns None if empty.
 
@@ -170,6 +197,18 @@ class TurbohaulQueue:
         wait=0.0 also collapse to strict FIFO even when a tag is supplied.
         """
         async with self._lock:
+            # Strict main reservation wins over FIFO and warm-model affinity.
+            # It is intentionally admission-only: a running auxiliary request
+            # completes normally, then the oldest queued main request is next.
+            if self.main_lane_reserved:
+                main = self._pop_first_main_locked()
+                if main is not None:
+                    if self._accept_buf and len(self._staging) < self.staging_max:
+                        tail = self._accept_buf.popleft()
+                        fsm_transition(tail, SlotState.STAGED)
+                        self._staging.append(tail)
+                    self._update_run_length_locked(main)
+                    return main
             if warm_model_tag is None or not self._staging:
                 # === Existing FIFO path — ZERO behavior change. ===
                 slot = self._pop_first_non_evicted_from(self._staging)
