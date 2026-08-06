@@ -9,6 +9,7 @@ ARG CUDA_ARCH="89;120"
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake build-essential ca-certificates pkg-config libcurl4-openssl-dev \
+      git ccache \
  && rm -rf /var/lib/apt/lists/*
 COPY engine/llama-cpp-turboquant /opt/turboquant
 WORKDIR /opt/turboquant
@@ -21,6 +22,7 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
       -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
       -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
       -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+      -DLLAMA_USE_PREBUILT_UI=OFF \
  && cmake --build build --config Release -j$(nproc) --target llama-server llama-bench llama-cli
 
 # ---- Stage 2: Runtime (vendored wheels + committed FE dist + compiled engine) ----

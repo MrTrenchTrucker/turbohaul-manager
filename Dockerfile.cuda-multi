@@ -58,6 +58,7 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
       -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
       -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
       -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+      -DLLAMA_USE_PREBUILT_UI=OFF \
  && cmake --build build --config Release -j$(nproc) \
       --target llama-server \
  && strip /opt/turboquant/build/bin/llama-server || true
