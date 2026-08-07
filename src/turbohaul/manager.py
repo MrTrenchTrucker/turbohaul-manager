@@ -45,13 +45,16 @@ from turbohaul.singleton import (
     boot_orphan_reaper,
     detect_foreign_gpu_apps,
     intra_lifetime_orphan_scan,
+    _read_proc_starttime,
 )
 from turbohaul.slot import Slot, SlotEvictedError, SlotState, derive_thread_id_prefix_hash
 from turbohaul import load_verify_log  # observability emitter + /status read (display-only)
 from turbohaul.state import (
     audit_db_session,
     known_active_pids,
+    known_engine_identities,
     mark_slot_ended,
+    record_engine_identity,
     open_state_db,
     reconcile_orphaned_slots,
     record_audit_event,
@@ -1643,24 +1646,99 @@ class TurbohaulManager:
 
     # === Boot lifecycle =====================================================
 
-    def boot_reconcile(self, pid_is_alive_fn: Callable[[int], bool] | None = None) -> dict:
-        """Run at startup. Returns summary dict for audit logging."""
+    def boot_reconcile(
+        self,
+        pid_is_alive_fn: Callable[[int], bool] | None = None,
+        reap_orphan_fn: "Callable[..., tuple[bool, str]] | None" = None,
+    ) -> dict:
+        """Run at startup. Returns summary dict for audit logging.
+
+        DURABLE ENGINE-IDENTITY ownership proof (replaces the heuristic
+        parent-chain proof): a candidate is reaped ONLY if its live
+        (pid, port, starttime) matches a recorded identity in state.sqlite
+        (persisted atomically at spawn via record_engine_identity). PPid=1 /
+        parent-chain heuristics are NOT ownership proof — a foreign/independent
+        llama-server that is itself orphaned (PPid=1) has no recorded identity
+        and is report-only, never reaped. The starttime cross-check prevents
+        PID reuse.
+
+        BOOT-TIME OWNERSHIP INVARIANT: the orphan reaper's known_pids
+        skip-list is EMPTY at boot. Rationale: flock guarantees singleton
+        ownership of the manager, so if THIS manager booted, any other
+        manager is dead and any of its engines still in /proc are STALE
+        orphans to reap — not active sidecars to preserve. Passing live_pids
+        (alive per state.sqlite) as known_pids was a correctness bug: a
+        recorded P12 no-listener stale engine is alive by definition, so it
+        landed in live_pids and was SKIPPED by the reaper, defeating boot
+        cleanup. live_pids is still consumed by reconcile_orphaned_slots
+        (slots whose pid is dead → COLD) — its correct, separate role.
+
+        UNAVOIDABLE CRASH WINDOW (atomicity limitation): record_engine_identity
+        writes the (pid, port, starttime) triple atomically in its own database
+        transaction. But there is a window between process spawn (the engine
+        is alive in /proc) and
+        the identity persisting to state.sqlite: if the manager crashes in
+        that window, the engine is alive, unrecorded, and therefore NOT
+        reaped by boot_reconcile (no recorded identity → report-only). This is
+        a CONSERVATIVE fail-safe: the engine is left for manual/operator
+        recovery rather than risked as a false-positive kill of a foreign
+        process. It is NOT a silent-data-loss bug — the engine keeps running
+        and is surfaced via the stale_listeners diagnostics count + the audit
+        log. Closing this window would require persisting the identity BEFORE
+        spawn (impossible — starttime is unknown until the process exists) or
+        a fork-inheritor pattern (out of scope for PR1).
+
+        Reconciliation passes:
+          1. orphan reaper (process-group safe + durable engine-identity pass,
+             known_pids=EMPTY at boot): reaps /proc llama-server candidates in
+             the managed port range ONLY when their live (pid, port, starttime)
+             matches a recorded identity (the P12 no-listener orphan route —
+             the manager crashed after recording the identity, the engine has
+             no listener, but the record + starttime match proves ownership).
+             A foreign llama-server in the range has no record → report-only.
+             A diagnostics-only listener scan reports ports still occupied but
+             does not reap.
+          2. foreign GPU detect — informational only.
+          3. state.sqlite reconcile: any slot whose pid is no longer alive → COLD.
+        """
         port_base = self.boot.runtime.default_port_base
 
-        # 1. orphan reaper (kills /proc/<pid> llama-server orphans w/ PPid=1)
-        reap = boot_orphan_reaper(port_base=port_base)
+        # state.sqlite reconcile: any slot whose pid is no longer alive → COLD.
+        # Read recorded engine identities (the durable ownership proof) in the
+        # SAME session so the reaper + the reconcile see one snapshot. The
+        # durable proof: a candidate is reaped ONLY if its live (pid, port,
+        # starttime) matches a recorded identity. PPid=1 / parent-chain
+        # heuristics are NOT ownership proof.
+        check_alive = pid_is_alive_fn or _pid_is_alive
+        with state_db_session(self.boot.storage.state_db_path) as conn:
+            stale_pids = known_active_pids(conn)
+            recorded_identities = known_engine_identities(conn)
+            live_pids = {pid for pid in stale_pids if check_alive(pid)}
+            reconciled = reconcile_orphaned_slots(conn, live_pids)
+
+        # 1. orphan reaper (process-group safe + durable engine-identity pass).
+        # BOOT-TIME: there is NO current-manager active sidecar to preserve —
+        # flock guarantees singleton ownership, so if THIS manager booted, any
+        # other manager is dead and its engines are stale orphans. Therefore the
+        # known_pids skip-list is EMPTY: the durable-identity match in the
+        # stale-engine scan is the SOLE reaping authority. Passing live_pids
+        # here was a correctness bug — a recorded P12 no-listener stale engine
+        # is alive by definition, so it landed in live_pids (passed as
+        # known_pids) and was SKIPPED by the reaper, defeating boot cleanup.
+        # live_pids is still consumed by reconcile_orphaned_slots above (slots
+        # whose pid is dead -> COLD) — that is its correct, separate role.
+        reap = boot_orphan_reaper(
+            port_base=port_base,
+            reap_fn=reap_orphan_fn,
+            manager_pids={os.getpid()},
+            known_pids=set(),  # boot: nothing to preserve (flock singleton)
+            known_engine_identities=recorded_identities,
+        )
 
         # 2. foreign GPU detect — informational only (we don't refuse to start here;
         # that's a CLI-flag decision)
         foreign = detect_foreign_gpu_apps()
 
-        # 3. state.sqlite reconcile: any slot whose pid is no longer alive → COLD
-        check_alive = pid_is_alive_fn or _pid_is_alive
-        # the design: read + slot-write stay on state_db_session; audit-write uses pool.
-        with state_db_session(self.boot.storage.state_db_path) as conn:
-            stale_pids = known_active_pids(conn)
-            live_pids = {pid for pid in stale_pids if check_alive(pid)}
-            reconciled = reconcile_orphaned_slots(conn, live_pids)
         with audit_db_session(self.boot.storage.state_db_path) as conn:
             record_audit_event(
                 conn,
@@ -1669,6 +1747,7 @@ class TurbohaulManager:
                     "orphans_reaped": reap["reaped"],
                     "foreign_gpu_apps_count": len(foreign),
                     "slots_reconciled_to_cold": reconciled,
+                    "stale_listeners_reaped": reap.get("stale_listeners", 0),
                 },
             )
 
@@ -1677,6 +1756,7 @@ class TurbohaulManager:
             "orphans_failed": reap["failed"],
             "foreign_gpu_apps": foreign,
             "slots_reconciled_to_cold": reconciled,
+            "stale_listeners": reap.get("stale_listeners", 0),
         }
 
     def verify_binary(self) -> bool:
@@ -3219,6 +3299,9 @@ class TurbohaulManager:
             r.booting_pid = handle.pid  # in the reaper union before handle is set
         slot.port = handle.port
         slot.pid = handle.pid
+        # DURABLE IDENTITY: record (pid, port, starttime) so boot_orphan_reaper
+        # can prove ownership after a crash and reject PID reuse. Best-effort.
+        self._record_engine_identity(slot)
         healthy = await self._wait_healthy(
             r.port, self.runtime.queue.loading_health_timeout_s,
             is_alive=handle.is_alive,
@@ -4166,6 +4249,10 @@ class TurbohaulManager:
                 self._clear_idle_holder()
                 slot.port = handle.port
                 slot.pid = handle.pid
+                # DURABLE IDENTITY: record (pid, port, starttime) so
+                # boot_orphan_reaper can prove ownership after a crash and
+                # reject PID reuse. Best-effort.
+                self._record_engine_identity(slot)
                 self._set_active_handle(handle)
                 self._bump_spawn_seq()  # live-monitor: mark new active handle + mirror to active resident (sole writer = worker_loop)
                 await self._audit_async(slot, "idle_hot_inherit")
@@ -5086,11 +5173,21 @@ class TurbohaulManager:
             # reap before the next slot needs the port + VRAM. ~50ms
             # /proc walk; cheap to run on every teardown.
             orphan_reaped = 0
+            # DURABLE PROOF: read recorded engine identities so the reaper
+            # only touches proven Turbohaul-owned engines. Conservative —
+            # a foreign llama-server is never reaped here either.
+            _teardown_ids: set = set()
+            try:
+                with state_db_session(self.boot.storage.state_db_path) as _c:
+                    _teardown_ids = known_engine_identities(_c)
+            except Exception:
+                pass
             try:
                 orphan_reap_result = boot_orphan_reaper(
                     port_base=self.boot.runtime.default_port_base,
                     known_pids=set(),  # single-slot mode; multi-slot
                                        # Wave-6 will pass live sidecar pids
+                    known_engine_identities=_teardown_ids,
                 )
                 orphan_reaped = orphan_reap_result.get("reaped", 0)
             except Exception:
@@ -5254,9 +5351,16 @@ class TurbohaulManager:
             expected_drop_mib=expected_drop_mib, timeout_s=30.0,
         )
         try:
+            _idle_ids: set = set()
+            try:
+                with state_db_session(self.boot.storage.state_db_path) as _c:
+                    _idle_ids = known_engine_identities(_c)
+            except Exception:
+                pass
             boot_orphan_reaper(
                 port_base=self.boot.runtime.default_port_base,
                 known_pids=set(),
+                known_engine_identities=_idle_ids,
             )
         except Exception:
             log.exception(
@@ -9504,6 +9608,33 @@ class TurbohaulManager:
                 "thread_id_prefix": (slot.thread_id or "")[:8],
             }
         )
+
+    def _record_engine_identity(self, slot: "Slot") -> None:
+        """DURABLE ENGINE IDENTITY: persist the spawned engine's (pid, port,
+        starttime) to state.sqlite atomically so boot_orphan_reaper can prove
+        ownership after a manager crash and reject PID-reused replacements.
+
+        Best-effort: never breaks spawn. Reads /proc/<pid>/stat starttime
+        (jiffies-since-boot, field 22) — unique per process instance per boot,
+        never changes for the life of a process. A NULL starttime (non-Linux /
+        /proc unavailable) leaves the column NULL → the identity proof
+        degrades to report-only (the candidate is never reaped), preserving
+        the conservative contract.
+        """
+        if slot.pid is None or slot.port is None:
+            return
+        try:
+            st = _read_proc_starttime(slot.pid)
+        except Exception:
+            log.debug("engine-identity starttime read failed (best-effort)", exc_info=True)
+            st = None
+        try:
+            with state_db_session(self.boot.storage.state_db_path) as conn:
+                record_engine_identity(
+                    conn, slot.slot_id, slot.pid, slot.port, st,
+                )
+        except Exception:
+            log.debug("engine-identity record failed (best-effort)", exc_info=True)
 
     def _audit_event_only(self, slot_id: str, event_type: str, payload: dict | None = None) -> None:
         """Audit: record event ONLY, no slot row mutation.
