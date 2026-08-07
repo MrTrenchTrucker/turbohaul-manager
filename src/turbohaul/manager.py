@@ -1039,6 +1039,8 @@ class TurbohaulManager:
             acceptance_max=runtime.queue.acceptance_buffer_max,
             max_consecutive_same_model=runtime.queue.max_consecutive_same_model,
             max_other_model_wait_s=runtime.queue.max_other_model_wait_s,
+            main_lane_reserved=runtime.queue.main_lane_reserved,
+            main_lane_identity_keys=tuple(runtime.queue.main_lane_identity_keys),
         )
         self.grace = GraceTimer(
             grace_seconds=runtime.queue.grace_seconds,
