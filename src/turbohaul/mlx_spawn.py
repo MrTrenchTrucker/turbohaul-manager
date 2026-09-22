@@ -99,6 +99,49 @@ def mlx_flags_to_argv(flags: dict[str, Any]) -> list[str]:
     return argv
 
 
+def derive_mlx_parallel(mlx_flags: dict[str, Any]) -> int:
+    """Concurrent-dispatch width for an MLX sidecar (the `parallel` a llama.cpp
+    handle gets from its ``--parallel`` argv).
+
+    Turbohaul's series-parallel fan-out cap is ``handle.parallel`` DIRECTLY
+    (manager: ``n_parallel = max(1, getattr(handle, "parallel", 1))``), so a
+    hardcoded 1 disables fan-out for MLX entirely and confines the backend to
+    single-series residency.
+
+    Modern ``mlx_lm.server`` is a ``ThreadingHTTPServer`` driving a real
+    ``BatchGenerator`` with ``completion_batch_size=--decode-concurrency`` and
+    ``prefill_batch_size=--prompt-concurrency``. Measured on Qwen3.5-9B-MLX-8bit
+    at ``--decode-concurrency 4``: 4 simultaneous requests completed in 2.0x a
+    single request's wall time (serial would be ~4x), so the concurrency is
+    genuine and worth exposing.
+
+    Width = max(decode_concurrency, prompt_concurrency), both default 1.
+
+    BATCHABILITY CAVEAT: mlx_lm only batches when ``draft_model is None`` (see
+    ``ModelProvider._load``: ``is_batchable = draft_model is None and ...``).
+    With speculative decoding configured, every request is served through
+    ``_serve_single`` regardless of the concurrency flags, so advertising a
+    width > 1 would let the manager dispatch riders the engine then serializes.
+    We therefore clamp to 1 whenever ``draft_model`` is set.
+
+    (The other batchability precondition -- all prompt caches implementing
+    ``merge`` -- is a per-model property we cannot see from here. If a model
+    turns out not to be mergeable, mlx_lm still serves every request correctly
+    via ``_serve_single``; the only cost is that fan-out does not speed it up.)
+    """
+    if mlx_flags.get("draft_model"):
+        return 1  # speculative decoding disables batching in mlx_lm
+    try:
+        decode = int(mlx_flags.get("decode_concurrency", 1) or 1)
+    except (TypeError, ValueError):
+        decode = 1
+    try:
+        prefill = int(mlx_flags.get("prompt_concurrency", 1) or 1)
+    except (TypeError, ValueError):
+        prefill = 1
+    return max(1, decode, prefill)
+
+
 def is_mlx_available() -> bool:
     """True only on Apple Silicon macOS with the mlx package importable."""
     if platform.system() != "Darwin":
@@ -238,6 +281,9 @@ def mlx_spawn(
         proc=proc,
         port=port,
         model_tag=model_tag,
-        parallel=1,  # mlx-lm is single-slot per process
+        # Series-parallel: mlx_lm.server batches concurrent requests via its
+        # BatchGenerator, so the dispatch width comes from the concurrency
+        # flags rather than being pinned at 1. See derive_mlx_parallel.
+        parallel=derive_mlx_parallel(mlx_flags),
         model_id=model_arg,  # mlx_lm server routes by request `model`; match --model
     )

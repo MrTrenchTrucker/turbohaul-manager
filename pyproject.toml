@@ -33,8 +33,15 @@ dev = [
 ]
 # MLX backend support (Apple Silicon only). mlx-lm provides the
 # `python -m mlx_lm server` runner used by the turbohaul MLX backend.
+#
+# The floor is a soft one: the backend itself works on older releases, but
+# series-parallel fan-out needs `mlx_lm.server`'s continuous-batching flags
+# (--decode-concurrency / --prompt-concurrency), which older versions lack.
+# derive_mlx_parallel() reads them from the manifest; on a release without
+# them the flags are simply never set, parallel stays 1, and MLX runs in
+# single-series mode exactly as before. Verified against 0.31.3.
 mlx = [
-    "mlx-lm>=0.21.0",
+    "mlx-lm>=0.28.0",
 ]
 
 [project.scripts]
