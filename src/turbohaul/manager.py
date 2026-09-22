@@ -2293,7 +2293,11 @@ class TurbohaulManager:
             "pid": int(src.get("pid") or (handle.pid if handle is not None else 0) or 0),
             "spawn_seq": getattr(self, "_spawn_seq", 0) or 0,
             "reserved_need_mib": 0,
-            "parallel": 1,
+            # Real dispatch width from the live handle (llama.cpp pins it from
+            # --parallel, MLX from its concurrency flags). Hardcoding 1 here
+            # under-reported series-parallel residents in the Residents panel.
+            "parallel": max(1, int(getattr(handle, "parallel", 1) or 1))
+            if handle is not None else 1,
             "main_gpu": 0,
             "split_mode": "single",
             "inflight": len(self._inflight),

@@ -794,8 +794,13 @@ class TestCancelDuringLoading:
 # shutdown-sweep + 2 folded follow-ups (waitpid reap, bg_tasks drain).
 # ============================================================================
 class _FakeResp:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code: int = 200):
         self._payload = payload
+        # Real httpx responses always carry status_code; the /slots poller
+        # branches on it to detect backends that lack the endpoint (mlx_lm
+        # returns 404). Without it the poller's except swallows an
+        # AttributeError and every tick reports "transitioning".
+        self.status_code = status_code
 
     def json(self):
         return self._payload
