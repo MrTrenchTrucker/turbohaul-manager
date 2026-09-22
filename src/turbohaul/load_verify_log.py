@@ -184,11 +184,21 @@ def _handle_pid(handle: Any) -> int | None:
     return None if isinstance(handle, int) else getattr(handle, "pid", None)
 
 
-async def verify_model_resident(handle: Any, *, timeout: float = 2.0) -> dict:
+async def verify_model_resident(
+    handle: Any, *, timeout: float = 2.0, mlx: bool = False
+) -> dict:
     """PURE read: is the engine process alive AND the model actually resident?
 
     Reads: os pid-alive (``handle.pid``), ``GET /health`` (health_200), and
-    ``GET /slots`` (model_resident = 200 and a slot with ``n_ctx`` > 0).
+    the engine's model list.
+
+    - llama.cpp (default): ``GET /slots`` (model_resident = 200 and a slot with
+      ``n_ctx`` > 0).
+    - MLX (``mlx=True``): ``mlx_lm server`` has **no** ``/slots`` endpoint, so we
+      probe ``GET /v1/models`` instead and treat the model as resident when the
+      sidecar is healthy AND it reports at least one model. (Full-path/id
+      matching is intentionally loose — the sidecar serves exactly one model.)
+
     Returns ``{process_alive, health_200, model_resident, n_ctx, port, pid,
     reason}``. Never raises — on any error the booleans are False and
     ``reason`` carries the cause.
@@ -212,17 +222,32 @@ async def verify_model_resident(handle: Any, *, timeout: float = 2.0) -> dict:
         async with httpx.AsyncClient(timeout=timeout) as client:
             h = await client.get(f"{base}/health")
             out["health_200"] = h.status_code == 200
-            s = await client.get(f"{base}/slots")
-            if s.status_code == 200:
-                slots = s.json()
-                if isinstance(slots, list) and slots:
-                    n_ctx = slots[0].get("n_ctx")
-                    out["n_ctx"] = n_ctx
-                    out["model_resident"] = bool(out["health_200"] and n_ctx and n_ctx > 0)
+            if mlx:
+                # mlx_lm server: no /slots. /v1/models lists the loaded model(s).
+                m = await client.get(f"{base}/v1/models")
+                if m.status_code == 200:
+                    try:
+                        models = m.json().get("data", [])
+                    except Exception:
+                        models = []
+                    if isinstance(models, list) and models:
+                        out["model_resident"] = bool(out["health_200"])
+                    else:
+                        out["reason"] = "empty /v1/models"
                 else:
-                    out["reason"] = "empty /slots"
+                    out["reason"] = f"/v1/models http {m.status_code}"
             else:
-                out["reason"] = f"/slots http {s.status_code}"
+                s = await client.get(f"{base}/slots")
+                if s.status_code == 200:
+                    slots = s.json()
+                    if isinstance(slots, list) and slots:
+                        n_ctx = slots[0].get("n_ctx")
+                        out["n_ctx"] = n_ctx
+                        out["model_resident"] = bool(out["health_200"] and n_ctx and n_ctx > 0)
+                    else:
+                        out["reason"] = "empty /slots"
+                else:
+                    out["reason"] = f"/slots http {s.status_code}"
     except Exception as e:  # noqa: BLE001 — pure read, never raise into caller
         out["reason"] = f"{type(e).__name__}: {e}"
     return out
