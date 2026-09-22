@@ -505,14 +505,14 @@ class LiveSlotsPoller:
         has_slots = getattr(handle, "_has_slots", None)
         if has_slots is False:
             return self._slots_unavailable_gen(
-                mgr, pid, spawn_seq, thread_or_slot, state_v
+                self._mgr, pid, spawn_seq, thread_or_slot, state_v
             )
         try:
             resp = await self._client.get(f"http://127.0.0.1:{port}/slots")
             if resp.status_code != 200:
                 handle._has_slots = False  # remember: this sidecar lacks /slots
                 return self._slots_unavailable_gen(
-                    mgr, pid, spawn_seq, thread_or_slot, state_v
+                    self._mgr, pid, spawn_seq, thread_or_slot, state_v
                 )
             handle._has_slots = True
             resp_t = time.monotonic()
