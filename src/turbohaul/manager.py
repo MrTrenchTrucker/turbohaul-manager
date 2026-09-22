@@ -995,6 +995,39 @@ def _first_diff_offset(a: str, b: str) -> int:
         return -2
 
 
+def should_inherit_idle_client_meta(
+    idle_client_meta: dict | None,
+    incoming_client_meta: dict | None,
+    is_mlx: bool,
+) -> bool:
+    """Decide whether an idle-hot warm-inherit may overwrite the incoming
+    request's ``client_meta`` with the idle holder's.
+
+    The inherit exists ONLY to restore llama.cpp KV-bin OWNERSHIP: the
+    session_id/role in ``client_meta`` select which on-disk ``/slots`` bin is
+    reloaded, so a same-session follow-up must carry the holder's identity to
+    find its own cache.
+
+    MLX has no KV bin at all (the MLX spawn path skips ``_restore_slot_kv``),
+    so there is nothing for the inherited identity to unlock — but the
+    inherited meta still carries the holder's STALE ``messages``, which the
+    completion proxy forwards to ``mlx_lm.server``. The model then answers the
+    PREVIOUS turn's prompt. Every request without a ``session_id`` (bare curl,
+    benchmark harness) would otherwise take the inherit branch and have its
+    prompt silently replaced. Hence: never inherit on MLX.
+    """
+    if not isinstance(idle_client_meta, dict) or not idle_client_meta:
+        return False
+    if is_mlx:
+        return False
+    inc = incoming_client_meta if isinstance(incoming_client_meta, dict) else {}
+    inc_sid = inc.get("session_id")
+    idle_sid = idle_client_meta.get("session_id")
+    # Same session (or the incoming carries no session of its own) => the
+    # holder's KV bin is legitimately this request's to reuse.
+    return (not inc_sid) or inc_sid == idle_sid
+
+
 class TurbohaulManager:
     """Top-level orchestrator.
 
@@ -4422,22 +4455,33 @@ class TurbohaulManager:
                 # KV-bin ownership (main returns after a sub-agent and can't find its own bin:
                 # "reloaded but no context") AND a per-role save-gate misreads the role.
                 # thread_id already stays the incoming's, so ONLY client_meta was inconsistent.
-                if _idle_client_meta:
-                    _inc_cm = slot.client_meta if isinstance(slot.client_meta, dict) else {}
-                    _inc_sid = _inc_cm.get("session_id")
-                    _idle_sid = (_idle_client_meta.get("session_id")
-                                 if isinstance(_idle_client_meta, dict) else None)
-                    if isinstance(_idle_client_meta, dict) and (not _inc_sid or _inc_sid == _idle_sid):
-                        slot.client_meta = _idle_client_meta
-                        log.debug(
-                            "Idle-hot warm-inherit: restored client_meta with session_id=%s",
-                            _idle_sid if _idle_sid is not None else "N/A",
-                        )
-                    else:
-                        log.info(
-                            "Idle-hot warm-inherit: KEPT incoming client_meta (incoming "
-                            "session_id=%s != idle-holder session_id=%s) — no cross-session "
-                            "identity clobber (root fix)", _inc_sid, _idle_sid)
+                # MLX GATE (2026-07-13): see should_inherit_idle_client_meta —
+                # MLX has no KV bin, so inheriting only replays the idle
+                # holder's stale `messages` and makes the model answer the
+                # PREVIOUS prompt. llama.cpp behavior is unchanged.
+                _inc_cm = slot.client_meta if isinstance(slot.client_meta, dict) else {}
+                _inc_sid = _inc_cm.get("session_id")
+                _idle_sid = (_idle_client_meta.get("session_id")
+                             if isinstance(_idle_client_meta, dict) else None)
+                if should_inherit_idle_client_meta(
+                    _idle_client_meta, slot.client_meta, manifest_is_mlx
+                ):
+                    slot.client_meta = _idle_client_meta
+                    log.debug(
+                        "Idle-hot warm-inherit: restored client_meta with session_id=%s",
+                        _idle_sid if _idle_sid is not None else "N/A",
+                    )
+                elif _idle_client_meta and manifest_is_mlx:
+                    log.info(
+                        "Idle-hot warm-inherit: MLX backend — KEPT incoming "
+                        "client_meta (no KV bin to inherit; inheriting would "
+                        "replay the idle holder's stale messages)"
+                    )
+                elif _idle_client_meta:
+                    log.info(
+                        "Idle-hot warm-inherit: KEPT incoming client_meta (incoming "
+                        "session_id=%s != idle-holder session_id=%s) — no cross-session "
+                        "identity clobber (root fix)", _inc_sid, _idle_sid)
                 # Skip spawn + health wait; jump straight to LOADING -> ACTIVE.
                 healthy = True
             else:
