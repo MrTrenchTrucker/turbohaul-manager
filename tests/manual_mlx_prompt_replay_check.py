@@ -1,17 +1,29 @@
-"""Live reproduction of the MLX warm-inherit prompt-clobber bug (Fix D).
+"""Live MLX check: prompt-replay correctness (Fix D) + decode tok/s.
 
-Sends two DIFFERENT prompts with NO session_id (the bare-curl shape that
-triggered the bug) through a running Turbohaul on 127.0.0.1:11401.
+Sends several DIFFERENT prompts with NO session_id -- the bare-curl shape that
+triggered the warm-inherit prompt-clobber bug -- against a running Turbohaul.
 
-BEFORE the fix: request 2 returns request 1's answer.
-AFTER the fix:  each request answers its own prompt.
+BEFORE Fix D: request 2+ returns request 1's answer.
+AFTER  Fix D: each request answers its own prompt.
+
+Speed: decode tok/s = usage.completion_tokens / wall_latency (ground truth).
+NEVER count SSE chunks as tokens -- reasoning + keepalive pseudo-chunks make
+that number meaningless. Streaming is the default because mlx_lm buffers
+non-streamed responses, so there is no mid-flight token signal for live stats.
+
+Usage:
+    python tests/manual_mlx_prompt_replay_check.py [model_tag] [--no-stream]
 """
 import json
+import sys
 import time
 import urllib.request
 
 URL = "http://127.0.0.1:11401/v1/chat/completions"
-MODEL = "qwen2.5-0.5b"
+
+_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+MODEL = _args[0] if _args else "qwen3.5-9b-mlx-8bit"
+STREAM = "--no-stream" not in sys.argv
 
 PROMPTS = [
     "What is 12 times 13? Answer briefly.",
@@ -20,44 +32,91 @@ PROMPTS = [
 ]
 
 
+def _extract(d):
+    """Reasoning models put the answer in `reasoning`, leaving `content` absent."""
+    return d.get("content") or d.get("reasoning_content") or d.get("reasoning") or ""
+
+
 def ask(prompt):
-    body = json.dumps({
+    payload = {
         "model": MODEL,
-        "max_tokens": 64,
+        "max_tokens": 128,
         "messages": [{"role": "user", "content": prompt}],
-    }).encode()
+        "stream": STREAM,
+    }
     req = urllib.request.Request(
-        URL, data=body, headers={"Content-Type": "application/json"}
+        URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
     )
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=600) as r:
-        d = json.loads(r.read())
+    ttft = None
+    parts = []
+    usage = {}
+    created = None
+
+    with urllib.request.urlopen(req, timeout=900) as r:
+        if not STREAM:
+            d = json.loads(r.read())
+            parts.append(_extract(d["choices"][0]["message"]))
+            usage = d.get("usage") or {}
+            created = d.get("created")
+        else:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                created = created or ev.get("created")
+                if ev.get("usage"):
+                    usage = ev["usage"]
+                for ch in ev.get("choices") or []:
+                    piece = _extract(ch.get("delta") or {})
+                    if piece:
+                        if ttft is None:
+                            ttft = time.time() - t0
+                        parts.append(piece)
+
     dt = time.time() - t0
-    msg = d["choices"][0]["message"]
-    ans = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-    usage = d.get("usage") or {}
+    ctok = usage.get("completion_tokens")
     return {
-        "answer": " ".join(ans.split())[:220],
-        "created": d.get("created"),
+        "answer": " ".join("".join(parts).split())[:220],
+        "created": created,
         "latency_s": round(dt, 3),
-        "completion_tokens": usage.get("completion_tokens"),
+        "ttft_s": round(ttft, 3) if ttft is not None else None,
+        "completion_tokens": ctok,
+        "tok_s": round(ctok / dt, 2) if (ctok and dt > 0) else None,
     }
 
 
+print(f"model={MODEL}  stream={STREAM}\n")
 results = []
 for i, p in enumerate(PROMPTS, 1):
     print(f"=== REQ {i}: {p}")
     r = ask(p)
     results.append(r)
     print(f"    created={r['created']}  latency={r['latency_s']}s  "
-          f"tokens={r['completion_tokens']}")
-    print(f"    ANSWER: {r['answer']}")
-    print()
+          f"ttft={r['ttft_s']}s  tokens={r['completion_tokens']}  "
+          f"tok/s={r['tok_s']}")
+    print(f"    ANSWER: {r['answer']}\n")
 
 answers = [r["answer"] for r in results]
-print("=" * 60)
-if len(set(answers)) == 1:
-    print("VERDICT: BUG PRESENT — all prompts returned the SAME answer.")
+print("=" * 64)
+distinct = len(set(answers))
+if distinct == 1:
+    print("CORRECTNESS: *** BUG PRESENT *** every prompt returned the SAME answer.")
 else:
-    print(f"VERDICT: OK — {len(set(answers))}/{len(answers)} distinct answers; "
-          "each prompt answered on its own.")
+    print(f"CORRECTNESS: OK -- {distinct}/{len(answers)} distinct answers.")
+
+if results[0]["tok_s"]:
+    print(f"SPEED: first request (includes model load) {results[0]['tok_s']} tok/s")
+warm = [r["tok_s"] for r in results[1:] if r["tok_s"]]
+if warm:
+    print(f"SPEED: warm decode avg {round(sum(warm) / len(warm), 2)} tok/s "
+          f"over {len(warm)} request(s)")
+    print("       [oMLX baseline ~49.85 tok/s on Qwen3.5-9B-MLX-8bit]")

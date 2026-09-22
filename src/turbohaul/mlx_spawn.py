@@ -195,14 +195,44 @@ def mlx_spawn(
     child_env = dict(os.environ)
     child_env.pop("PYTHONPATH", None)
 
+    # Sidecar stdio: DEVNULL by default (a PIPE nobody drains WILL deadlock the
+    # child once the pipe buffer fills). But DEVNULL also discards every mlx_lm
+    # traceback -- a model that fails to load, or a sidecar that wedges on its
+    # first completion, looks like a silent hang from Turbohaul's logs with no
+    # way to tell a manager-proxy problem from an engine problem.
+    # TURBOHAUL_MLX_LOG_DIR=<dir> redirects the child's stdout+stderr to a real
+    # file per sidecar, which is safe (a file never blocks the writer) and makes
+    # engine-side failures diagnosable. Unset = today's DEVNULL behavior.
+    stdio = subprocess.DEVNULL
+    log_dir = os.environ.get("TURBOHAUL_MLX_LOG_DIR") or ""
+    log_file = None
+    if log_dir:
+        try:
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            log_path = Path(log_dir) / f"mlx_sidecar_{model_tag}_{port}.log"
+            log_file = open(log_path, "ab", buffering=0)  # noqa: SIM115 (child-owned)
+            stdio = log_file
+            log.info("mlx_lm.server stdio -> %s", log_path)
+        except Exception as exc:  # never let logging setup block a spawn
+            log.warning("could not open MLX sidecar log in %s: %s", log_dir, exc)
+            stdio = subprocess.DEVNULL
+
     factory = popen_factory or subprocess.Popen
-    proc = factory(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,  # setsid - own process group -> killpg works
-        env=child_env,
-    )
+    try:
+        proc = factory(
+            cmd,
+            stdout=stdio,
+            stderr=subprocess.STDOUT if log_file is not None else stdio,
+            start_new_session=True,  # setsid - own process group -> killpg works
+            env=child_env,
+        )
+    finally:
+        # The child dup()s the fd; the parent's copy is not needed.
+        if log_file is not None:
+            try:
+                log_file.close()
+            except Exception:
+                pass
 
     return SidecarHandle(
         proc=proc,
