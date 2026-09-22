@@ -120,6 +120,13 @@ conda install -c conda-forge mlx-lm
 
 The macOS helper script is `turbohaul-launcher.sh`.
 
+**Benchmarking the MLX path.** To compare Turbohaul's MLX throughput and memory
+against another runner (e.g. native oMLX) on the same model, see
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md) and the `bench_runner.py` harness
+at the repo root. It measures cold load, prefill (TTFT), decode tok/s (ground
+truth via `usage.completion_tokens`), and RSS, and documents the
+warm-inherit/cache caveats you must work around when benchmarking MLX today.
+
 ### Web UI (no Docker needed)
 
 Turbohaul serves its own dashboard from the same port at **`/ui`** — there is
