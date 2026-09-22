@@ -78,7 +78,10 @@ def test_tick_surfaces_fresh_stream_stats_without_active_slot(mgr):
         "last_t": time.monotonic(),
     }
     poller = LiveSlotsPoller(mgr, interval_s=1.0)
-    asyncio.get_event_loop().run_until_complete(poller._tick())
+    # asyncio.run (NOT get_event_loop): another test module may have closed the
+    # thread's loop, which makes get_event_loop() raise "no current event loop"
+    # and turns these into order-dependent failures.
+    asyncio.run(poller._tick())
     g = mgr.live_generation
     assert g is not None
     assert g["state"] == "generating"
@@ -95,7 +98,10 @@ def test_tick_falls_through_when_stream_stats_stale(mgr):
         "last_t": time.monotonic() - 10.0,  # stale (>3s)
     }
     poller = LiveSlotsPoller(mgr, interval_s=1.0)
-    asyncio.get_event_loop().run_until_complete(poller._tick())
+    # asyncio.run (NOT get_event_loop): another test module may have closed the
+    # thread's loop, which makes get_event_loop() raise "no current event loop"
+    # and turns these into order-dependent failures.
+    asyncio.run(poller._tick())
     g = mgr.live_generation
     assert g is not None
     # No fresh stream -> honest idle/transitioning, NOT a fabricated generating tok/s.

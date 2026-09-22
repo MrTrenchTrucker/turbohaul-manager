@@ -2287,6 +2287,40 @@ def _first_diff_offset(a: str, b: str) -> int:
 from turbohaul.engine_budget import EngineBudgetInputs, effective_engine_cap
 
 
+def should_inherit_idle_client_meta(
+    idle_client_meta: dict | None,
+    incoming_client_meta: dict | None,
+    is_mlx: bool,
+) -> bool:
+    """Decide whether an idle-hot warm-inherit may overwrite the incoming
+    request's ``client_meta`` with the idle holder's.
+
+    The inherit exists ONLY to restore llama.cpp KV-bin OWNERSHIP: the
+    session_id/role in ``client_meta`` select which on-disk ``/slots`` bin is
+    reloaded, so a same-session follow-up must carry the holder's identity to
+    find its own cache.
+
+    MLX has no KV bin at all (the MLX spawn path skips ``_restore_slot_kv``),
+    so there is nothing for the inherited identity to unlock — but the
+    inherited meta still carries the holder's STALE ``messages``, which the
+    completion proxy forwards to ``mlx_lm.server``. The model then answers the
+    PREVIOUS turn's prompt. Every request without a ``session_id`` (bare curl,
+    benchmark harness) would otherwise take the inherit branch and have its
+    prompt silently replaced. Hence: never inherit on MLX.
+    """
+    if not isinstance(idle_client_meta, dict) or not idle_client_meta:
+        return False
+    if is_mlx:
+        return False
+    inc = incoming_client_meta if isinstance(incoming_client_meta, dict) else {}
+    inc_sid = inc.get("session_id")
+    idle_sid = idle_client_meta.get("session_id")
+    # Same session (or the incoming carries no session of its own) => the
+    # holder's KV bin is legitimately this request's to reuse.
+    return (not inc_sid) or inc_sid == idle_sid
+
+
+
 class TurbohaulManager:
     """Top-level orchestrator.
 
@@ -15707,7 +15741,19 @@ class TurbohaulManager:
                 # context_size/ip describe THIS request, not the caller's identity — ip in
                 # particular must not transfer, or a session-less caller would inherit the
                 # idle holder's origin as if it were its own.
-                if _idle_client_meta:
+                #
+                # MLX GATE (2026-07-13): see should_inherit_idle_client_meta —
+                # MLX has no KV bin, so inheriting only replays the idle
+                # holder's stale `messages` and makes the model answer the
+                # PREVIOUS prompt. llama.cpp behavior (the re-cue/same-session +
+                # role-clobber-guard logic below) is unchanged.
+                if _idle_client_meta and manifest_is_mlx:
+                    log.info(
+                        "Idle-hot warm-inherit: MLX backend — KEPT incoming "
+                        "client_meta (no KV bin to inherit; inheriting would "
+                        "replay the idle holder's stale messages)"
+                    )
+                elif _idle_client_meta:
                     _inc_cm = slot.client_meta if isinstance(slot.client_meta, dict) else {}
                     _inc_sid = _inc_cm.get("session_id")
                     _idle_sid = (_idle_client_meta.get("session_id")
