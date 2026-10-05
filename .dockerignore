@@ -34,4 +34,5 @@ var/
 # Project meta + tests (kept for image — but `tests/` is large; comment to include)
 tests/
 ARCHITECTURE.md
+TODO.md
 docs/

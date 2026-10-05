@@ -1,14 +1,55 @@
-# ENGINE PIN (durable) -- Turbohaul runs the TurboQuant llama.cpp engine baked at this SHA.
-# Cold-restore checkpoint-ladder rewind is proven. TURBOHAUL_CKPT_SIDECAR (default-on)
-# requires this engine (its per-entry draft-MTP validator fixes the earlier cold-restore reject).
+# ENGINE PIN (durable) -- Turbohaul runs the TurboQuant llama.cpp engine.
+#
+# HONEST-LABEL NOTE (label honesty only; no re-pin). The SHA below is the commit
+# this engine tree is BASED ON. The shipped directory is that base plus further
+# work, and it does NOT byte-match that commit, or any other commit, in the fork
+# or in the upstream project. It is not a git archive of this SHA alone.
+# Provenance detail in engine/llama-cpp-turboquant/VENDORED.md.
+#
+# turboquant_engine_sha is the BASE SHA. It is not, and cannot be, a "matches"
+# claim. Measured by comparing the shipped tree against the base commit and
+# against every commit of both the fork and the upstream project, blob by blob,
+# the changed paths fall into three groups:
+#   (a) 30 paths whose shipped content is byte-identical to the tip of the fork's
+#       integration line. That line does NOT descend from this SHA: the two
+#       diverged at an earlier common commit, so this content was not applied on
+#       top of the base.
+#   (b) 5 paths whose shipped content matches older upstream commits only.
+#   (c) 37 paths that match no commit anywhere, at file level, in either history
+#       -- on the order of 60 individual hunks of shipped source with no commit
+#       behind them. Notable members: src/models/dflash.cpp (absent from every
+#       fork ref), the capped/prefix sequence-save API and its max_cells
+#       plumbing across the memory/context/public-header chain, the
+#       SPEC_DOWNGRADED drafter downgrade, and the parent-aware draft memory
+#       measurement.
+# The other 2951 paths of the 3022 in the base commit are byte-identical to it and
+# are the "base" content in the ordinary sense.
+# No commit carries the group (c) work, so a re-sync must diff against a
+# preserved copy rather than against a SHA.
 turboquant_engine_sha = 86771a58d
+turboquant_engine_sha_role = base
+turboquant_engine_matches_sha = false
+turboquant_engine_tip_paths = 30
+turboquant_engine_upstream_only_paths = 5
+turboquant_engine_unrecorded_paths = 37
+turboquant_engine_base_content_paths = 2951
+# The next two values were measured against the base commit, not the shipped tree,
+# so they do not describe the shipped source.
 turboquant_engine_version = 9915
-turboquant_engine_branch = fix/engine-savestate
 libllama_server_impl_bytes = 6343816
 built = 2026-07-07
+# NOTE: the pin above is recorded in this file, not enforced at build time, and
+# build_id is not hardened for dirty trees (a from-source CUDA compile takes ~10min).
+# TURBOHAUL_CKPT_SIDECAR is opt-in (set it to 1) and requires this engine: its
+# per-entry draft-MTP validator fixes the earlier cold-restore reject. That claim
+# is unaffected by the honest-label note above.
 
 # ---- VENDORED IN-REPO ----
 # The TurboQuant engine SOURCE ships INSIDE this repo (one self-contained repo):
-#   engine/llama-cpp-turboquant/   -- git-archive snapshot of SHA 86771a58d (no history)
+#   engine/llama-cpp-turboquant/   -- a source snapshot taken from the fork tree at
+#   turboquant_engine_sha above, PLUS further fork-line and upstream work and an
+#   unattributed working-set layer (see the honest-label note and VENDORED.md).
+#   No git history.
+# Source-of-record: the TurboQuant engine source tree (see VENDORED.md).
 # Provenance + re-sync: engine/llama-cpp-turboquant/VENDORED.md
-# Build-from-source: Dockerfile.engine-src (compiles the vendored tree).
+# Build-from-source: Dockerfile.engine-src (compiles the vendored tree; no external sidecar image needed).

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turbohaul-manager"
-version = "0.0.1"
+version = "0.8.0"
 description = "Ollama-shape inference manager using TurboQuant llama.cpp - local inference one-stop-shop"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,6 +41,14 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Pin `import turbohaul` to THIS checkout's src/ (pytest>=7 built-in
+# pythonpath plugin inserts rootpath/src at the front of sys.path). Without
+# this, a foreign importable turbohaul elsewhere on the host shadows the
+# checkout under test.
+# The shared test fixture lives in tests/ and is imported BY NAME from more
+# than one suite, so tests/ must be importable. "src" stays FIRST so the pin
+# above still wins for `import turbohaul`.
+pythonpath = ["src", "tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"

@@ -263,10 +263,14 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
     if (g_abort_callback) {
         g_abort_callback(message);
     } else {
-        // default: print error and backtrace to stderr
+        // default: print error to stderr
         fprintf(stderr, "%s\n", message);
-        ggml_print_backtrace();
     }
+    // always print a backtrace, callback or not. Only a
+    // model-serving child ever hit the silent case: the router process
+    // never calls ggml_set_abort_callback (server.cpp:93, gated on
+    // !is_router_server), so it already took the else branch above.
+    ggml_print_backtrace();
 
     abort();
 }

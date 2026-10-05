@@ -16,6 +16,7 @@ export default defineConfig({
       '/health': 'http://localhost:11401',
       '/api': 'http://localhost:11401',
       '/v1': 'http://localhost:11401',
+      '/models': 'http://localhost:11401', // bare /models mirrors /v1/models
       '/ws': { target: 'ws://localhost:11401', ws: true },
     },
   },

@@ -19,10 +19,9 @@ Covers BOTH gates:
             cold-wire `.shadow` target — one POST, one guard)
 
 Scenarios per path: (a) tool tail beyond common -> SKIP; (b) TEXT/think tail -> restore
-STILL fires (shadow-preference intact); (c) tool turn BEFORE common (settled prefix) ->
-does NOT skip; (d) flag OFF -> pre-fix behavior (restore fires). Plus pure-helper +
-flag-reader unit tests. Fixtures mirror test_shadow_restore_prefer.py /
-test_shadow_cold_restore.py.
+STILL fires (shadow-preference intact); (c) tool turn BEFORE common (settled prefix) -> does NOT
+skip; (d) flag OFF -> pre-fix behavior (restore fires). Plus pure-helper + flag-reader
+unit tests. Fixtures mirror test_shadow_restore_prefer.py / test_shadow_cold_restore.py.
 """
 import json
 
@@ -72,7 +71,7 @@ def mgr(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return TurbohaulManager(boot, runtime)
 
 
@@ -168,7 +167,7 @@ def _the_restore(posts):
 
 
 # --- conversation shapes ------------------------------------------------------------
-_QWEN = "qwen3-27b"          # matches _is_qwen_family() -> the force gate is armed
+_QWEN = "qwen-27b"              # qwen family -> the force gate is armed
 _PORT = 59500
 _TID = "agent-ip-10.0.0.5"
 _SID_CLEAN = 0

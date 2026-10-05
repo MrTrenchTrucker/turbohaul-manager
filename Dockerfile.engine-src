@@ -30,6 +30,7 @@ FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       python3.11 python3.11-venv python3.11-dev ca-certificates curl procps libgomp1 \
+      ffmpeg \
  && rm -rf /var/lib/apt/lists/* \
  && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
  && ln -sf /usr/bin/python3.11 /usr/local/bin/python
@@ -43,6 +44,22 @@ COPY vendor/pywheels/ ./vendor/pywheels/
 RUN /opt/venv/bin/pip install --no-index --find-links=vendor/pywheels --upgrade setuptools wheel  && /opt/venv/bin/pip install --no-index --no-build-isolation --find-links=vendor/pywheels .
 # Engine binary compiled from vendored source (Stage 1).
 COPY --from=llama-build /opt/turboquant/build/bin /opt/turboquant/build/bin
+# Build-time guard: fail HERE if this layer left a mixed/partial engine (e.g. a
+# fresh libllama-server-impl.so over a stale libllama.so missing a symbol it needs) --
+# not at the first production KV save. binutils is TRANSIENT: installed, used, purged,
+# apt lists cleaned, all in this one RUN layer, so the runtime image never ships it.
+COPY scripts/check_engine_symbols.sh /tmp/check_engine_symbols.sh
+# KV-variant guard (mirrors Dockerfile.cuda-multi): this stage also compiles the
+# engine from vendored source, so the same auto-asymmetric K-upgrade check applies.
+# Rides the SAME transient binutils install as the symbols check above, because
+# it needs `strings` too: no extra layer, no extra image weight.
+COPY scripts/check_engine_kv_variant.sh /tmp/check_engine_kv_variant.sh
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends binutils \
+ && bash /tmp/check_engine_symbols.sh /opt/turboquant/build/bin \
+ && bash /tmp/check_engine_kv_variant.sh --require-present /opt/turboquant/build/bin/libllama.so.0.0.0 \
+ && apt-get purge -y --auto-remove binutils \
+ && rm -rf /var/lib/apt/lists/* /tmp/check_engine_symbols.sh /tmp/check_engine_kv_variant.sh
 RUN mkdir -p /opt/turbohaul/bin \
  && ln -sf /opt/turboquant/build/bin/llama-server /opt/turbohaul/bin/llama-server
 # Frontend: COMMITTED pre-built dist (no node/npm needed).

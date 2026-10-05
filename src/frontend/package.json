@@ -1,13 +1,16 @@
 {
   "name": "turbohaul-frontend",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.8.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test .test-run/*.test.mjs",
+    "pretest": "node scripts/build-tests.mjs",
+    "posttest": "rm -rf .test-run"
   },
   "dependencies": {
     "react": "^18.3.1",

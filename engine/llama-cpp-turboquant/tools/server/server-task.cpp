@@ -63,6 +63,8 @@ json task_params::to_json(bool only_metrics) const {
             {"mirostat",                  sampling.mirostat},
             {"mirostat_tau",              sampling.mirostat_tau},
             {"mirostat_eta",              sampling.mirostat_eta},
+            {"adaptive_target",           sampling.adaptive_target},
+            {"adaptive_decay",            sampling.adaptive_decay},
             {"max_tokens",                n_predict},
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
@@ -114,6 +116,8 @@ json task_params::to_json(bool only_metrics) const {
         {"mirostat",                  sampling.mirostat},
         {"mirostat_tau",              sampling.mirostat_tau},
         {"mirostat_eta",              sampling.mirostat_eta},
+        {"adaptive_target",           sampling.adaptive_target},
+        {"adaptive_decay",            sampling.adaptive_decay},
         {"stop",                      antiprompt},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
@@ -979,10 +983,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
         output.push_back(json {
+            {"id",        "fc_" + tool_call.id},
             {"type",      "function_call"},
             {"status",    "completed"},
             {"arguments", tool_call.arguments},
-            {"call_id",   "fc_" + tool_call.id},
+            {"call_id",   "call_" + tool_call.id},
             {"name",      tool_call.name},
         });
     }
@@ -1078,10 +1083,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
         const json output_item = {
+            {"id",        "fc_" + tool_call.id},
             {"type",      "function_call"},
             {"status",    "completed"},
             {"arguments", tool_call.arguments},
-            {"call_id",   "fc_" + tool_call.id},
+            {"call_id",   "call_" + tool_call.id},
             {"name",      tool_call.name}
         };
         server_sent_events.push_back(json {
@@ -1665,8 +1671,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 {"data", json {
                     {"type",  "response.output_item.added"},
                     {"item", json {
+                        {"id",        "fc_" + diff.tool_call_delta.id},
                         {"arguments", ""},
-                        {"call_id",   "fc_" + diff.tool_call_delta.id},
+                        {"call_id",   "call_" + diff.tool_call_delta.id},
                         {"name",      diff.tool_call_delta.name},
                         {"type",      "function_call"},
                         {"status",    "in_progress"},
@@ -2016,7 +2023,22 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         }
     }
 
-    // next, remove any cached prompts that are fully contained in the current prompt
+    // calculate checkpoints size to see if it will fit with the prompt
+    size_t checkpoints_size = 0;
+    for (const auto & ckpt : prompt.checkpoints) {
+        checkpoints_size += ckpt.size();
+    }
+
+    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+
+    // skip over-limit entries to avoid disturbing the cache
+    if (limit_size > 0 && state_size_new > limit_size) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        return nullptr;
+    }
+
+    // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->tokens.get_common_prefix(prompt.tokens);
 
@@ -2026,6 +2048,16 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
             it = states.erase(it);
         } else {
             ++it;
+        }
+    }
+
+    if (limit_size > 0) {
+        // make room before allocating the new vectors to avoid breaching the limit
+        while (!states.empty() && size() + state_size_new > limit_size) {
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
         }
     }
 
@@ -2137,12 +2169,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
-        while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
-                break;
-            }
-
+        while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
@@ -2156,11 +2183,7 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
-            if (states.empty()) {
-                break;
-            }
-
+        while (!states.empty() && n_tokens() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 

@@ -64,7 +64,7 @@ def mgr(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return TurbohaulManager(boot, runtime)
 
 
@@ -90,14 +90,14 @@ def _shadow_off_by_default(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _covered_scaffold_strip_off(monkeypatch):
-    """The covered-scaffold-strip feature ships default-ON, which swaps the save-probe prefill TRANSPORT to
-    /apply-template + /completion. This suite verifies the TRANSPORT-INDEPENDENT
-    save/meta/guard logic against the flag-OFF (byte-identical-to-today) messages transport;
-    the Fix B default-ON render+strip transport + bin-write is covered in
-    tests/test_covered_scaffold_strip.py. Pin OFF so the messages-based fake engine here
-    keeps serving the probe."""
-    monkeypatch.setenv("TURBOHAUL_COVERED_SCAFFOLD_STRIP", "0")
+def _covered_scaffold_strip_off(mgr):
+    """The covered-scaffold strip ships default-ON, which swaps the save-probe prefill
+    TRANSPORT to /apply-template + /completion. This suite verifies the
+    TRANSPORT-INDEPENDENT save/meta/guard logic against the flag-OFF
+    (byte-identical-to-today) messages transport; the default-ON render+strip transport +
+    bin-write is covered in tests/test_covered_scaffold_strip.py. Pin OFF so the
+    messages-based fake engine here keeps serving the probe."""
+    mgr.runtime.kv.covered_scaffold_strip = False
 
 
 # --- sidecar fake (GET /slots + records every POST; materialises the temp bin) ---
@@ -154,7 +154,7 @@ def make_httpx(monkeypatch):
     return _make
 
 
-_QWEN = "example-model-27b"
+_QWEN = "qwen3.6-27b"
 _PORT = 59500
 _THINK = "<think>chain of reasoning here</think>THE_FINAL_ANSWER"
 

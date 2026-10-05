@@ -5,7 +5,7 @@ in-memory ring buffer (hot, fast) and the persistent JSONL files (full
 history).
 
 Auth model: NO app-layer auth — matches project-wide network-perimeter
-posture. See ARCHITECTURE.md §11 addendum.
+posture. See ARCHITECTURE.md §8.
 """
 from __future__ import annotations
 

@@ -6,6 +6,10 @@ dist-ssr/
 .vite/
 *.tsbuildinfo
 
+# Test-run output: esbuild-bundled *.test.tsx, built by
+# scripts/build-tests.mjs, run by `npm test`, removed by posttest.
+.test-run/
+
 # Build sentinel + log (created by Docker build orchestration)
 build.log
 build.done

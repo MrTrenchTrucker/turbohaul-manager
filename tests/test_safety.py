@@ -8,6 +8,7 @@ from turbohaul.safety import (
     check_kv_cache_fit,
     check_load_avg,
     check_iowait,
+    check_tensor_split_devices,
     estimate_kv_cache_mib,
 )
 
@@ -89,7 +90,7 @@ class TestEstimateKvCacheMib:
         assert estimate_kv_cache_mib(4096, 0) == 0
         assert estimate_kv_cache_mib(0, 17000000000) == 0
 
-    def test_f16_27b_at_64k_in_expected_range(self):
+    def test_f16_qwen27b_at_64k_in_expected_range(self):
         # 17 GB gguf, 64K ctx, f16 → expect ~9000-10000 MiB (calibration)
         kv = estimate_kv_cache_mib(65536, 17 * 1024 * 1024 * 1024, "f16")
         # Allow wide band — formula is heuristic, exact varies per model
@@ -165,14 +166,14 @@ class TestCheckKvCacheFit:
         assert not r.ok
         assert "need" in r.detail and "22000 MiB free" in r.detail
 
-    def test_q4_lets_64k_27b_fit_on_blackwell(self):
+    def test_q4_lets_64k_qwen27b_fit_on_blackwell(self):
         # 24 GB Blackwell with ~22 GB free. q4_0 at 64K on a 27B model:
         # 17 GB body + ~2.4 GB KV + 1 GB overhead = ~20.4 GB → fits
         with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[22_000]):
             r = check_kv_cache_fit(65536, 17 * 1024 * 1024 * 1024, kv_cache_quant="q4_0")
         assert r.ok, f"q4_0 64K 27B model should fit on 22 GB free, got: {r.detail}"
 
-    def test_q8_64k_27b_refused_on_blackwell(self):
+    def test_q8_64k_qwen27b_refused_on_blackwell(self):
         # Same hardware + q8_0 instead of q4_0. q8_0 ≈ 4.9 GB KV → 17+4.9+1 = ~23 GB > 22 GB
         # safety_gate CORRECTLY refuses (correct behavior — q8_0 needs bigger GPU)
         with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[22_000]):
@@ -229,28 +230,103 @@ class TestCheckKvCacheFit:
         assert "VRAM" in r.detail
 
 
+class TestCheckTensorSplitDevices:
+    """Spawn-time device-count == element-count gate.
+
+    Device count is a runtime property (unlike the manifest-time CSV format
+    check in turbohaul.manifest), so this is exercised against a mocked
+    nvidia-smi probe rather than the manifest validator.
+    """
+
+    def test_no_tensor_split_is_a_noop(self):
+        with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[10_000, 10_000]):
+            result = check_tensor_split_devices(None)
+        assert result.ok is True
+        assert result.name == "tensor_split_devices"
+
+    def test_empty_string_is_a_noop(self):
+        with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[10_000, 10_000]):
+            result = check_tensor_split_devices("")
+        assert result.ok is True
+
+    def test_probe_unavailable_degrades_open(self):
+        # Same degrade-open doctrine as every other gate in this module.
+        with patch("turbohaul.safety._read_free_vram_all_mib", return_value=None):
+            result = check_tensor_split_devices("0.72,0.28")
+        assert result.ok is True
+        assert "no-probe" in result.detail
+
+    def test_count_matches_devices_passes(self):
+        with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[10_000, 10_000]):
+            result = check_tensor_split_devices("0.72,0.28")
+        assert result.ok is True
+
+    def test_count_below_devices_refuses(self):
+        # 1 element, 2 devices visible.
+        with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[10_000, 10_000]):
+            result = check_tensor_split_devices("1")
+        assert result.ok is False
+        assert "1 element" in result.detail
+        assert "2 device" in result.detail
+
+    def test_count_above_devices_refuses(self):
+        # 3 elements, 2 devices visible.
+        with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[10_000, 10_000]):
+            result = check_tensor_split_devices("1,1,1")
+        assert result.ok is False
+
+    def test_single_device_single_element_passes(self):
+        with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[24_000]):
+            result = check_tensor_split_devices("1")
+        assert result.ok is True
+
+
 class TestAllGatesAggregate:
-    def test_returns_5_gates(self):
+    def test_returns_7_gates(self):
+        # Seven gates; tensor_split_devices is the seventh. A caller that
+        # (like this test) never sets tensor_split gets a pure no-op
+        # seventh gate, always ok=True (same no-op-by-default shape as
+        # moe_ram_fit before it).
         with patch("turbohaul.safety._read_meminfo_kib", return_value={}):
             with patch(
                 "turbohaul.safety._read_free_vram_mib", return_value=None,
             ):
                 with patch(
-                    "turbohaul.safety._read_stat_iowait_jiffies",
-                    return_value=None,
+                    "turbohaul.safety._read_free_vram_all_mib", return_value=None,
                 ):
-                    with patch("os.getloadavg", return_value=(0.1, 0.1, 0.1)):
-                        with patch("os.cpu_count", return_value=4):
+                    with patch(
+                        "turbohaul.safety._read_stat_iowait_jiffies",
+                        return_value=None,
+                    ):
+                        # Patching os.getloadavg / os.cpu_count would be DEAD here
+                        # (check_load_avg is not called; check_cpu_util reads /proc/stat
+                        # directly, not os.getloadavg/os.cpu_count) and
+                        # would leave this test silently host-CPU-dependent, so
+                        # the gate's own probe is patched instead.
+                        # Mirrors the
+                        # _read_stat_iowait_jiffies->None fail-open patch
+                        # immediately above, for the new gate's own probe.
+                        with patch(
+                            "turbohaul.safety._read_stat_cpu_jiffies",
+                            return_value=None,
+                        ):
                             results = all_safety_gates(
                                 min_free_ram_mib=1024,
                                 min_free_vram_mib=512,
-                                max_load_per_core=0.9,
+                                max_cpu_busy_percent=99.0,
                                 max_iowait_percent=30.0,
                                 iowait_sample_window_s=0.01,
                                 ctx_size=65536,
                                 gguf_size_bytes=17 * 1024 * 1024 * 1024,
                                 kv_cache_quant="f16",
                             )
-        assert len(results) == 5
+        assert len(results) == 7
         names = {g.name for g in results}
-        assert names == {"ram", "vram", "kv_cache_fit", "cpu_load", "iowait"}
+        assert names == {
+            "ram", "vram", "kv_cache_fit", "moe_ram_fit", "cpu_util", "iowait",
+            "tensor_split_devices",
+        }
+        moe_ram = next(g for g in results if g.name == "moe_ram_fit")
+        assert moe_ram.ok is True  # no-op: no expert_offloaded_mib, no no_kv_offload
+        ts_gate = next(g for g in results if g.name == "tensor_split_devices")
+        assert ts_gate.ok is True  # no-op: tensor_split not set

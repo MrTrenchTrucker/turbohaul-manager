@@ -34,7 +34,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        llama_context * ctx_parent = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -63,7 +64,17 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    llama_context_params cparams_copy = *cparams;
+    if (ctx_parent != nullptr) {
+        // a drafter's own GGUF may omit tok_embd/output to save disk space, borrowing them
+        // from the target at graph-build time via cparams.ctx_other -- without a parent set
+        // here, that fallback has nothing to borrow from and the measurement fails even
+        // though the real construction (which always has a real target ctx available) would
+        // have succeeded.
+        cparams_copy.ctx_other = ctx_parent;
+    }
+
+    llama_context * ctx = llama_init_from_model(model, cparams_copy);
     if (ctx == nullptr) {
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
@@ -148,6 +159,87 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
+}
+
+// Like common_get_device_memory_data, but for a child model (e.g. a DFlash/DSpark draft)
+// that needs a parent model + context set as cparams.ctx_other to build its compute graph --
+// without this, measuring a drafter whose GGUF omits tok_embd/output throws before it can
+// report anything.
+common_device_memory_data_vec common_get_device_memory_data_with_parent(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const char * path_parent,
+        const llama_model_params * mparams_parent,
+        const llama_context_params * cparams_parent,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        uint32_t & hp_n_ctx_train,
+        uint32_t & hp_n_expert,
+        ggml_log_level log_level) {
+    // the parent here is the full target model (e.g. a multi-billion-parameter one, not a small
+    // drafter) -- filter its load output to log_level same as the child gets below, or every
+    // fit measurement dumps a full target-model load at normal verbosity into the log.
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } original_logger;
+        ggml_log_level min_level; // prints below this log level go to debug log
+    };
+    user_data_t ud;
+    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
+    ud.min_level = log_level;
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+    }, &ud);
+
+    llama_model_params mparams_parent_copy = *mparams_parent;
+    mparams_parent_copy.no_alloc  = true;
+    mparams_parent_copy.use_mmap  = false;
+    mparams_parent_copy.use_mlock = false;
+
+    llama_model * model_parent = llama_model_load_from_file(path_parent, mparams_parent_copy);
+    if (model_parent == nullptr) {
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw std::runtime_error("failed to load parent model");
+    }
+
+    llama_context * ctx_parent = llama_init_from_model(model_parent, *cparams_parent);
+    if (ctx_parent == nullptr) {
+        llama_model_free(model_parent);
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw std::runtime_error("failed to create parent llama_context");
+    }
+
+    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+
+    std::vector<llama_device_memory_data> impl_parented;
+    try {
+        impl_parented = common_get_device_memory_data_impl(
+                path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+                log_level, ctx_parent);
+    } catch (...) {
+        llama_free(ctx_parent);
+        llama_model_free(model_parent);
+        throw;
+    }
+
+    llama_free(ctx_parent);
+    llama_model_free(model_parent);
+
+    common_device_memory_data_vec ret_parented(impl_parented.size());
+    for (size_t i = 0; i < impl_parented.size(); i++) {
+        ret_parented[i].total   = impl_parented[i].total;
+        ret_parented[i].free    = impl_parented[i].free;
+        ret_parented[i].model   = impl_parented[i].mb.model;
+        ret_parented[i].context = impl_parented[i].mb.context;
+        ret_parented[i].compute = impl_parented[i].mb.compute;
+    }
+    return ret_parented;
 }
 
 common_device_memory_data_vec common_get_device_memory_data(

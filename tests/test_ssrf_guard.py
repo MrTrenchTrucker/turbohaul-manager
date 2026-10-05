@@ -15,7 +15,7 @@ from turbohaul.ssrf_guard import (
 
 class TestIsBlockedIp:
     def test_rfc1918_blocked(self):
-        for ip in ["10.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.50"]:
+        for ip in ["10.0.0.1", "10.0.0.7", "172.16.0.1", "192.168.1.128"]:
             assert is_blocked_ip(ip), ip
 
     def test_loopback_blocked(self):
@@ -126,7 +126,7 @@ class TestValidatePullUrl:
 
     def test_ip_literal_private_rejected(self):
         with pytest.raises(UrlSafetyError, match="denied range"):
-            validate_pull_url("https://10.1.2.3/x")
+            validate_pull_url("https://10.0.0.7/x")
 
     def test_ip_literal_imds_rejected(self):
         with pytest.raises(UrlSafetyError):

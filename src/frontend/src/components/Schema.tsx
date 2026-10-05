@@ -5,12 +5,12 @@ import type { ResponseFormat } from '../lib/responseFormatValidator';
 /**
  * Schema tab page — hosts `SchemaEditor` and surfaces the constructed
  * `response_format` envelope so users can copy it into other tools or
- * (in a future polish wave) fire a smoke chat-completion against the
+ * (in a future update) fire a smoke chat-completion against the
  * sidecar directly.
  *
- * This page is author-only (no live POST UI); the `chatComplete` helper
- * is intentionally deferred to a follow-on change so this component
- * doesn't grow legs into the chat-execution surface.
+ * This page is author-only (no live POST UI); the
+ * `chatComplete` helper is intentionally deferred to a follow-on change so
+ * this page doesn't grow legs into the chat-execution surface.
  */
 export default function Schema() {
   const [envelope, setEnvelope] = useState<ResponseFormat | null>({ type: 'text' });
@@ -76,7 +76,7 @@ export default function Schema() {
         </pre>
         <p className="mt-2 text-xs text-slate-500">
           Live POST + retry-on-noncompliance behavior is deferred to a follow-on
-          polish wave; this page is author-only today.
+          release; this page is author-only today.
         </p>
       </div>
     </div>

@@ -467,7 +467,12 @@ def port_listeners_in_range(port_base: int, port_range_size: int = 100) -> list[
             continue
         for fd in fds:
             try:
-                link = fd.readlink()
+                # Path.readlink() returns a Path, not a str — the socket:[N]
+                # target is not a real path, so compare it as text. Without
+                # the str() this raises AttributeError on the first socket fd
+                # and the caller's broad except swallows it, leaving the
+                # listener diagnostic permanently reporting zero.
+                link = str(fd.readlink())
             except (FileNotFoundError, PermissionError, OSError):
                 continue
             # link looks like socket:[<inode>]

@@ -121,7 +121,7 @@ SCENARIOS_BY_ID = {s.id: s for s in SCENARIOS}
 
 
 # ============================================================================
-# Fixtures (mirrors tests/test_ws2_classifier.py conventions)
+# Fixtures (mirrors tests/test_classifier.py conventions)
 # ============================================================================
 
 @pytest.fixture
@@ -143,7 +143,7 @@ def mgr(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return TurbohaulManager(boot, runtime)
 
 
@@ -273,12 +273,31 @@ async def test_restore_slot_kv_restores_on_valid_prefix(mgr, kv_dir, posts):
     """A valid-prefix clean anchor -> cold restore POST fires (reuse='restore').
 
     Default env: warm-force OFF (cold path unaffected), shadow-cold OFF (no shadow bin,
-    keep clean anchor), tooltail-skip OFF (text tail, no skip)."""
+    keep clean anchor), tooltail-skip OFF (text tail, no skip).
+
+    Call-count note (a bare `len(posts) == 1`
+    assertion would be wrong here): the cold path
+    also runs the cold-restore size guard, which legitimately
+    calls `/apply-template` to render what the incoming request tokenizes to
+    before deciding whether to restore -- a real, by-design second call, not
+    a regression. Asserting the CALLS specifically (an apply-template render
+    AND exactly one action=restore POST) rather than bumping the bare count
+    from 1 to 2, so an unrelated future call landing on this path still fails
+    loudly instead of coincidentally matching a count -- not weakening this
+    into a smoke alarm with the battery out."""
     sc = SCENARIOS_BY_ID["user_message_warm_unknown_cold"]  # clean [SYS,U1] ⊑ inc [SYS,U1,U2]
     _write_clean_bin(kv_dir, "m", 0, "t", 0, sc.clean_chain)
     await mgr._restore_slot_kv(0, "m", _make_slot(sc))
-    assert len(posts) == 1, f"expected one restore POST, got {posts}"
-    url, _ = posts[0]
+
+    assert len(posts) == 2, f"expected exactly [apply-template, restore], got {posts}"
+    apply_template_posts = [(u, b) for (u, b) in posts if "/apply-template" in u]
+    restore_posts = [(u, b) for (u, b) in posts if "action=restore" in u]
+    assert len(apply_template_posts) == 1, (
+        f"expected exactly one apply-template render (the cold-restore "
+        f"size guard tokenizing the incoming request), got {apply_template_posts}"
+    )
+    assert len(restore_posts) == 1, f"expected exactly one restore POST, got {restore_posts}"
+    url, _ = restore_posts[0]
     assert "action=restore" in url
 
 

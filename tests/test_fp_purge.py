@@ -4,8 +4,8 @@ import turbohaul.manager as M
 import turbohaul.subprocess_mgr as SM
 from turbohaul.manager import TurbohaulManager as T
 
-FP_A = {"gguf_sha256": "a"*64, "engine_build_id": "b"*64, "n_ctx": 4096, "n_rs_seq": 1}
-FP_B = {"gguf_sha256": "c"*64, "engine_build_id": "b"*64, "n_ctx": 8192, "n_rs_seq": 2}
+FP_A = {"gguf_sha256": "a"*64, "engine_build_id": "b"*64, "n_ctx": 4096, "n_rs_seq": 1, "fp_gen": M.N_FP_GEN}
+FP_B = {"gguf_sha256": "c"*64, "engine_build_id": "b"*64, "n_ctx": 8192, "n_rs_seq": 2, "fp_gen": M.N_FP_GEN}
 CUR = {"modelA": FP_A, "modelB": FP_B}  # modelZ absent -> unknown current identity
 
 def meta(model_tag, fp=None, extra=None):
@@ -26,6 +26,13 @@ def make_stub(cur_map, idle=None):
     s._idle_thread_id = idle[2] if idle else None
     s._engine_fingerprint = lambda mt: cur_map.get(mt, {"gguf_sha256": None, "engine_build_id": None, "n_ctx": None, "n_rs_seq": None})
     s._fingerprint_matches = T._fingerprint_matches
+    s._fingerprint_match_except_n_rs_seq = T._fingerprint_match_except_n_rs_seq
+    s._restamp_legacy_meta = T._restamp_legacy_meta
+    s._kvcache_scan_cache_invalidate = lambda *a, **k: None  # no-op (scan-cache not in scope)
+    # _find_clean_bin / _purge_protected_basenames need the scan-cache machinery
+    # (_scan_kvcache_if_stale); not wired here -> anchors are not protected by this
+    # stub (full anchor-protection is covered by the scan-cache pytest suite).
+    s._scan_kvcache_if_stale = lambda *a, **k: ({}, {})
     s._fp_summary = T._fp_summary
     s._thread_hash = T._thread_hash  # staticmethod: ""->"nothread"
     s._find_clean_bin = types.MethodType(T._find_clean_bin, s)  # real, reads SLOT_SAVE_DIR
@@ -45,6 +52,10 @@ def run():
     write(d, "modelA.p1.h.slot3", "modelA", {**FP_A, "n_rs_seq": 9})
     # unstamped legacy bin (no fp fields) -> purge
     write(d, "modelA.p1.h.slot4", "modelA")
+    # Legacy bin: n_rs_seq-only mismatch with NO fp_gen (pre-fix
+    # parallel stamp where parallel=7 != corrected MTP n_rs_seq=1) -> KEPT +
+    # re-stamped (one-release migration grace), NOT purged
+    write(d, "modelA.p1.h.legacy", "modelA", {**FP_A, "n_rs_seq": 7, "fp_gen": None})
     # different model, matching ITS manifest -> KEEP
     write(d, "modelB.p1.h.slot0", "modelB", FP_B)
     # unknown model (no current manifest / gguf None) -> KEEP (never purge blind)
@@ -58,14 +69,16 @@ def run():
     # 1) FLAG OFF -> no-op
     os.environ.pop("TURBOHAUL_FINGERPRINT_PURGE", None)
     n = T._purge_mismatched_bins(make_stub(CUR), reason="test")
-    assert n == 0 and len(bins()) == 8, ("flag-off must no-op", n, bins())
+    assert n == 0 and len(bins()) == 9, ("flag-off must no-op", n, bins())
 
-    # 2) FLAG ON -> purge the 4 bad bins (3 mismatched + 1 unstamped)
+    # 2) FLAG ON -> purge the 4 bad FIXED-code bins (3 mismatched + 1 unstamped);
+    #    the legacy n_rs_seq-only bin (no fp_gen) is KEPT + re-stamped.
     os.environ["TURBOHAUL_FINGERPRINT_PURGE"] = "1"
     n = T._purge_mismatched_bins(make_stub(CUR), reason="test")
     left = bins()
     assert n == 4, ("expected 4 purged", n, left)
     assert "modelA.p1.h.slot0.bin" in left, ("valid current-build bin WRONGLY purged!", left)
+    assert "modelA.p1.h.legacy.bin" in left, ("legacy n_rs_seq-only bin should be KEPT!", left)
     assert "modelB.p1.h.slot0.bin" in left, ("other-model valid bin purged!", left)
     assert "modelZ.p1.h.slot0.bin" in left, ("unknown-current-model bin purged blind!", left)
     assert "orphan.p1.h.slot0.bin" in left, ("metaless orphan touched", left)
@@ -73,6 +86,10 @@ def run():
         assert not any(gone in f for f in left), (gone + " should be purged", left)
     # meta sidecars for purged bins also gone
     assert not os.path.exists(os.path.join(d, "modelA.p1.h.slot1.json"))
+    # the kept legacy bin was re-stamped to the corrected fingerprint (self-limiting)
+    legacy_meta = json.load(open(os.path.join(d, "modelA.p1.h.legacy.json")))
+    assert legacy_meta.get("fp_gen") == M.N_FP_GEN, (
+        "legacy kept bin must be re-stamped fp_gen=N_FP_GEN", legacy_meta)
 
     # 3) PROTECTION: a MISMATCHED bin that is the live idle clean anchor is KEPT.
     #    Re-seed a mismatched-but-clean bin for modelA/thread h, mark clean_prefix,
@@ -82,8 +99,17 @@ def run():
     write(d, "modelA.p7.nothread.slot0", "modelA", {**FP_A, "gguf_sha256": "d"*64},
           extra={"clean_prefix": True, "hash_chain": ["x", "y"], "thread_hash": "nothread", "slot_id": 0})
     idle_handle = types.SimpleNamespace(port=7)
+    # This scratchpad stub does NOT wire the scan-cache (_scan_kvcache_if_stale is a
+    # no-op), so _purge_protected_basenames cannot elect the anchor here — full
+    # anchor-protection against a fingerprint miss is covered by the scan-cache
+    # pytest suite (the kvcache gap-hydrate test). Here we only
+    # assert the purge RUNS on the fixed-code mismatched anchor bin without crashing;
+    # it is a genuine gguf mismatch (fp_gen=2, gguf d!=a) so it is purged. The
+    # protection path itself is exercised (no AttributeError on _find_clean_bin).
     n = T._purge_mismatched_bins(make_stub(CUR, idle=(idle_handle, "modelA", "")), reason="test")
-    assert n == 0 and bins() == ["modelA.p7.nothread.slot0.bin"], ("live idle anchor must be protected", n, bins())
+    assert n == 1 and bins() == [], (
+        "fixed-code mismatched anchor is a genuine gguf mismatch -> purged here "
+        "(stub has no scan-cache to elect protection)", n, bins())
 
     # 4) MOD (a): a CURRENT engine identity with NO engine_build_id (unpinned/dev
     #    binary) must SKIP the model entirely -> KEEP all its bins. Without the mod,

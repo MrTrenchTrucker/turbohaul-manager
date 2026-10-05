@@ -13,9 +13,9 @@ Identity fields ride the request payload — **top-level keys win, with a nested
 | Field | Type | Meaning |
 |---|---|---|
 | `session_id` | string | The conversation/agent-session this request belongs to. Required for role-keyed KV. |
-| `is_main` | bool | This is the primary agent's turn. Its KV is **always saved** and restored when it returns. |
+| `is_main` | bool | This is the primary agent's turn. Its KV is never switched off by the `save_kv` toggle (it is always eligible to be saved) and is restored when it returns. |
 | `is_sub_agent` | bool | A spawned worker. Its KV is isolated and **thrown away** after the job (unless `save_kv`). |
-| `is_curator` | bool | A background reviewer. Gets its own isolated bin by default; its KV is never saved, and it can never overwrite main's saved copy. |
+| `is_curator` | bool | A background reviewer. Gets its own isolated bin by default; its KV is not saved unless `save_kv` is set (§3), and it can never overwrite main's saved copy. |
 | `is_compression` | bool | A context-compression pass. Marks the session's saved main KV stale so the next main turn re-anchors at the new compressed baseline. |
 | `save_kv` | bool | Per-role persistence override (see §3). |
 | `role` | string | Back-compat literal (`"sub-agent"`, `"curator"`, …). Prefer the boolean flags. |
@@ -25,7 +25,7 @@ Example (OpenAI surface):
 
 ```json
 {
-  "model": "example-27b-mtp",
+  "model": "my-model-27b",
   "messages": [...],
   "thread_id": "my-agent-main",
   "client_meta": {
@@ -51,13 +51,13 @@ Turbohaul reads identity from **two places in the JSON body**, in this order:
 | persistence toggle | `$.save_kv` | `$.client_meta.save_kv` |
 | conversation identity | `$.thread_id` | *(top-level only)* |
 
-Nothing else is scanned — headers, query strings, and message content are **never** used for identity. The same two-location rule applies on both `POST /v1/chat/completions` and `POST /api/chat`.
+Nothing else is scanned for tags — headers and query strings are **never** used for identity, and message content is used only for the fingerprint fallback in §4 (never to infer a role). The same two-location rule applies on both `POST /v1/chat/completions` and `POST /api/chat`.
 
 **Copy-paste examples.** Raw HTTP (both locations shown — pick either):
 
 ```bash
 curl http://localhost:11401/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "example-27b-mtp",
+  "model": "my-model-27b",
   "thread_id": "assistant-alice",
   "client_meta": { "session_id": "sess-001", "is_main": true },
   "messages": [{"role": "user", "content": "hello"}]
@@ -68,7 +68,7 @@ OpenAI SDKs reject unknown top-level fields client-side, so pass them through `e
 
 ```python
 client.chat.completions.create(
-    model="example-27b-mtp",
+    model="my-model-27b",
     messages=[...],
     extra_body={
         "thread_id": "assistant-alice",
@@ -87,16 +87,16 @@ Ollama-style (`/api/chat`) accepts the same fields at the same two locations alo
 
 | Role | KV while running | KV after the job | Why |
 |---|---|---|---|
-| **main** | native VRAM reuse between tool calls | **saved** at the model-swap seam (system RAM), persisted to SSD after full unload, **restored on return** — only the new suffix is prefilled | the main agent's context is the product; it must never silently recompute |
+| **main** | native VRAM reuse between tool calls | **saved** at the model-swap seam (system RAM), persisting to SSD after a full unload is work in progress and currently not working, **restored on return** — only the new suffix is prefilled (contexts under 40,000 characters, about 13k tokens, are not clean-saved: re-prefilling them is cheaper; see [ARCHITECTURE.md §4.5](../ARCHITECTURE.md)) | the main agent's context is the product; it should not silently recompute |
 | **sub-agent** | native VRAM reuse on its own isolated bin | **thrown away** (unless `save_kv: true`) | disposable by contract; can never muddy main, the curator, or sibling sub-agents |
-| **curator** | its own isolated per-conversation bin (default); an opt-in route (`TURBOHAUL_CURATOR_REUSE_MAIN`, off by default) lets a labeled curator restore main's saved state read-only instead | **thrown away**; structurally prevented from overwriting main's saved copy either way | reviews must not corrupt the thing they review |
+| **curator** | its own isolated per-conversation bin (default); an opt-in route (`TURBOHAUL_CURATOR_REUSE_MAIN`, off by default) lets a labeled curator restore main's saved state read-only instead | **thrown away** (unless `save_kv: true`); structurally prevented from overwriting main's saved copy either way | reviews must not corrupt the thing they review |
 | **compression** | ordinary serve | not saved; marks main's saved bin stale | after compression the old prefix is wrong by design |
 
-**Give every spawned sub-agent its own `session_id`.** The recommended pattern (used by the reference agent integration) is `{parent_session_id}-sub-<nonce>` per spawn — distinct sessions mean distinct bins, which is what makes context bleed between concurrent agents structurally impossible.
+**Give every spawned sub-agent its own `session_id`.** The recommended pattern is `{parent_session_id}-sub-<nonce>` per spawn — distinct sessions mean distinct bins, which is what keeps concurrent agents' contexts apart.
 
 ## 3. The `save_kv` override
 
-`client_meta["save_kv"]` (bool) is the per-request control over disposable-role persistence — deliberately a request field, never an environment variable, so it is runtime-switchable per role from your client's settings. Absent → sub-agent/curator/compression KV is not saved (main always saves). Plenty of VRAM/RAM and long-lived sub-agents? Send `save_kv: true` on that role and its KV starts being kept — no restart, no rebuild. (One configuration-level exception: with the opt-in `TURBOHAUL_CURATOR_REUSE_MAIN` route enabled, curator saves are forced off regardless of the toggle.)
+`client_meta["save_kv"]` (bool) is the per-request control over disposable-role persistence — deliberately a request field, never an environment variable, so it is runtime-switchable per role from your client's settings. Absent → sub-agent/curator/compression KV is not saved (the toggle never switches main off). Plenty of VRAM/RAM and long-lived sub-agents? Send `save_kv: true` on that role and its KV starts being kept — no restart, no rebuild. (One configuration-level exception: with the opt-in `TURBOHAUL_CURATOR_REUSE_MAIN` route enabled, a curator's slot save is skipped regardless of the toggle.)
 
 ## 4. No tags? The guess ladder
 
@@ -116,9 +116,9 @@ What each level gets:
 
 So a completely naive client is fast between follow-ups on the live model; adding **one field** (`thread_id`) buys cross-swap KV persistence; adding tags buys the full multi-agent contract. By design, unlabeled traffic keys into a different bin namespace than tagged sessions, so well-formed untagged traffic cannot collide with, restore, or reset a tagged session's bins.
 
-**How your IP is used.** Turbohaul records the source IP of every request — that is how it knows *who sent what* even when the request carries nothing else. For tag-less clients the IP anchors the derived identity (rung 2), so two different machines talking to the same server never blur into one conversation; and the IP is displayed for the operator (the identity strip on the Dashboard, the `R2B_REQ_IDENTITY` log, `/status`). It is **not** authentication — Turbohaul trusts its network perimeter (see `ARCHITECTURE.md` §8) — and it never appears on the redacted WebSocket event feed.
+**How your IP is used.** Turbohaul records the source IP of every request — that is how it knows *who sent what* even when the request carries nothing else. For tag-less clients the IP anchors the derived identity (rung 2), so two different machines talking to the same server never blur into one conversation; and the IP is displayed for the operator (the identity strip on the Dashboard, the `R2B_REQ_IDENTITY` log, `/status`). It is **not** authentication — Turbohaul trusts its network perimeter (see `ARCHITECTURE.md` §8) — and it is stripped from the state events the WebSocket feed streams (the one-time snapshot sent when a client connects is the `/status` payload, which does carry it).
 
-This is not theoretical: non-agent clients (plain headless CLI tools driving the OpenAI surface) have been validated against Turbohaul — they ride the identity ladder and reuse warm state across turns without any integration work.
+Clients that are not agents (for example plain command-line tools driving the OpenAI-compatible surface) simply ride this ladder, with no integration work.
 
 ## 5. Verifying your tags land
 
@@ -143,3 +143,5 @@ Wrong tags → you prefill fresh in your *own* bin (isolation working as intende
 - **Send the flags, not just `role` strings.** The boolean flags are the contract; the literal `role` field exists for back-compat.
 - **One session ID per sub-agent.** Reusing the parent's `session_id` for a spawned sub-agent would make it a sibling of main in the same session — mint a distinct child session instead (§2).
 - **Compression must be labeled.** An unlabeled compression pass looks like an ordinary turn; label it `is_compression` so the stale-marking contract fires and the next main turn re-anchors cleanly.
+
+**See also:** [design/FAST_LANE_ARCHITECTURE.md](design/FAST_LANE_ARCHITECTURE.md) — the tag ranks and effective priority (its section 1.3); [FAST_LANE.md](FAST_LANE.md) — setting up Fast Lane rules and their tag ranks.

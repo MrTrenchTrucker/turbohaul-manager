@@ -658,7 +658,29 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        // A destructor must never abort the process -- true at
+        // EVERY point in the lifecycle, not only at shutdown (this destructor
+        // also runs on every ordinary buffer release while the process keeps
+        // serving, not just at exit). cudaFree is still called, unconditionally,
+        // every time -- this is about not letting its failure be FATAL, not
+        // about not freeing. CUDA_CHECK's shared path ([[noreturn]]
+        // ggml_cuda_error -> GGML_ABORT) is deliberately NOT used here; every
+        // other CUDA_CHECK call site in this file is unchanged and still aborts.
+        // WARN, not ERROR, and not silent: a real CUDA API call did fail and
+        // that stays visible and greppable, but this one destructor's failure
+        // is not, on its own, a reason to abort the process
+        // (this warning usually fires on benign buffer releases during shutdown,
+        // not on faults).
+        // The message names "destructor" explicitly so a reader does not have
+        // to already know this symbol is one to judge its blast radius.
+        cudaError_t err = cudaFree(dev_ptr);
+        if (err != cudaSuccess) {
+            int id = -1; // in case cudaGetDevice fails
+            (void) cudaGetDevice(&id);
+            GGML_LOG_WARN("%s error freeing buffer in ~ggml_backend_cuda_buffer_context "
+                "(destructor, not fatal): %s\n", GGML_CUDA_NAME, cudaGetErrorString(err));
+            GGML_LOG_WARN("  current device: %d, at %s:%d\n", id, __FILE__, __LINE__);
+        }
     }
 };
 

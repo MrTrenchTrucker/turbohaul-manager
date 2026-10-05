@@ -164,6 +164,10 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        // TURBOQUANT (savestate): optional save prefix limit (-1 = absent, save full slot as
+        // before). When > 0, the save writes at most this many tokens AND the KV cells at
+        // positions [0, limit) — a CONSISTENT truncated bin.
+        int64_t save_token_limit = -1;
     };
     slot_action slot_action;
 

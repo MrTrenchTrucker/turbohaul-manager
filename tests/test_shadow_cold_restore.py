@@ -66,7 +66,7 @@ def mgr(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return TurbohaulManager(boot, runtime)
 
 
@@ -133,7 +133,7 @@ def capture_restore(monkeypatch):
     return SimpleNamespace(posts=posts, install=_install)
 
 
-_MODEL = "example-model-27b"
+_QWEN = "qwen3.6-27b"
 _PORT = 59500
 _TID = "agent-ip-10.0.0.5"
 _SID_CLEAN = 0
@@ -177,13 +177,13 @@ def _write_clean(kv_dir, sid, chain, tid=_TID, port=_PORT, prompt_len=40000,
     # length-guard); clean_prefix=False -> a WITH-<think> polluted anchor (MOD-B drops
     # the length-guard -> any valid-prefix shadow wins regardless of length).
     th = TurbohaulManager._thread_hash(tid)
-    bin_fn = kv_save_fn(_MODEL, sid, th, port)
-    meta_fn = kv_meta_fn(_MODEL, sid, th, port)
+    bin_fn = kv_save_fn(_QWEN, sid, th, port)
+    meta_fn = kv_meta_fn(_QWEN, sid, th, port)
     (kv_dir / bin_fn).write_bytes(b"CLEAN_ANCHOR_BYTES")
     (kv_dir / meta_fn).write_text(json.dumps({
         "thread_id": tid, "thread_hash": th, "prompt_tokens": 500,
         "prompt_len": prompt_len, "n_context_turns": len(chain), "hash_chain": chain,
-        "prompt_hash": "", "model_tag": _MODEL, "slot_id": sid, "port": port,
+        "prompt_hash": "", "model_tag": _QWEN, "slot_id": sid, "port": port,
         "clean_prefix": clean_prefix,
     }))
     return bin_fn
@@ -191,13 +191,13 @@ def _write_clean(kv_dir, sid, chain, tid=_TID, port=_PORT, prompt_len=40000,
 
 def _write_shadow(kv_dir, sid, chain, tid=_TID, port=_PORT):
     th = TurbohaulManager._thread_hash(tid)
-    bin_fn = _kv_shadow_save_fn(_MODEL, sid, th, port)
-    meta_fn = _kv_shadow_meta_fn(_MODEL, sid, th, port)
+    bin_fn = _kv_shadow_save_fn(_QWEN, sid, th, port)
+    meta_fn = _kv_shadow_meta_fn(_QWEN, sid, th, port)
     (kv_dir / bin_fn).write_bytes(b"SHADOW_THINKFREE_BYTES")
     (kv_dir / meta_fn).write_text(json.dumps({
         "thread_id": tid, "thread_hash": th, "prompt_tokens": 600,
         "prompt_len": 45000, "n_context_turns": len(chain), "hash_chain": chain,
-        "prompt_hash": "", "model_tag": _MODEL, "slot_id": sid, "port": port,
+        "prompt_hash": "", "model_tag": _QWEN, "slot_id": sid, "port": port,
         "clean_prefix": False, "shadow": True,
     }))
     return bin_fn
@@ -215,7 +215,7 @@ def _the_restore(posts):
 @pytest.mark.asyncio
 async def test_preflight_cold_restores_clean(mgr, kv_dir, capture_restore):
     clean_bin = _write_clean(kv_dir, _SID_CLEAN, CLEAN_CHAIN)
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
     url, body = _the_restore(capture_restore.posts)
     assert body["filename"] == clean_bin
     assert f"/slots/{_SID_CLEAN}?action=restore" in url
@@ -231,7 +231,7 @@ async def test_gate_off_restores_clean_and_shadow_isdigit_skipped(mgr, kv_dir, c
     clean_bin = _write_clean(kv_dir, _SID_CLEAN, CLEAN_CHAIN)
     _write_shadow(kv_dir, _SID_SHADOW, SHADOW_CHAIN)           # present but ignored
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
 
     url, body = _the_restore(capture_restore.posts)
     assert body["filename"] == clean_bin                       # clean, NOT the shadow
@@ -248,7 +248,7 @@ async def test_gate_on_prefers_valid_shadow(mgr, kv_dir, capture_restore, cold_o
     _write_clean(kv_dir, _SID_CLEAN, CLEAN_CHAIN)
     shadow_bin = _write_shadow(kv_dir, _SID_SHADOW, SHADOW_CHAIN)
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
 
     url, body = _the_restore(capture_restore.posts)
     assert body["filename"] == shadow_bin                      # the `.shadow` bin won
@@ -269,7 +269,7 @@ async def test_gate_on_stale_shadow_falls_back(mgr, kv_dir, capture_restore, col
     clean_bin = _write_clean(kv_dir, _SID_CLEAN, CLEAN_CHAIN)
     _write_shadow(kv_dir, _SID_SHADOW, STALE_SHADOW_CHAIN)     # NOT a prefix of INC
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
 
     url, body = _the_restore(capture_restore.posts)
     assert body["filename"] == clean_bin
@@ -291,7 +291,7 @@ async def test_gate_on_shorter_valid_shadow_now_preferred(mgr, kv_dir, capture_r
     _write_clean(kv_dir, _SID_CLEAN, LONG_CLEAN_CHAIN, clean_prefix=False)  # len 6, POLLUTED
     shadow_bin = _write_shadow(kv_dir, _SID_SHADOW, SHORT_SHADOW_CHAIN)  # len 3, valid, SHORTER
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
 
     url, body = _the_restore(capture_restore.posts)
     assert body["filename"] == shadow_bin                      # shorter valid shadow wins (polluted anchor)
@@ -308,7 +308,7 @@ async def test_modB_clean_prefix_longer_anchor_kept_over_shorter_shadow(mgr, kv_
     clean_bin = _write_clean(kv_dir, _SID_CLEAN, LONG_CLEAN_CHAIN, clean_prefix=True)  # len 6, think-free
     _write_shadow(kv_dir, _SID_SHADOW, SHORT_SHADOW_CHAIN)                             # len 3, valid, SHORTER
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
 
     url, body = _the_restore(capture_restore.posts)
     assert body["filename"] == clean_bin                       # longer think-free clean kept
@@ -322,7 +322,7 @@ async def test_modB_clean_prefix_longer_anchor_kept_over_shorter_shadow(mgr, kv_
 async def test_gate_on_no_shadow_uses_clean(mgr, kv_dir, capture_restore, cold_on):
     clean_bin = _write_clean(kv_dir, _SID_CLEAN, CLEAN_CHAIN)
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
 
     url, body = _the_restore(capture_restore.posts)
     assert body["filename"] == clean_bin
@@ -340,7 +340,7 @@ async def test_cold_independent_of_warm_prefer_flag(mgr, kv_dir, capture_restore
     _write_clean(kv_dir, _SID_CLEAN, CLEAN_CHAIN)
     shadow_bin = _write_shadow(kv_dir, _SID_SHADOW, SHADOW_CHAIN)
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
 
     _url, body = _the_restore(capture_restore.posts)
     assert body["filename"] == shadow_bin                        # cold prefers, warm=0 irrelevant
@@ -349,8 +349,8 @@ async def test_cold_independent_of_warm_prefer_flag(mgr, kv_dir, capture_restore
     capture_restore.posts.clear()
     monkeypatch.setenv("TURBOHAUL_SHADOW_RESTORE_PREFER", "1")   # WARM ON
     monkeypatch.setenv("TURBOHAUL_SHADOW_COLD_RESTORE", "0")     # COLD OFF
-    clean_bin = kv_save_fn(_MODEL, _SID_CLEAN, TurbohaulManager._thread_hash(_TID), _PORT)
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())
+    clean_bin = kv_save_fn(_QWEN, _SID_CLEAN, TurbohaulManager._thread_hash(_TID), _PORT)
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())
     _url2, body2 = _the_restore(capture_restore.posts)
     assert body2["filename"] == clean_bin                        # warm flag does NOT arm cold
     assert mgr._kv_shadow_restore_counts == {}
@@ -395,7 +395,7 @@ async def test_restore_post_failure_is_truthful(mgr, kv_dir, capture_restore, co
     _write_clean(kv_dir, _SID_CLEAN, CLEAN_CHAIN)
     _write_shadow(kv_dir, _SID_SHADOW, SHADOW_CHAIN)
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot())   # must not raise
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot())   # must not raise
 
     # the preference still ran (shadow chosen) but the POST failed -> truthful:
     assert mgr._kv_shadow_restore_counts.get("cold_preferred") == 1
@@ -418,7 +418,7 @@ async def test_swapback_restores_thinkfree_shadow_for_strict_extension(mgr, kv_d
     _write_clean(kv_dir, _SID_CLEAN, CLEAN_CHAIN)          # short clean anchor [1..N-1]
     shadow_bin = _write_shadow(kv_dir, _SID_SHADOW, SHADOW_CHAIN)   # full think-free [1..N]
 
-    await mgr._restore_slot_kv(_PORT, _MODEL, _slot(inc_chain=INC_CHAIN))
+    await mgr._restore_slot_kv(_PORT, _QWEN, _slot(inc_chain=INC_CHAIN))
 
     _url, body = _the_restore(capture_restore.posts)
     # the engine is handed the LONGEST valid think-free prefix -> the most main history

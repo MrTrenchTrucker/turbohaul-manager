@@ -68,7 +68,7 @@ def mgr(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return TurbohaulManager(boot, runtime)
 
 
@@ -133,7 +133,7 @@ def capture_restore(monkeypatch):
 
 
 # --- shared conversation shape --------------------------------------------------
-_QWEN = "qwen3-27b"          # tag matched by the reasoning-family force gate
+_QWEN = "qwen-27b"              # qwen family -> the force gate is armed
 _PORT = 59500
 _TID = "agent-ip-10.0.0.5"
 _SID_CLEAN = 0

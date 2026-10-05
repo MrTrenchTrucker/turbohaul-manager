@@ -1,11 +1,11 @@
 """Dimension-aware / measured-override KV-fit.
 
 The file-size KV heuristic under-counts ultra-low-bit hybrids (the low-bit hybrid
-g64) ~6x, so the KV-fit gate can admit an over-commit that OOMs at high ctx.
+model) ~6x, so the KV-fit gate can admit an over-commit that OOMs at high ctx.
 This adds two higher-precedence, ADDITIVE paths — measured override and parsed
 GGUF dims — while leaving every existing model byte-identical.
 
-Calibration ground truth (nvidia-smi on the manager container, measured):
+Calibration ground truth (nvidia-smi on a test host, measured):
   a 27B qwen35 hybrid, cache K=turbo3 / V=turbo2, 250k ctx →
   MEASURED marginal ~3,295 MiB per 250k context.
 Measured dims (VERIFIED from the GGUF bytes): block_count=64,
@@ -24,12 +24,12 @@ from turbohaul.safety import (
 )
 
 # --- Low-bit hybrid fixtures ----------------------------------------------------------
-HYBRID_BYTES = 7233 * 1024 * 1024          # file body ≈ 7233 MiB (weights)
-HYBRID_CTX = 250_000
+LOWBIT_HYBRID_BYTES = 7233 * 1024 * 1024          # file body ≈ 7233 MiB (weights)
+LOWBIT_HYBRID_CTX = 250_000
 MEASURED_MARGINAL_MIB = 3295               # nvidia-smi, per 250k slot
 
 
-def _hybrid_dims() -> KVDims:
+def _lowbit_hybrid_dims() -> KVDims:
     return KVDims(
         arch="qwen35",
         block_count=64,
@@ -47,28 +47,28 @@ class TestCalibration:
         """16 attn layers · 4 KV heads · (256+256) · 2B, K=turbo3/V=turbo2, no
         hybrid multiply → 2,441 MiB (first-principles floor, 4.4x the 549 the
         file-size heuristic gives — the safety improvement)."""
-        kv = estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3", "turbo2",
-                                   attn_dims=_hybrid_dims())
+        kv = estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3", "turbo2",
+                                   attn_dims=_lowbit_hybrid_dims())
         assert kv == 2441, kv
 
     def test_measured_override_reproduces_nvidia_smi(self):
         """Operator-measured override (≈13.5 KiB/token = 13824 B) reproduces the
         MEASURED 3,295 MiB within ±15% (in fact exactly)."""
-        kv = estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3", "turbo2",
+        kv = estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3", "turbo2",
                                    kv_bytes_per_token=13824.0)
         lo, hi = MEASURED_MARGINAL_MIB * 0.85, MEASURED_MARGINAL_MIB * 1.15
         assert lo <= kv <= hi, f"{kv} not within ±15% of {MEASURED_MARGINAL_MIB}"
         assert kv == 3295, kv
 
-    def test_legacy_heuristic_undercounts_as_documented(self):
+    def test_legacy_lowbit_hybrid_undercounts_as_documented(self):
         """The file-size + hybrid(0.25) path gives 549 MiB — the 6x under-count
         this RC fixes. Pinned to prove the legacy path is unchanged."""
-        legacy = estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3",
+        legacy = estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3",
                                        "turbo2", hybrid_kv_ratio=0.25)
         assert legacy == 549, legacy
         # The dims/override paths are both far higher → catch the over-commit.
-        assert estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3", "turbo2",
-                                     attn_dims=_hybrid_dims()) > legacy * 4
+        assert estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3", "turbo2",
+                                     attn_dims=_lowbit_hybrid_dims()) > legacy * 4
 
 
 # === Precedence + no-compound (the reconciliation guard) ======================
@@ -77,25 +77,25 @@ class TestPrecedenceAndReconciliation:
     def test_override_outranks_dims(self):
         """Measured override wins over parsed dims (a live measurement beats a
         first-principles estimate)."""
-        kv = estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3", "turbo2",
-                                   attn_dims=_hybrid_dims(),
+        kv = estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3", "turbo2",
+                                   attn_dims=_lowbit_hybrid_dims(),
                                    kv_bytes_per_token=13824.0)
         assert kv == 3295, kv  # override, NOT the dims 2441
 
     def test_dims_path_ignores_hybrid_kv_ratio(self):
         """RECONCILIATION: dims path must NOT also apply hybrid_kv_ratio (16 attn
         layers already encode the hybrid 1/4 — re-applying would 4x under-count)."""
-        d_default = estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3",
-                                          "turbo2", attn_dims=_hybrid_dims())
-        d_quarter = estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3",
+        d_default = estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3",
+                                          "turbo2", attn_dims=_lowbit_hybrid_dims())
+        d_quarter = estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3",
                                           "turbo2", hybrid_kv_ratio=0.25,
-                                          attn_dims=_hybrid_dims())
+                                          attn_dims=_lowbit_hybrid_dims())
         assert d_default == d_quarter == 2441
 
     def test_override_path_ignores_hybrid_kv_ratio(self):
-        o_default = estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3",
+        o_default = estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3",
                                           "turbo2", kv_bytes_per_token=13824.0)
-        o_quarter = estimate_kv_cache_mib(HYBRID_CTX, HYBRID_BYTES, "turbo3",
+        o_quarter = estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES, "turbo3",
                                           "turbo2", hybrid_kv_ratio=0.25,
                                           kv_bytes_per_token=13824.0)
         assert o_default == o_quarter == 3295
@@ -116,8 +116,8 @@ class TestLegacyByteIdentical:
         assert abs(half - full // 2) <= 2
 
     def test_zero_guards_unchanged(self):
-        assert estimate_kv_cache_mib(0, HYBRID_BYTES, attn_dims=_hybrid_dims()) == 0
-        assert estimate_kv_cache_mib(HYBRID_CTX, 0, attn_dims=_hybrid_dims()) == 0
+        assert estimate_kv_cache_mib(0, LOWBIT_HYBRID_BYTES, attn_dims=_lowbit_hybrid_dims()) == 0
+        assert estimate_kv_cache_mib(LOWBIT_HYBRID_CTX, 0, attn_dims=_lowbit_hybrid_dims()) == 0
 
 
 # === Gate integration (the safety win) ========================================
@@ -133,14 +133,14 @@ class TestGateCatchesOvercommitDimsMisses:
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr("turbohaul.safety._read_free_vram_all_mib",
                        lambda *a, **k: [9000])
-            legacy = check_kv_cache_fit(HYBRID_CTX, HYBRID_BYTES,
+            legacy = check_kv_cache_fit(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES,
                                         kv_cache_quant="turbo3",
                                         kv_cache_quant_v="turbo2",
                                         hybrid_kv_ratio=0.25)
-            dims = check_kv_cache_fit(HYBRID_CTX, HYBRID_BYTES,
+            dims = check_kv_cache_fit(LOWBIT_HYBRID_CTX, LOWBIT_HYBRID_BYTES,
                                       kv_cache_quant="turbo3",
                                       kv_cache_quant_v="turbo2",
-                                      attn_dims=_hybrid_dims())
+                                      attn_dims=_lowbit_hybrid_dims())
         assert legacy.ok, f"legacy heuristic should admit (under-count): {legacy.detail}"
         assert not dims.ok, f"dims gate should refuse over-commit: {dims.detail}"
 
@@ -150,8 +150,8 @@ class TestGateCatchesOvercommitDimsMisses:
                        lambda *a, **k: [40_000])
             results = all_safety_gates(
                 min_free_ram_mib=1024, min_free_vram_mib=512,
-                max_load_per_core=99.0, max_iowait_percent=99.0,
-                ctx_size=HYBRID_CTX, gguf_size_bytes=HYBRID_BYTES,
+                max_cpu_busy_percent=99.0, max_iowait_percent=99.0,
+                ctx_size=LOWBIT_HYBRID_CTX, gguf_size_bytes=LOWBIT_HYBRID_BYTES,
                 kv_cache_quant="turbo3", kv_cache_quant_v="turbo2",
                 kv_bytes_per_token=13824.0,
             )
@@ -190,8 +190,8 @@ def _build_gguf(kvs: list, tensor_count: int = 0) -> bytes:
 
 
 class TestGgufMetaParser:
-    def test_parses_hybrid_header(self, tmp_path):
-        p = tmp_path / "hybrid.gguf"
+    def test_parses_lowbit_hybrid_header(self, tmp_path):
+        p = tmp_path / "borage.gguf"
         p.write_bytes(_build_gguf([
             _kv_str("general.architecture", "qwen35"),
             _kv_arr_u32("qwen35.some_array", [1, 2, 3]),   # exercise array-skip

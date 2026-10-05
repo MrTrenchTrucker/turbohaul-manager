@@ -57,7 +57,7 @@ def _thread_hash(thread_id: str) -> str:
 
 def _prefix_hash_chain(context: list) -> list[str]:
     """Compute rolling hash chain for context turns.
-    H_i = SHA256(H_{i-1} + \\x00 + role_i + \\x00 + content_i).
+    H_i = SHA256(H_{i-1} + \\x00 + role_i + \\x00 + content_i [+ tool-call fields]).
     Each turn's hash includes the previous hash, so the chain is order-sensitive.
     Empty/None context returns []. Monolithic-message clients get a 1-element list.
 
@@ -68,6 +68,53 @@ def _prefix_hash_chain(context: list) -> list[str]:
     so this is the form that produces today's on-disk saved metas — zero
     meta-format regression). Non-dict turns are coerced via str() so this never
     raises (kv_policy's input-safety, which manager's copy lacked).
+
+    Why more than role+content is hashed: role+content ALONE is blind to
+    tool-calling turns. An assistant tool_calls turn carries content=null —
+    the function name and arguments live in `tool_calls`, which role+content
+    never covers — and a role="tool" result turn's `tool_call_id` (which call this
+    answers) is not covered either. Two requests differing ONLY in which
+    tool was called, with what arguments, or which call a result answers
+    would produce an IDENTICAL chain hash at that position, so the
+    manager's prefix-validity check would pass for a bin whose actual tokens had
+    already diverged. Symptom: byte-identical hash for two requests
+    differing only in tool_calls.arguments, so the manager could restore far more
+    tokens than the new prompt held and the engine would log a `large stale`
+    condition (stale > n_rs_seq) followed by `CLEAR + reprefill`.
+
+    Fields hashed, and why each one — every one is a place the template
+    actually renders tool-call identity into the prompt, or (tool_call_id)
+    correlates which rendered result belongs to which call:
+      - tool_calls (assistant turns): hashed as the full canonicalized list
+        (sort_keys per entry), not name+arguments alone, so an `id` or
+        `type` difference is also caught in case some deployed template's
+        rendering keys off it (the vendored Qwen3.5 template renders only the
+        name and arguments) -- an over-conservative hash costs a
+        reprefill; a silent match costs correctness. The fields
+        that DO render (name, arguments) are covered either way.
+      - function_call (assistant turns): the pre-tool_calls legacy singular
+        shape (OpenAI function-calling). Same blindness, so same treatment.
+      - tool_call_id (role="tool" turns): correlates a result to a specific
+        call among several in flight; two different calls' results can
+        otherwise share an identical role+content shape at that position.
+    Deliberately NOT hashed: any other field a client shape might attach to
+    a turn (sender/name tags, refusal, annotations, arbitrary per-client
+    metadata) that isn't one of the three above. Pulling in fields that
+    don't correlate with tool-call identity risks the opposite failure:
+    a hash that differs on irrelevant noise defeats
+    legitimate reuse (see test_prefix_hash_chain_determinism and the
+    identical-tool_calls matching test).
+
+    BACKWARD COMPATIBILITY: the extra fields are appended to the hashed
+    string ONLY when present on a turn — a turn with no tool_calls /
+    function_call / tool_call_id hashes to the EXACT SAME value as the plain role+content form,
+    so an ordinary text-only conversation's chain is
+    byte-for-byte unaffected (see test_prefix_hash_chain_known_vector_pin
+    and test_prefix_hash_chain_parity_with_pre_refactor_manager, both
+    of which pin the text-only hash). Only a chain that actually
+    contains a tool-calling turn diverges from its plain role+content value; that is
+    a MISS (safe, one-time recompute), not a MIS-RESTORE,
+    for the bins it invalidates.
     """
     if not context:
         return []
@@ -77,12 +124,25 @@ def _prefix_hash_chain(context: list) -> list[str]:
         if isinstance(turn, dict):
             content = turn.get("content", "")
             role = turn.get("role", "")
+            tool_calls = turn.get("tool_calls")
+            function_call = turn.get("function_call")
+            tool_call_id = turn.get("tool_call_id")
         else:
             content = str(turn)
             role = ""
+            tool_calls = None
+            function_call = None
+            tool_call_id = None
         if isinstance(content, (list, dict)):
             content = json.dumps(content, sort_keys=True, separators=(',', ':'))
-        raw = f"{prev}\x00{role}\x00{content}"
+        extra = ""
+        if tool_calls:
+            extra += "\x00tc=" + json.dumps(tool_calls, sort_keys=True, separators=(',', ':'))
+        if function_call:
+            extra += "\x00fc=" + json.dumps(function_call, sort_keys=True, separators=(',', ':'))
+        if tool_call_id:
+            extra += "\x00tcid=" + str(tool_call_id)
+        raw = f"{prev}\x00{role}\x00{content}{extra}"
         h = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
         chain.append(h)
         prev = h
@@ -155,8 +215,8 @@ def _resolve_save(thread_id: str, model_tag: str, sizes: dict) -> KVDecision:
 def _resolve_restore(thread_id: str, model_tag: str, sizes: dict) -> KVDecision:
     """Decide whether to restore KV for this request.
 
-    Prefix-validity classifier (replaces the earlier length compaction gate
-    with prefix-VALIDITY vs the pinned clean bin).
+    Prefix-validity classifier (restore is decided by prefix-VALIDITY vs the
+    pinned clean bin, not by a length compaction gate).
 
     The engine reuses KV ONLY when the saved KV is a valid prefix of the incoming
     context (``saved ⊑ incoming`` → strict extension, stale ≤ 0). If saved diverges

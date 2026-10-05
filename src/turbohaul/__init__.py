@@ -4,4 +4,4 @@ A local inference one-stop-shop for a single GPU host.
 See ARCHITECTURE.md for full design.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.8.0"

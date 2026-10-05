@@ -10,10 +10,12 @@ The image and source tree include the following third-party components.
 - **Fork:** Tom's TurboQuant fork — selectable-quantization inference fork
 - **License:** MIT
 - **How we use it:** `llama-server` is invoked as a child subprocess. The binary
-  is mounted into the container from the host at `/opt/turbohaul/bin/llama-server`;
-  the supply chain (build flags, pinned SHA) is owned by the operator.
+  is mounted into the slim image from the host at `/opt/turbohaul/bin/llama-server`
+  (see `docker-compose.yml`); the supply chain (build flags, pinned source revision) is
+  owned by the operator. The CUDA images (`Dockerfile.engine-src`, `Dockerfile.cuda-multi`)
+  instead compile the engine from the source vendored in this repo.
 
-## Python dependencies (PyPI, MIT/BSD/Apache 2.0)
+## Python dependencies (PyPI, MIT/BSD/Apache 2.0, plus certifi under MPL-2.0)
 
 | Package | License | Purpose |
 |---|---|---|
@@ -25,7 +27,9 @@ The image and source tree include the following third-party components.
 | aiosqlite | MIT | Async SQLite for state |
 | httpx | BSD-3-Clause | HTTP client (pull URLs / llama-server completion proxy) |
 | websockets | BSD-3-Clause | WebSocket /ws/state |
+| jsonschema | MIT | JSON Schema validation of structured-output requests |
 | structlog | Apache-2.0 / MIT | Logging |
+| certifi | MPL-2.0 | CA certificate bundle (pulled in by httpx; vendored as the unmodified wheel) |
 
 ## Frontend dependencies (npm, MIT)
 
@@ -49,7 +53,7 @@ affiliated with Ollama.
 
 ## Container base images
 
-- **CUDA variant** (`Dockerfile.cuda-multi`) builds on `nvidia/cuda:12.9.0-runtime-ubuntu22.04`:
+- **CUDA variants** (`Dockerfile.engine-src`, `Dockerfile.cuda-multi`) run on `nvidia/cuda:12.9.0-runtime-ubuntu22.04`:
   - **NVIDIA CUDA runtime** — (c) NVIDIA Corporation, under the NVIDIA Deep Learning Container
     License / CUDA EULA. NVIDIA permits redistribution of the CUDA runtime as part of an
     application container (see https://docs.nvidia.com/cuda/eula/ and the NVIDIA Deep Learning
@@ -59,7 +63,8 @@ affiliated with Ollama.
 - **Slim / CPU variant** (`Dockerfile`) builds on `python:3.11-slim` (Debian) — no NVIDIA component.
 
 Turbohaul-Manager's own code is MIT. The published CUDA image is a composite: the MIT
-application + MIT/BSD/Apache Python & frontend dependencies + the MIT llama.cpp TurboQuant
+application + MIT/BSD/Apache Python & frontend dependencies (plus certifi, MPL-2.0, a file-level weak-copyleft
+license, shipped as the unmodified wheel) + the MIT llama.cpp TurboQuant
 binary + the NVIDIA CUDA runtime (NVIDIA license) on an Ubuntu base. The slim variant carries
 no NVIDIA-licensed component.
 

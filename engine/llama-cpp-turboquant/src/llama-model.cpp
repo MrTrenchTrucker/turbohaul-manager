@@ -291,6 +291,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
             return new llama_model_eagle3(params);
+        case LLM_ARCH_DFLASH:
+            return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
@@ -1003,9 +1005,17 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    std::vector<float> tensor_split_owned;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.tensor_split != nullptr) {
+        // llama_model_params stores tensor_split as a borrowed pointer, but the model
+        // may need it later for tensor-parallel KV-cache split metadata.
+        pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
+        this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
@@ -1264,8 +1274,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         split_sum += splits[i];
         splits[i] = split_sum;
     }
-    for (size_t i = 0; i < n_devices(); ++i) {
-        splits[i] /= split_sum;
+    if (split_sum <= 0.0f) {
+        // all devices reported zero free memory (e.g. a fitted primary model packed
+        // the GPU before a draft model load) - normalizing would produce NaN split
+        // points and an out-of-range device index below. fall back to a uniform split.
+        LLAMA_LOG_WARN("%s: all device split weights are zero, falling back to a uniform split\n", __func__);
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] = float(i + 1) / n_devices();
+        }
+    } else {
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] /= split_sum;
+        }
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
@@ -1276,7 +1296,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const int layer_gpu = std::min<int>(
+            std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin(),
+            (int) n_devices() - 1);
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -2441,6 +2463,13 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3MOE:
+        // legacy DFlash drafters are NeoX, not NORM: the reference implementation imports Qwen3's
+        // rotate_half (half-split pairing, which is NeoX in llama.cpp's terms), and the GGUF
+        // conversion lineage (DFlashModel : Qwen3Model : Qwen2Model) applies no q/k permute, so the
+        // weights are laid out unpermuted. Upstream gates this on dsv4_hc_mult (DSV4 backbones use
+        // NORM instead); we carry no DSV4 backbone in this tree, so the NeoX case is unconditional
+        // here rather than a port of that conditional.
+        case LLM_ARCH_DFLASH:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
         case LLM_ARCH_OLMO2:
@@ -2612,7 +2641,8 @@ bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
-        case LLM_ARCH_EAGLE3:    return true;
+        case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }
 }

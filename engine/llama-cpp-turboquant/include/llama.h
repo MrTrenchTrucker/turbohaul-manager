@@ -865,6 +865,20 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
+    // TURBOQUANT: like llama_state_seq_save_file, but writes only the KV cells
+    // at positions [0, max_cells) of the sequence (prefix save). The token header and token
+    // array are bounded by n_token_count; the cell payload is additionally bounded by
+    // max_cells so a truncated save yields an internally CONSISTENT bin
+    // (header N, tokens N, cells [0, N)). Pass max_cells = SIZE_MAX for the full sequence
+    // (identical to llama_state_seq_save_file).
+    LLAMA_API size_t llama_state_seq_save_file_capped(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+                          size_t   max_cells);
+
     LLAMA_API size_t llama_state_seq_load_file(
             struct llama_context * ctx,
                       const char * filepath,

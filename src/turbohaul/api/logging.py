@@ -1,8 +1,10 @@
 """GET /v1/logging — paginated audit_events stream.
 
+Responses are bounded by a token budget; see the constants below.
+
 Auth model: NO app-layer auth — matches project-wide network-perimeter posture
 (/api/config, /api/chat, /v1/chat/completions all unauthenticated). See
-ARCHITECTURE.md §11 addendum for the documented security model.
+ARCHITECTURE.md §8 for the documented security model.
 
 Denylist is a tripwire; load-bearing protection is emitter discipline (no
 prompts/responses/PII in audit payloads).
@@ -100,7 +102,7 @@ async def get_logging(
     """GET /v1/logging — paginated audit_events stream.
 
     Network-perimeter auth model: NO app-layer auth — matches project posture.
-    See ARCHITECTURE.md §11 addendum for the documented security model.
+    See ARCHITECTURE.md §8 for the documented security model.
 
     Pagination: caller loops `?since=next_since` until `next_since` is null.
     Use `>=` semantics; `next_since = last_event_id + 1` when more remain.

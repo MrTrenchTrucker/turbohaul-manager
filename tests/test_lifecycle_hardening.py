@@ -76,7 +76,7 @@ def boot_and_runtime(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return boot, runtime
 
 
@@ -413,7 +413,7 @@ class TestHealthTimeoutBounded:
 
         boot, runtime = boot_and_runtime
         runtime = RuntimeConfig(
-            queue=QueueConfig(loading_health_timeout_s=10, max_parallel_sidecars=1),
+            queue=QueueConfig(safety_enabled=False, loading_health_timeout_s=10, max_parallel_sidecars=1),
             pull=PullConfig(),
         )
         mgr = TurbohaulManager(boot, runtime)

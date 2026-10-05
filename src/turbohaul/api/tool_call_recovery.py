@@ -4,7 +4,7 @@ Some chat-templated GGUF builds (notably certain instruct-tuned families
 on llama.cpp jinja runners — see upstream issues #20809 / #20837 / #20260)
 emit tool-call attempts as text JSON inside ``message.content`` instead of
 populating the structured ``message.tool_calls`` field. Clients that read
-only the structured field (many agent workers, the OpenAI SDK, LangChain
+only the structured field (many agent workers, the OpenAI SDK, agent frameworks
 default) see "no tool call" and bail.
 
 This module's :func:`maybe_recover_tool_calls` runs AFTER the slot
@@ -36,8 +36,7 @@ _CANONICAL_RE = re.compile(
     re.DOTALL,
 )
 
-# <tool_call>...</tool_call> XML wrapper around canonical JSON (emitted by
-# some chat templates).
+# Qwen <tool_call>...</tool_call> XML wrapper around canonical JSON.
 _XML_RE = re.compile(
     r'<tool_call>\s*(?P<body>\{.*?\})\s*</tool_call>',
     re.DOTALL,

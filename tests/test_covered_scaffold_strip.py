@@ -45,7 +45,6 @@ from turbohaul.config import (
 from turbohaul.kv_policy import _prefix_hash_chain, kv_meta_fn
 from turbohaul.manager import (
     TurbohaulManager,
-    _covered_scaffold_strip_enabled,
     _divergent_tail_is_tool_opaque,
     _kv_shadow_meta_fn,
     _kv_shadow_save_fn,
@@ -54,7 +53,7 @@ from turbohaul.manager import (
 )
 from turbohaul.slot import Slot
 
-_MODEL_TAG = "example-model-27b"
+_QWEN = "qwen3.6-27b"
 _PORT = 59500
 
 
@@ -94,6 +93,30 @@ def test_strip_multi_block_global():
         "<|im_start|>assistant\nY<|im_end|>\n"
     )
     assert _strip_think_scaffold(rendered) == expected
+
+
+def test_strip_multiblock_within_one_assistant_turn():
+    """ONE assistant turn, TWO think blocks (reason -> tool_call -> reason -> answer — a normal
+    Qwen3 tool-use shape, one generation). The old single-match regex stripped only the first
+    block and left the second (tags + reasoning text) baked into the saved bin; this is the
+    direct regression test for that gap. Both blocks must go, and the tool call + final answer
+    between/after them must survive untouched."""
+    rendered = (
+        "<|im_start|>assistant\n"
+        "<think>\nfirst I should check the file exists\n</think>\n\n"
+        "<tool_call>\n{\"name\": \"read_file\"}\n</tool_call>\n"
+        "<think>\nnow that I have the contents, let me summarize\n</think>\n\n"
+        "Here is the summary.<|im_end|>\n"
+    )
+    expected = (
+        "<|im_start|>assistant\n"
+        "<tool_call>\n{\"name\": \"read_file\"}\n</tool_call>\n"
+        "Here is the summary.<|im_end|>\n"
+    )
+    out = _strip_think_scaffold(rendered)
+    assert out == expected
+    assert "<think>" not in out and "</think>" not in out
+    assert "now that I have the contents" not in out
 
 
 def test_strip_no_think_is_noop():
@@ -149,30 +172,54 @@ def test_user_and_tool_embedded_think_survive():
     assert "my reasoning" not in out
 
 
+def test_multiblock_assistant_plus_user_tool_think_survive():
+    """BOTH directions in one render: a role=user msg AND a role=tool msg each carrying a
+    literal `<think>...</think>` (pasted logs) survive byte-for-byte, WHILE the assistant
+    turn's own TWO think blocks (multi-block reasoning around a tool call) are both fully
+    stripped. Proves the per-turn scoping and the multi-block removal simultaneously, not as
+    two independent claims that could each pass while some interaction between them breaks."""
+    rendered = (
+        "<|im_start|>user\npasted log: <think>\ndebug trace\n</think>\n\nplease help<|im_end|>\n"
+        "<|im_start|>tool\nresult: <think>\ninner\n</think>\n\ndone<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        "<think>\nfirst reasoning\n</think>\n\n"
+        "<tool_call>\n{\"name\": \"x\"}\n</tool_call>\n"
+        "<think>\nsecond reasoning\n</think>\n\n"
+        "The answer.<|im_end|>\n"
+    )
+    out = _strip_think_scaffold(rendered)
+    # direction 1: user + tool literal think blocks survive byte-for-byte
+    assert "user\npasted log: <think>\ndebug trace\n</think>\n\nplease help<|im_end|>" in out
+    assert "tool\nresult: <think>\ninner\n</think>\n\ndone<|im_end|>" in out
+    # direction 2: BOTH assistant blocks are gone, tool call + answer survive
+    assert (
+        "<|im_start|>assistant\n<tool_call>\n{\"name\": \"x\"}\n</tool_call>\nThe answer.<|im_end|>\n"
+        in out
+    )
+    assert "first reasoning" not in out and "second reasoning" not in out
+
+
 # ============================================================================
 # 2. FLAG READERS — Fix B default ON, Fix A default OFF
 # ============================================================================
 @pytest.fixture(autouse=True)
 def _clean_flag_env(monkeypatch):
     """Each test starts from the shipped defaults regardless of ambient env."""
-    monkeypatch.delenv("TURBOHAUL_COVERED_SCAFFOLD_STRIP", raising=False)
     monkeypatch.delenv("TURBOHAUL_TOOLTAIL_SCAN_COVERED", raising=False)
 
 
-def test_fixb_flag_default_on():
-    assert _covered_scaffold_strip_enabled() is True
+def test_fixb_flag_default_on(mgr):
+    assert mgr._covered_scaffold_strip_enabled() is True
 
 
-@pytest.mark.parametrize("v", ["0", "false", "no", "off", "OFF", "False"])
-def test_fixb_flag_explicit_off(monkeypatch, v):
-    monkeypatch.setenv("TURBOHAUL_COVERED_SCAFFOLD_STRIP", v)
-    assert _covered_scaffold_strip_enabled() is False
+def test_fixb_flag_explicit_off(mgr):
+    mgr.runtime.kv.covered_scaffold_strip = False
+    assert mgr._covered_scaffold_strip_enabled() is False
 
 
-@pytest.mark.parametrize("v", ["1", "true", "yes", "on", "anything-else"])
-def test_fixb_flag_on_values(monkeypatch, v):
-    monkeypatch.setenv("TURBOHAUL_COVERED_SCAFFOLD_STRIP", v)
-    assert _covered_scaffold_strip_enabled() is True
+def test_fixb_flag_on(mgr):
+    mgr.runtime.kv.covered_scaffold_strip = True
+    assert mgr._covered_scaffold_strip_enabled() is True
 
 
 def test_fixa_flag_default_off():
@@ -275,7 +322,7 @@ def mgr(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return TurbohaulManager(boot, runtime)
 
 
@@ -333,6 +380,16 @@ class _FakeEngine:
             with open(tmp_path, "wb") as f:
                 f.write(b"stripped-historical-kv")
             return _Resp({"status": "ok"})
+        if "/v1/chat/completions" in url:
+            # the real plain-probe reply carries the tokenized
+            # prompt's usage; the strict clean stamp keys off
+            # usage.prompt_tokens, so the fake reports the slot's
+            # engine-reported count.
+            _n = (self._slots[0].get("n_prompt_tokens") or 1) if self._slots else 1
+            return _Resp({"status": "ok",
+                           "usage": {"prompt_tokens": _n,
+                                     "completion_tokens": 0,
+                                     "total_tokens": _n}})
         return _Resp({"tokens_evaluated": 42})  # /completion (and any other)
 
 
@@ -378,8 +435,9 @@ async def test_render_strip_prefill_posts_stripped_prompt(mgr, make_engine):
     posts = make_engine([{"id": 0, "n_prompt_tokens": 100}], rendered=rendered)
 
     ok = await mgr._render_strip_prefill_probe(
-        _PORT, _MODEL_TAG, [{"role": "user", "content": "u"}],
+        _PORT, _QWEN, [{"role": "user", "content": "u"}],
         {"tools": [{"type": "function"}], "tool_choice": "auto"},
+        read_timeout_s=900.0,  # now required, value irrelevant to this test
     )
 
     assert ok is True
@@ -402,7 +460,9 @@ async def test_render_strip_prefill_posts_stripped_prompt(mgr, make_engine):
 @pytest.mark.asyncio
 async def test_render_strip_prefill_no_tools_omits_knobs(mgr, make_engine):
     posts = make_engine([{"id": 0, "n_prompt_tokens": 100}], rendered="plain\nprompt")
-    ok = await mgr._render_strip_prefill_probe(_PORT, _MODEL_TAG, [{"role": "user", "content": "u"}], {})
+    ok = await mgr._render_strip_prefill_probe(
+        _PORT, _QWEN, [{"role": "user", "content": "u"}], {}, read_timeout_s=900.0,
+    )
     assert ok is True
     body = _apply_posts(posts)[0][1]
     for k in ("tools", "tool_choice", "parallel_tool_calls", "function_call", "functions"):
@@ -412,7 +472,9 @@ async def test_render_strip_prefill_no_tools_omits_knobs(mgr, make_engine):
 @pytest.mark.asyncio
 async def test_render_strip_prefill_false_on_apply_fail(mgr, make_engine):
     posts = make_engine([{"id": 0, "n_prompt_tokens": 100}], fail_apply=True)
-    ok = await mgr._render_strip_prefill_probe(_PORT, _MODEL_TAG, [{"role": "user", "content": "u"}], {})
+    ok = await mgr._render_strip_prefill_probe(
+        _PORT, _QWEN, [{"role": "user", "content": "u"}], {}, read_timeout_s=900.0,
+    )
     assert ok is False
     assert _completion_posts(posts) == []  # never reached /completion
 
@@ -420,7 +482,9 @@ async def test_render_strip_prefill_false_on_apply_fail(mgr, make_engine):
 @pytest.mark.asyncio
 async def test_render_strip_prefill_false_on_missing_prompt(mgr, make_engine):
     posts = make_engine([{"id": 0, "n_prompt_tokens": 100}], rendered=None)  # apply returns {}
-    ok = await mgr._render_strip_prefill_probe(_PORT, _MODEL_TAG, [{"role": "user", "content": "u"}], {})
+    ok = await mgr._render_strip_prefill_probe(
+        _PORT, _QWEN, [{"role": "user", "content": "u"}], {}, read_timeout_s=900.0,
+    )
     assert ok is False
     assert _completion_posts(posts) == []
 
@@ -435,16 +499,21 @@ def _msgs(k):
 
 @pytest.mark.asyncio
 async def test_clean_probe_default_on_saves_via_render_strip(mgr, kv_dir, make_engine):
-    """Fix B default ON: _probe_and_save_clean_kv prefills the stripped historical prompt
+    """Default ON: _probe_and_save_clean_kv prefills the stripped historical prompt
     (apply-template + /completion) — NOT /v1/chat/completions — and still writes the clean
-    bin. Proves case (a) end-to-end at the clean save site."""
+    bin. Proves case (a) end-to-end at the clean save site. save_to_disk=True drives the
+    unload-seam path where this transport now actually lives (see
+    test_probe_save_to_disk_false_parks_no_transport for the complementary per-turn path)."""
     rendered = "<|im_start|>user\nu<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\nTAIL"
     stripped = "<|im_start|>user\nu<|im_end|>\n<|im_start|>assistant\nTAIL"
-    posts = make_engine([{"id": 0, "n_prompt_tokens": 100}], rendered=rendered)
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+    # the extent gate requires the probe's recorded
+    # render count and the slot's live count to be coherent — the fake
+    # /completion reports tokens_evaluated=42, so the slot payload agrees.
+    posts = make_engine([{"id": 0, "n_prompt_tokens": 42}], rendered=rendered)
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
                     client_meta={"messages": _msgs(6)}, admission_ctx_len=50000)
 
-    await mgr._probe_and_save_clean_kv(_handle(), slot)
+    await mgr._probe_and_save_clean_kv(_handle(), slot, save_to_disk=True)
 
     # transport swapped: rendered + prefilled the stripped prompt, no live chat POST
     assert len(_apply_posts(posts)) == 1
@@ -465,7 +534,7 @@ async def test_shadow_probe_default_on_saves_via_render_strip(mgr, kv_dir, make_
     rendered = "<|im_start|>assistant\n<think>\n\n</think>\n\nDONE"  # empty scaffold on think-free turn N
     stripped = "<|im_start|>assistant\nDONE"
     posts = make_engine([{"id": 0, "n_prompt_tokens": 100}], rendered=rendered)
-    slot = SimpleNamespace(thread_id="t", model_tag=_MODEL_TAG,
+    slot = SimpleNamespace(thread_id="t", model_tag=_QWEN,
                            client_meta={"messages": _msgs(8)}, streamed_assistant_text=None)
     result = {"choices": [{"message": {"content": "<think>cot</think>THE_ANSWER"}}]}
 
@@ -476,8 +545,8 @@ async def test_shadow_probe_default_on_saves_via_render_strip(mgr, kv_dir, make_
     assert _chat_posts(posts) == []
     # a DISTINCT .shadow bin was written
     th = TurbohaulManager._thread_hash("t")
-    shadow_bin = kv_dir / _kv_shadow_save_fn(_MODEL_TAG, 0, th, _PORT)
-    shadow_meta = kv_dir / _kv_shadow_meta_fn(_MODEL_TAG, 0, th, _PORT)
+    shadow_bin = kv_dir / _kv_shadow_save_fn(_QWEN, 0, th, _PORT)
+    shadow_meta = kv_dir / _kv_shadow_meta_fn(_QWEN, 0, th, _PORT)
     assert shadow_bin.exists() and shadow_meta.exists()
     meta = json.loads(shadow_meta.read_text())
     assert meta["shadow"] is True and meta["clean_prefix"] is False
@@ -486,21 +555,38 @@ async def test_shadow_probe_default_on_saves_via_render_strip(mgr, kv_dir, make_
 @pytest.mark.asyncio
 async def test_flag_off_uses_legacy_chat_transport(mgr, kv_dir, make_engine):
     """Flag OFF -> byte-identical-to-today: the clean probe uses /v1/chat/completions and
-    NEVER calls /apply-template or /completion."""
+    NEVER calls /apply-template or /completion. save_to_disk=True drives the unload-seam
+    path where this transport now actually lives (see
+    test_probe_save_to_disk_false_parks_no_transport for the complementary per-turn path)."""
     posts = make_engine([{"id": 0, "n_prompt_tokens": 100}], rendered="unused")
-    import os as _os
-    _os.environ["TURBOHAUL_COVERED_SCAFFOLD_STRIP"] = "0"
+    mgr.runtime.kv.covered_scaffold_strip = False
     try:
-        slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+        slot = Slot.new(_QWEN, thread_id="t", context=None,
                         client_meta={"messages": _msgs(6)}, admission_ctx_len=50000)
-        await mgr._probe_and_save_clean_kv(_handle(), slot)
+        await mgr._probe_and_save_clean_kv(_handle(), slot, save_to_disk=True)
     finally:
-        _os.environ.pop("TURBOHAUL_COVERED_SCAFFOLD_STRIP", None)
+        mgr.runtime.kv.covered_scaffold_strip = True
 
     assert len(_chat_posts(posts)) == 1
     assert _apply_posts(posts) == []
     assert _completion_posts(posts) == []
     assert len(_save_posts(posts)) == 1  # clean bin still saved
+
+
+@pytest.mark.asyncio
+async def test_probe_save_to_disk_false_parks_no_transport(mgr, kv_dir, make_engine):
+    """save_to_disk defaults False: the per-turn call only parks the VRAM anchor
+    (unload-seam-only save timing) and returns before any transport — zero posts
+    of every kind, not just zero of the flag-gated ones. This is the complement
+    of the 2 save_to_disk=True tests above: together they cover both branches of
+    manager.py's `if not save_to_disk: ... return` early exit."""
+    posts = make_engine([{"id": 0, "n_prompt_tokens": 100}], rendered="unused")
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
+                    client_meta={"messages": _msgs(6)}, admission_ctx_len=50000)
+
+    await mgr._probe_and_save_clean_kv(_handle(), slot)
+
+    assert posts == []
 
 
 def _handle(port=_PORT):
@@ -509,4 +595,4 @@ def _handle(port=_PORT):
 
 def _read_clean_meta(kv_dir, thread_id, sid=0, port=_PORT):
     th = TurbohaulManager._thread_hash(thread_id)
-    return json.loads((kv_dir / kv_meta_fn(_MODEL_TAG, sid, th, port)).read_text())
+    return json.loads((kv_dir / kv_meta_fn(_QWEN, sid, th, port)).read_text())

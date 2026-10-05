@@ -1,124 +1,107 @@
-![Turbohaul-Manager — cyberpunk GPU rig hauling inference traffic](docs/banner.png)
+<p align="center">
+  <img src="docs/banner.png" alt="Turbohaul-Manager: a GPU rig hauling inference traffic" width="640">
+</p>
 
 # Turbohaul-Manager
 
-Ollama-shape inference manager using [Tom's TurboQuant](https://github.com/TheTom/llama-cpp-turboquant) fork of llama.cpp.
+**One GPU, a whole fleet of AI agents.** Turbohaul-Manager is a self-hosted inference server for local GGUF models on NVIDIA GPUs (Blackwell included). It speaks the Ollama and OpenAI APIs, queues every agent's requests on one card, and keeps each conversation's work warm. A follow-up turn picks up where the last one left off instead of making the model re-read the whole conversation.
 
-FIFO queue + grace + IDLE_HOT hot-hold + model swap on Nvidia RTX GPU's including Blackwell.
+**Why it matters:** a large context that takes about 327 s to re-read comes back in about 0.5 s. In one measured restore after a full unload, 154,647 tokens were reused with only 29 new tokens to process.
 
-**Precomputed KV-cache reuse.** Turbohaul saves each conversation's computed context and restores it across grace windows, model swaps, and even full idle unloads — so a follow-up turn reuses the already-computed prefix instead of re-reading the whole conversation from scratch. A large context that would cost ~327 s to re-prefill comes back in ~0.5 s: in a measured cold restore after a full unload, **154,647 tokens were reused with a 29-token prefill — roughly 629x less prefill work**. See [docs/REASONING_KV_REUSE.md](docs/REASONING_KV_REUSE.md) and [docs/KV_CACHE_MATCHING.md](docs/KV_CACHE_MATCHING.md).
+- 🚦 **Fast Lane:** decide which clients, and which kinds of work, get served first. Off by default.
+- ♻️ **Warm conversations:** each conversation's computed context (its KV cache) is saved and restored across pauses, model swaps and idle unloads.
+- 🔌 **Drop-in API:** any Ollama or OpenAI client connects with two lines of config.
+- 🚛 **Many agents, one card:** requests queue cleanly, the warm model is kept when it can be, and several models can stay loaded at once (`max_parallel_sidecars`).
+- 📊 **Web dashboard:** watch what is loaded, running and queued, and manage models, manifests and the blob store from the browser.
+- 🛡️ **Safety first:** refuses to load a model when VRAM, RAM, CPU or disk wait would put the host at risk.
+- 📦 **Fully vendored:** the engine (a [TurboQuant](https://github.com/TheTom/llama-cpp-turboquant) fork of llama.cpp), the Python wheels and the web UI live in this one repository.
 
-## What it does
-
-- Accepts OpenAI / Ollama-shape `/v1/chat/completions` requests
-- Single-slot serial sidecar (one llama-server child holds the model)
-- ACTIVE_MATCH cascade for same-thread follow-ups within a grace window (warm-process reuse)
-- IDLE_HOT 5-minute warm-hold after grace expires: same-model follow-ups inherit the warm process; different-model swap tears down + spawns new
-- Multiplexed multi-agent serialization on one shared GPU (proven with 3 production agents on a single host — see [docs/MULTI_AGENT_SHARING.md](docs/MULTI_AGENT_SHARING.md))
-- Transparent tool-call recovery for jinja-templated GGUFs that emit calls as text JSON in `message.content` instead of the structured `tool_calls` field (seen on some model families per upstream llama.cpp issues #20809 / #20837 / #20260) — see [docs/TOOL_CALL_HANDLING.md](docs/TOOL_CALL_HANDLING.md)
-- Safety guardrails: refuses spawn when VRAM / RAM / CPU / IO-wait would put the host at risk
+![The Turbohaul-Manager dashboard: two models serving live traffic side by side](docs/dashboard-live.png)
 
 ## Quick start
 
+Turbohaul is built from source; no prebuilt image is published.
+
 ```bash
-# Clone, build the self-contained image, and run (Blackwell or older NVIDIA GPU)
 git clone https://github.com/MrTrenchTrucker/turbohaul-manager.git
 cd turbohaul-manager
-docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.6.0 .   # fully offline (vendored engine + wheels)
+docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.8.0 .
 
-docker run --gpus all -p 11401:11401 \
+docker run --gpus all -p 127.0.0.1:11401:11401 \
     -v $(pwd)/state:/var/lib/turbohaul \
     -v $(pwd)/models:/var/lib/turbohaul/import-staging \
-    turbohaul-manager:v0.6.0
-
-# For broad NVIDIA arch support (Turing through Blackwell), build with Dockerfile.cuda-multi instead.
+    turbohaul-manager:v0.8.0
 ```
 
-The `-v $(pwd)/state:/var/lib/turbohaul` mount is **required** for production deployment — without it, `state.sqlite`, `manifests/*.yaml`, and the `blobs/` store live inside the container layer and are destroyed by `docker rm` or container-layer corruption. See [docs/PERSISTENCE_CHECKLIST.md](docs/PERSISTENCE_CHECKLIST.md) for the full hardening checklist.
+Then open **http://127.0.0.1:11401/ui**.
 
-## API
+- ⚠️ **No built-in login.** Turbohaul performs no authentication, so the bind address is the security boundary. Keep `127.0.0.1` unless you have read [Security model & hardening](ARCHITECTURE.md).
+- 💾 **Keep the `state` mount.** It holds the database, the manifests and the model blobs. Without it they are lost when the container is removed. See [docs/PERSISTENCE_CHECKLIST.md](docs/PERSISTENCE_CHECKLIST.md).
+- 🖥️ **Hardware:** three tiers (Minimum, Recommended, High) are in [SYSTEM_REQUIREMENTS.md](SYSTEM_REQUIREMENTS.md).
+- 🧰 **Build options:** `Dockerfile.engine-src` builds fully offline from the vendored sources for CUDA architectures 89 and 120 (add `--build-arg CUDA_ARCH="<list>"` to change them). `Dockerfile.cuda-multi` covers Turing through Blackwell, but installs the Python and frontend dependencies from the network.
 
-Compatible with Ollama-shape clients:
-- `GET /api/tags` -- list models
-- `GET /api/show?name=<tag>` -- model detail
-- `POST /v1/chat/completions` -- OpenAI-shape inference (supports `response_format` json_object + json_schema)
-- `POST /api/chat` -- Ollama-shape inference
-- `POST /v1/embeddings` -- llama-server embeddings passthrough
-- `GET /v1/logging` -- paginated audit events
-- `PUT /api/manifests/{tag}` -- register a new model (requires GGUF blob in store; ETag/If-Match atomic concurrency)
-- `POST /api/pull-hf` -- pull a GGUF from HuggingFace
-- `POST /api/pull-url` -- pull a GGUF from arbitrary HTTPS URL (SSRF-guarded)
-- `POST /api/import` -- import a local GGUF file
-- `GET /status` -- live queue + active + idle_hot snapshot
+## Connect your agent
 
-## Setting up AI Agents
-
-Pointing an AI agent (langchain, llama-index, LiteLLM, raw OpenAI SDK, Ollama clients, etc.) at Turbohaul is two lines:
+Point any OpenAI-compatible client (an AI harness, an agent framework, the OpenAI SDK, an Ollama client) at Turbohaul:
 
 ```yaml
 base_url: http://<turbohaul-host>:11401/v1
-api_key: dummy   # no auth required on the internal port
+api_key: dummy   # no authentication is performed
 ```
 
-Turbohaul ships with sane defaults for multi-tool-call agent loops — `idle_hot_load_seconds=600`, `grace_seconds=30`, streaming SSE pass-through, tool-call field forwarding on both `/v1/chat/completions` and `/api/chat`, text-JSON tool-call recovery for jinja-template models that emit calls as content text, and ACTIVE_MATCH warm-slot reuse for same-`thread_id` follow-ups (sub-second after the first turn).
+The defaults are tuned for multi-tool-call agent loops: streaming pass-through, tool-call forwarding on both APIs, recovery of tool calls a model writes as plain text, and warm reuse for same-thread follow-ups.
 
-**Full guide:** [docs/AI_AGENT_SETUP.md](docs/AI_AGENT_SETUP.md) — per-client config recipes (OpenAI SDK / langchain / llama-index / LiteLLM / Ollama / curl), multi-tool-call workflow notes, production setup, validation smoke tests, and a troubleshooting table. For the recovery layer specifically, see [docs/TOOL_CALL_HANDLING.md](docs/TOOL_CALL_HANDLING.md).
+- **Full guide:** [docs/AI_AGENT_SETUP.md](docs/AI_AGENT_SETUP.md)
+- **Agent skills** (for an AI agent that sets up or runs Turbohaul for you): [skills/](skills/)
 
-## Multi-agent shared-GPU
+## 🚦 Fast Lane: deciding who goes next
 
-Multiple agents can target the same Turbohaul endpoint at the same time. Turbohaul queues their requests, holds the warm model when possible, and cleanly swaps models when a different agent needs a different one. Proven in production with three agents (one primary worker plus two advisor agents) running on one Blackwell card with zero force-evictions during a multi-model serialization smoke.
+![Fast Lane: the rig running the priority lane past queued traffic](docs/fastlane-banner.png)
 
-This is sharing-via-serialization, not concurrent-tensor-parallelism. See [docs/MULTI_AGENT_SHARING.md](docs/MULTI_AGENT_SHARING.md) for the architecture, the proof, and when this does (and does not) fit your workload.
+When several agents share one GPU, somebody has to go first. By default requests are served in arrival order. Fast Lane lets you say it should be *this* client, and *this* kind of work (main conversation, curator, compression, sub-agent), ahead of the rest.
 
-## TurboQuant flag doctrine
+- **It never interrupts a reply.** It only chooses which waiting request goes next. A lower-priority idle model may be unloaded to make room, but only between turns.
+- **Nobody starves.** Unlisted traffic has a wall-clock fairness floor (`fastlane.max_normal_wait_s`).
+- **Easy to set up:** turn it on at **Settings → General → Fast Lane**, then pick clients from the **Discovered** list at **Queue → Fast Lane**.
 
-The Turbohaul manifest schema includes five spawn-time TurboQuant flags that should be on by default for production manifests: `flash_attn`, `no_context_shift`, `cache_reuse: 256`, `slot_prompt_similarity: 0.5`, `no_perf`. These are spawn argv — manifest PUT does not affect a running `llama-server`; a cold-spawn (request with body `"keep_alive": 0`, natural `IDLE_HOT` teardown, or container restart) is required to pick up changes.
+![The Fast Lane screen: priority rules per client and per kind of work, with the Discovered list below](docs/fastlane-rules.png)
 
-See [docs/TURBOQUANT_FLAGS.md](docs/TURBOQUANT_FLAGS.md) for the spawn-vs-request distinction, patching recipe, and verification recipe.
+Full guide: [docs/FAST_LANE.md](docs/FAST_LANE.md)
 
-## Hybrid (SSM + attention) models
+## More under the hood
 
-Turbohaul serves hybrid models — architectures that combine state-space (SSM) layers with attention layers — in every existing mode: single, series-parallel (`--parallel N`), and double-parallel (multiple resident models). Because SSM layers keep a fixed-size recurrent state instead of a growing per-token cache, a hybrid's KV footprint is smaller than a pure-attention model of the same size, and the manifest fields below let the VRAM / KV-fit estimate account for that.
+- **Several models, or several copies of one:** `max_parallel_sidecars` sets how many engines run box-wide, and `llama_server_flags.parallel` sets context windows per engine. See [docs/SIDECARS_AND_CONTEXT_WINDOWS.md](docs/SIDECARS_AND_CONTEXT_WINDOWS.md).
+- **Multi-GPU placement:** assign models to cards explicitly or automatically. See [docs/MULTI_GPU_PLACEMENT.md](docs/MULTI_GPU_PLACEMENT.md).
+- **Hybrid (SSM + attention) models** are sized correctly from their real dimensions. See [docs/HYBRID_KV_RATIO.md](docs/HYBRID_KV_RATIO.md).
+- **Vision models and speculative decoding**, configured per model. See [docs/VISION_MODELS.md](docs/VISION_MODELS.md) and [docs/SPECULATIVE_DECODING.md](docs/SPECULATIVE_DECODING.md).
+- **Tool-call recovery** for models that write their tool calls as text. See [docs/TOOL_CALL_HANDLING.md](docs/TOOL_CALL_HANDLING.md).
+- **Plugins** *(work in progress):* operator-run HTTP services (a transcriber, a document converter) invoked through the API. See [docs/PLUGINS_SETUP.md](docs/PLUGINS_SETUP.md).
 
-### Manifest fields
+## 📚 Documentation
 
-Three optional manifest fields let you describe a hybrid model so the VRAM / KV-fit estimate stays accurate. For a `qwen35` hybrid the fit is **dimension-derived by default** — the manager reads the model's real GGUF attention dims — with `kv_bytes_per_token` available as a measured override (details in [MODEL_CONFIG_REFERENCE](docs/MODEL_CONFIG_REFERENCE.md)):
+| I want to... | Read |
+|---|---|
+| Understand how it all fits together | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| See every API endpoint | [docs/API_REFERENCE.md](docs/API_REFERENCE.md) |
+| Use the web dashboard | [docs/frontend/README.md](docs/frontend/README.md) |
+| Connect an AI agent | [docs/AI_AGENT_SETUP.md](docs/AI_AGENT_SETUP.md) · [skills/](skills/) |
+| Set up Fast Lane | [docs/FAST_LANE.md](docs/FAST_LANE.md) |
+| Add and configure a model (backend and dashboard) | [docs/MODELS_AND_MANIFESTS.md](docs/MODELS_AND_MANIFESTS.md) |
+| Look up every manifest field and flag | [docs/MODEL_CONFIG_REFERENCE.md](docs/MODEL_CONFIG_REFERENCE.md) · [docs/TURBOQUANT_FLAGS.md](docs/TURBOQUANT_FLAGS.md) |
+| Understand cache reuse | [docs/KV_CACHE_MATCHING.md](docs/KV_CACHE_MATCHING.md) · [docs/REASONING_KV_REUSE.md](docs/REASONING_KV_REUSE.md) · [docs/KV_CACHE_RAM_LIFECYCLE.md](docs/KV_CACHE_RAM_LIFECYCLE.md) |
+| Plan GPUs and memory | [SYSTEM_REQUIREMENTS.md](SYSTEM_REQUIREMENTS.md) · [docs/SAFETY_GATE_VRAM_MATH.md](docs/SAFETY_GATE_VRAM_MATH.md) · [docs/MULTI_GPU_PLACEMENT.md](docs/MULTI_GPU_PLACEMENT.md) |
+| Share one GPU between many agents | [docs/MULTI_AGENT_SHARING.md](docs/MULTI_AGENT_SHARING.md) · [docs/DEPLOYMENT_PATTERNS.md](docs/DEPLOYMENT_PATTERNS.md) |
+| Run it in production | [docs/PERSISTENCE_CHECKLIST.md](docs/PERSISTENCE_CHECKLIST.md) |
+| Add plugins *(WIP)* | [docs/PLUGINS_SETUP.md](docs/PLUGINS_SETUP.md) · [docs/PLUGIN_REFERENCE.md](docs/PLUGIN_REFERENCE.md) |
+| See what changed | [CHANGELOG.md](CHANGELOG.md) |
 
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `arch` | string | `""` | Model architecture hint (e.g. `qwen35` for an SSM/attention hybrid). |
-| `hybrid_kv_ratio` | float 0.0–1.0 | `1.0` | Fraction of layers that contribute a **growing** per-token KV cache. SSM layers keep a fixed-size recurrent state rather than a growing cache, so a hybrid's per-token KV is smaller than a pure-attention model of the same size. Scales the **file-size fallback** estimate only (for a parseable `qwen35` model the dimension-aware path is used instead). |
-| `kv_bytes_per_token` | float ≥ 1024.0 or unset | *(unset)* | Optional operator-**measured** effective KV cost in **BYTES/token** (highest precedence, used verbatim; 1 KiB/token floor rejects a KiB-vs-bytes typo). Leave unset for existing models. |
+## Known issues
 
-The defaults (`arch: ""`, `hybrid_kv_ratio: 1.0`) mean **pure attention** and are byte-identical to prior behaviour for every existing model. Hybrid models reuse the existing KV-cache types — no new KV type is introduced.
+- 💾 **Saving the KV cache to disk when a model unloads is a work in progress and does not currently work.** The RAM tier works, so cache reuse across model swaps is unaffected.
+- ⬆️ **Upgrading from v0.7.0?** One retired setting stops the manager from starting until you remove it. Read the *Compatibility* notes in [CHANGELOG.md](CHANGELOG.md) before you restart.
 
-## Persistence
+## Contributing, credits and license
 
-Production deployments must bind-mount `/var/lib/turbohaul`, ship an image tarball backup, mirror configs to a separate host, and have an auto-recovery entry. See [docs/PERSISTENCE_CHECKLIST.md](docs/PERSISTENCE_CHECKLIST.md) for the full Turbohaul-specific hardening audit.
-
-## License
-
-MIT (see LICENSE). All third-party deps audited MIT-compatible (see THIRD_PARTY_NOTICES.md).
-
-## Contributors
-
-See [CONTRIBUTORS.md](CONTRIBUTORS.md). MrTrench (founder) shipped v0.6.0. Release notes in [CHANGELOG.md](CHANGELOG.md).
-
-
-## Offline use — everything vendored in one repository
-
-Turbohaul Manager ships **fully vendored** in this single Git repository — engine
-source, Python deps (wheels), and frontend. No external repo, registry, PyPI, or npm
-required.
-
-### Build from source (needs the CUDA base image once)
-```bash
-docker build -f Dockerfile.engine-src -t turbohaul-manager:engine-src .
-```
-Compiles the vendored engine (`engine/llama-cpp-turboquant/`) from source, installs Python
-from the vendored wheels (`vendor/pywheels/`), and serves the committed frontend `dist` --
-no PyPI, npm, or external clone. `Dockerfile.cuda-multi` is the same build with wider GPU
-architecture coverage (Turing through Blackwell) if you prefer pulling dependencies from the
-network instead of using the vendored wheels.
-
-Requires an NVIDIA GPU. Licensing: all vendored deps are permissive (see THIRD_PARTY_NOTICES.md).
+- **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Contributors:** [CONTRIBUTORS.md](CONTRIBUTORS.md)
+- **License:** MIT (see [LICENSE](LICENSE)). Third-party dependencies are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), all under MIT or MIT-compatible permissive licenses.

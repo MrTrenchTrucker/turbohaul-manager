@@ -1,7 +1,7 @@
 """Wave-return manager delta — cold-path clean save + restore.
 
 Covers the 2 behavioural changes in manager.py (the WARM path + the kv_policy gate
-are unchanged and stay covered by test_ws2_classifier.py / test_kv_policy.py):
+are unchanged and stay covered by test_classifier.py / test_kv_policy.py):
 
   * empty-chain save fallback in _save_slot_kv: when slot.context is empty,
     persist a REAL prefix-comparable chain from the admission messages
@@ -33,7 +33,7 @@ from turbohaul.manager import TurbohaulManager
 from turbohaul.slot import Slot
 
 
-# --- fixtures (mirror test_ws2_classifier.py) ------------------------------------
+# --- fixtures (mirror test_classifier.py) ------------------------------------
 @pytest.fixture
 def mgr(tmp_path):
     storage_root = tmp_path / "state"
@@ -53,7 +53,7 @@ def mgr(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return TurbohaulManager(boot, runtime)
 
 
@@ -163,7 +163,7 @@ _SYS = {"role": "system", "content": "system prompt long enough to matter"}
 _U1 = {"role": "user", "content": "first user turn"}
 _U2 = {"role": "user", "content": "second user turn"}
 _A1 = {"role": "assistant", "content": "A"}
-_QWEN = "example-27b"
+_QWEN = "qwen3.6-27b"
 
 
 def _write_bin(kv_dir, model_tag, port, thread_id, sid, chain, *, clean,

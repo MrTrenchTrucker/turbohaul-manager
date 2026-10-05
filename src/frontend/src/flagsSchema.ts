@@ -1,7 +1,7 @@
 // flagsSchema.ts — FE mirror of BE SAFE_LLAMA_FLAGS (manifest.py).
 // MUST stay in lockstep with src/turbohaul/manifest.py. Single source of truth.
 //
-// When BE adds/changes a flag, update here too. Future improvement: codegen this
+// When BE adds/changes a flag, update here too. Future work: codegen this
 // from Python via a build step (Approach A — codegen)
 // or shared JSON-Schema (Approach B). Today this is hand-mirrored.
 //
@@ -26,7 +26,7 @@ export type FlagCategory =
   | 'MoE / Multi-GPU'
   | 'Sampling'
   | 'Reasoning'
-  | 'Speculative / MTP'
+  | 'Speculative Decoding'
   | 'Chat / Template'
   | 'Server'
   | 'Debug';
@@ -40,6 +40,7 @@ export interface FlagSpec {
   bounds?: [number, number];    // (lo, hi) for int/float
   enumValues?: readonly string[]; // for enum-string / bool-or-enum / chat-template
   primary?: boolean;            // featured at top
+  dualRender?: boolean;         // primary flag that ALSO renders in its own category section (same state, not a copy)
 }
 
 // === Built-in chat_template names (MUST match BE SAFE_CHAT_TEMPLATE_NAMES) ===
@@ -103,12 +104,14 @@ export const FLAGS_SCHEMA: readonly FlagSpec[] = [
 
   // === KV Cache ===
   { name: 'cache_type_k', type: 'enum-string', category: 'KV Cache', primary: true, default: 'f16',
-    enumValues: ['f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1'],
-    hint: 'K-cache quantization. f16 = full quality. q4_0 = quarter size. q8_0 = well-tested half size.' },
+    enumValues: ['f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1', 'turbo2', 'turbo3', 'turbo4'],
+    hint: 'K-cache quantization. f16 = full quality. q4_0 = quarter size. q8_0 = well-tested half size. turbo3 = smaller than q8_0.' },
   { name: 'cache_type_v', type: 'enum-string', category: 'KV Cache', primary: true, default: 'f16',
-    enumValues: ['f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1'],
-    hint: 'V-cache quantization. Match cache_type_k for symmetric.' },
+    enumValues: ['f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1', 'turbo2', 'turbo3', 'turbo4'],
+    hint: 'V-cache quantization. Match cache_type_k for symmetric. turbo3 = smaller than q8_0.' },
   { name: 'kv_offload', type: 'bool', category: 'KV Cache', default: true, hint: 'Offload KV cache to GPU.' },
+  { name: 'no_kv_offload', type: 'bool', category: 'KV Cache', default: false,
+    hint: 'Keep the KV cache in host RAM instead of VRAM. Frees GPU memory at a large latency cost.' },
   { name: 'kv_unified', type: 'bool', category: 'KV Cache', default: true, hint: 'Unified KV cache layout (auto by default).' },
   { name: 'cache_idle_slots', type: 'bool', category: 'KV Cache', default: true, hint: 'Keep idle slot KV in cache.' },
   { name: 'cache_prompt', type: 'bool', category: 'KV Cache', default: true, hint: 'Cache prompt prefix across requests.' },
@@ -134,6 +137,8 @@ export const FLAGS_SCHEMA: readonly FlagSpec[] = [
   { name: 'split_mode', type: 'enum-string', category: 'MoE / Multi-GPU', default: 'layer',
     enumValues: ['none', 'layer', 'row', 'tensor'], hint: 'Multi-GPU split strategy.' },
   { name: 'main_gpu', type: 'int', category: 'MoE / Multi-GPU', default: 0, bounds: [0, 16], hint: 'Index of main GPU.' },
+  { name: 'tensor_split', type: 'string', category: 'MoE / Multi-GPU',
+    hint: 'Per-GPU weight split as a comma-separated list, e.g. 0.55,0.45. Digits, dots and commas only. The element count must equal the number of visible GPUs or the manager refuses the spawn.' },
   { name: 'fit', type: 'enum-string', category: 'MoE / Multi-GPU', default: 'on',
     enumValues: ['on', 'off'], hint: 'Tom\'s Fork auto-mem-fit toggle.' },
   { name: 'fit_ctx', type: 'int', category: 'MoE / Multi-GPU', default: 4096, bounds: [1, 2_000_000], hint: 'Tom\'s Fork fit-ctx target.' },
@@ -167,26 +172,33 @@ export const FLAGS_SCHEMA: readonly FlagSpec[] = [
   { name: 'adaptive_decay', type: 'float', category: 'Sampling', default: 0.9, bounds: [0.0, 1.0], hint: 'Adaptive sampler decay.' },
   { name: 'ignore_eos', type: 'bool', category: 'Sampling', default: false, hint: 'Ignore EOS token (model keeps generating).' },
 
-  // === Reasoning (preserved-thinking reasoning models) ===
+  // === Reasoning (preserved-thinking) ===
   { name: 'reasoning_format', type: 'enum-string', category: 'Reasoning', default: 'auto',
     enumValues: ['none', 'deepseek', 'deepseek-legacy', 'auto'], hint: 'Reasoning output format (deepseek-r1 style).' },
   { name: 'reasoning', type: 'enum-string', category: 'Reasoning', default: 'auto',
     enumValues: ['on', 'off', 'auto'], hint: 'Reasoning mode.' },
 
-  // === Speculative / MTP (multi-token-prediction; needs a GGUF with a nextn head) ===
-  { name: 'spec_type', type: 'enum-string', category: 'Speculative / MTP', primary: true, default: 'draft-mtp',
-    enumValues: ['draft-mtp'],
-    hint: 'Speculative decode type. draft-mtp = model bundled multi-token-prediction head (faster decode on GGUFs that carry the nextn head). Composes with TurboQuant cache types.' },
-  { name: 'spec_draft_n_max', type: 'int', category: 'Speculative / MTP', default: 3, bounds: [0, 64], hint: 'Max draft tokens proposed per step. MTP default 3. Higher = more speculative, diminishing returns.' },
-  { name: 'spec_draft_n_min', type: 'int', category: 'Speculative / MTP', default: 0, bounds: [0, 64], hint: 'Min draft tokens per step.' },
-  { name: 'spec_draft_p_min', type: 'float', category: 'Speculative / MTP', default: 0.0, bounds: [0.0, 1.0], hint: 'Min probability to continue drafting (0 = always draft n_max).' },
-  { name: 'spec_draft_p_split', type: 'float', category: 'Speculative / MTP', default: 0.0, bounds: [0.0, 1.0], hint: 'Draft tree split probability threshold.' },
-  { name: 'spec_draft_ngl', type: 'int', category: 'Speculative / MTP', default: -1, bounds: [-1, 999], hint: 'Draft GPU layers. Bundled MTP head rides the main model; -1 = same as model.' },
-  { name: 'spec_draft_backend_sampling', type: 'bool', category: 'Speculative / MTP', default: false, hint: 'Backend-side sampling for the draft path (+perf on some setups).' },
+  // === Speculative Decoding: MTP / D-Flash / D-Spark. Single enum-string field so
+  // exactly one drafter can be selected -- MTP and D-Spark are mutually exclusive by construction. ===
+  { name: 'spec_type', type: 'enum-string', category: 'Speculative Decoding', primary: true, dualRender: true, default: 'draft-mtp',
+    enumValues: ['draft-mtp', 'draft-dflash', 'draft-dspark'],
+    hint: 'Speculative decode type (pick at most one). draft-mtp = model-bundled multi-token-prediction head (Qwen3.5/3.6 GGUFs with the nextn head). draft-dflash = standalone D-Flash draft model. draft-dspark = D-Flash + a Markov head (D-Spark is a superset of D-Flash, not an alternative to it) -- use whichever the published draft checkpoint actually implements. Composes with TurboQuant cache types.' },
+  { name: 'spec_draft_n_max', type: 'int', category: 'Speculative Decoding', default: 3, bounds: [0, 64], hint: 'Max draft tokens proposed per step. MTP default 3. Higher = more speculative, diminishing returns.' },
+  { name: 'spec_draft_n_min', type: 'int', category: 'Speculative Decoding', default: 0, bounds: [0, 64], hint: 'Min draft tokens per step.' },
+  { name: 'spec_draft_p_min', type: 'float', category: 'Speculative Decoding', default: 0.0, bounds: [0.0, 1.0], hint: 'Min probability to continue drafting (0 = always draft n_max).' },
+  { name: 'spec_draft_p_split', type: 'float', category: 'Speculative Decoding', default: 0.0, bounds: [0.0, 1.0], hint: 'Draft tree split probability threshold.' },
+  { name: 'spec_draft_ngl', type: 'int', category: 'Speculative Decoding', default: -1, bounds: [-1, 999], hint: 'Draft GPU layers. Bundled MTP head rides the main model; -1 = same as model.' },
+  { name: 'spec_draft_backend_sampling', type: 'bool', category: 'Speculative Decoding', default: false, hint: 'Backend-side sampling for the draft path (+perf on some setups).' },
+  { name: 'spec_draft_type_k', type: 'enum-string', category: 'Speculative Decoding', default: 'f16',
+    enumValues: ['f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1', 'turbo2', 'turbo3', 'turbo4'],
+    hint: 'Draft-cache K quantization. Defaults to f16 regardless of the model cache_type; set it to reclaim draft VRAM.' },
+  { name: 'spec_draft_type_v', type: 'enum-string', category: 'Speculative Decoding', default: 'f16',
+    enumValues: ['f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1', 'turbo2', 'turbo3', 'turbo4'],
+    hint: 'Draft-cache V quantization. Match spec_draft_type_k for symmetric.' },
 
   // === Chat / Template ===
   { name: 'chat_template', type: 'chat-template', category: 'Chat / Template', default: 'default',
-    enumValues: SAFE_CHAT_TEMPLATE_NAMES, hint: 'Built-in template name OR plain string. Jinja constructs ({% / {{) REJECTED (SSTI hardening).' },
+    enumValues: SAFE_CHAT_TEMPLATE_NAMES, hint: 'Built-in template name OR plain string. Jinja constructs ({% / {{) REJECTED (template-injection hardening).' },
   { name: 'jinja', type: 'bool', category: 'Chat / Template', default: true, hint: 'Enable Jinja template processing.' },
   { name: 'skip_chat_parsing', type: 'bool', category: 'Chat / Template', default: false, hint: 'Skip chat-template parsing.' },
   { name: 'special', type: 'bool', category: 'Chat / Template', default: false, hint: 'Output special tokens (BOS/EOS/etc).' },
@@ -221,7 +233,7 @@ export const CATEGORY_ORDER: readonly FlagCategory[] = [
   'MoE / Multi-GPU',
   'Sampling',
   'Reasoning',
-  'Speculative / MTP',
+  'Speculative Decoding',
   'Chat / Template',
   'Server',
   'Debug',
@@ -233,6 +245,13 @@ export function getFlagSpec(name: string): FlagSpec | undefined {
 
 export function getFlagsByCategory(cat: FlagCategory): FlagSpec[] {
   return FLAGS_SCHEMA.filter((f) => f.category === cat);
+}
+
+// Flags that render inside their OWN category section, as opposed to ONLY
+// the ★ Primary block: every non-primary flag in the category, plus any
+// primary flag explicitly marked `dualRender` (today: spec_type only).
+export function getCategorySectionFlags(cat: FlagCategory): FlagSpec[] {
+  return getFlagsByCategory(cat).filter((f) => !f.primary || f.dualRender);
 }
 
 // DENIED flag categories (informational — for FE error messages when a flag

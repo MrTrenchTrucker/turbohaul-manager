@@ -50,12 +50,40 @@ def _make_handle(model_tag: str, port: int) -> SidecarHandle:
     return SidecarHandle(proc=proc, port=port, model_tag=model_tag)
 
 
+def _write_manifest_yaml(manifests_root, tag: str) -> None:
+    """Minimal valid manifest so read_manifest() finds the tag. Mirrors
+    tests/test_api_chat_completion.py (_write_manifest_yaml) -- the
+    chat/completions and api/chat routes 404 on an unknown model tag (a real,
+    intentional product guard), so every /api/chat call here needs a
+    registered tag: without one the call would 404 on that guard rather than
+    exercise the tool-calling contract."""
+    (manifests_root / f"{tag}.yaml").write_text(
+        f"""model_tag: {tag}
+gguf_blob_sha256: "{'a' * 64}"
+gguf_size_bytes: 1000
+"""
+    )
+
+
+# Every model tag any test in this file sends in a request payload (the
+# "test-model" inside _openai_response_with's canned response dict is the
+# fake completion's OWN "model" field, not a request -- not listed here).
+_ALL_TEST_MODEL_TAGS = ("test-model", "broken-model", "plain", "x", "big-model", "m")
+
+
 def _build_app(tmp_path, fake_complete):
     storage_root = tmp_path / "state"
     storage_root.mkdir()
     (storage_root / "blobs").mkdir()
     (storage_root / "manifests").mkdir()
     (storage_root / "import-staging").mkdir()
+    # /api/chat has a real read_manifest() 404 gate
+    # (chat_completion.py) for any unregistered model tag. Seed a
+    # manifest for every tag this file's tests use so each test genuinely
+    # exercises the tool-calling contract past that gate, instead of dying
+    # on it before reaching the code under test.
+    for _tag in _ALL_TEST_MODEL_TAGS:
+        _write_manifest_yaml(storage_root / "manifests", _tag)
     boot = BootConfig(
         server=ServerConfig(),
         storage=StorageConfig(
@@ -71,7 +99,7 @@ def _build_app(tmp_path, fake_complete):
         ui=UIConfig(static_path=tmp_path / "ui"),
     )
     runtime = RuntimeConfig(
-        queue=QueueConfig(
+        queue=QueueConfig(safety_enabled=False,
             grace_seconds=0,
             idle_hot_load_seconds=0,
             drained_sigterm_window_active_s=1,
@@ -338,8 +366,7 @@ def test_f_error_guard_passthrough(tmp_path):
 
 def test_g_openai_path_no_stream_only_leak(tmp_path):
     """Non-streaming /v1/chat/completions request with tools must NOT cause
-    _complete to forward stream-only knobs. Verifies the common/stream-only
-    knob split is wired."""
+    _complete to forward stream-only knobs. Verifies the common/stream-only knob split is wired."""
     captured = {}
     async def fc(slot, handle):
         # Re-create the payload the production _complete would build by

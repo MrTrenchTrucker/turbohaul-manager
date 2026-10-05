@@ -2,7 +2,6 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from turbohaul import __version__
 from turbohaul.api.main import _CSP_HEADER, create_app
 from turbohaul.config import (
     BootConfig,
@@ -38,7 +37,7 @@ def app_and_client(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),  # missing dir → no /ui route
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     app = create_app(boot, runtime, auto_start_worker=False, auto_boot_reconcile=False)
     with TestClient(app) as client:
         yield app, client
@@ -81,7 +80,7 @@ def app_and_client_with_ui(tmp_path):
         ),
         ui=UIConfig(static_path=ui_dist),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     app = create_app(boot, runtime, auto_start_worker=False, auto_boot_reconcile=False)
     with TestClient(app) as client:
         yield app, client, ui_dist
@@ -94,7 +93,11 @@ class TestHealth:
         assert r.status_code == 200
         body = r.json()
         assert body["status"] == "ok"
-        assert body["version"] == __version__
+        # Pinned to the literal shipped version ON PURPOSE. Comparing the response to
+        # `__version__`, the very constant the app reads, could not fail on a
+        # version bump, so the package version could drift unnoticed from the
+        # documented release. Bump this deliberately.
+        assert body["version"] == "0.8.0"
 
 
 class TestStatus:
@@ -117,7 +120,11 @@ class TestApiVersion:
         r = client.get("/api/version")
         assert r.status_code == 200
         body = r.json()
-        assert body["version"] == __version__
+        # Pinned to the literal shipped version ON PURPOSE. Comparing the response to
+        # `__version__`, the very constant the app reads, could not fail on a
+        # version bump, so the package version could drift unnoticed from the
+        # documented release. Bump this deliberately.
+        assert body["version"] == "0.8.0"
         assert body["api_compat"] == "ollama-superset"
         assert "Ollama-compatible" in body["user_agent"]
         assert body["backend_sha_pinned"] is False
@@ -279,11 +286,11 @@ class TestUIPathTraversal:
 class TestProductionWiring:
     """Asserts create_app() injects real factory functions into TurbohaulManager.
 
-    This test class exists because an earlier release shipped with `complete_fn`
-    NOT wired in production: api/main.py constructed TurbohaulManager(boot, runtime)
-    without passing complete_fn=, so the default raised
+    This test class guards against `complete_fn` being left unwired in production:
+    if api/main.py constructed TurbohaulManager(boot, runtime)
+    without passing complete_fn=, the default would raise
     'no completion_fn wired' on every real /v1/chat/completions request.
-    All 322+ existing tests passed because each one explicitly injected its own
+    Other tests would not notice, because each one explicitly injects its own
     mock factory.
 
     Lesson: pytest assertions on the management plane do NOT cover the
@@ -294,9 +301,9 @@ class TestProductionWiring:
     def test_complete_fn_is_wired_not_default(self, app_and_client):
         """create_app() must inject a real make_llama_server_complete_fn() callable.
 
-        Caught in a smoke test: the default complete_fn raised
-        'no completion_fn wired' on the first chat completion. The fix wired
-        make_llama_server_complete_fn() into manager construction.
+        The default complete_fn raises 'no completion_fn wired' on the first
+        chat completion, so make_llama_server_complete_fn() must be wired
+        into manager construction.
         """
         app, _ = app_and_client
         mgr = app.state.manager

@@ -156,6 +156,7 @@ class Keys:
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
         TARGET_LAYERS                     = "{arch}.target_layers"
         TARGET_HIDDEN_SIZE                = "{arch}.target_hidden_size"
+        BLOCK_SIZE                        = "{arch}.block_size"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
 
     class Attention:
@@ -516,6 +517,7 @@ class MODEL_ARCH(IntEnum):
     PANGU_EMBED      = auto()
     MISTRAL3         = auto()
     EAGLE3           = auto()
+    DFLASH           = auto()
     MISTRAL4         = auto()
     PADDLEOCR        = auto()
     MIMO2            = auto()
@@ -917,6 +919,10 @@ class MODEL_TENSOR(IntEnum):
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
+    # dspark
+    DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
+    DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
+    DSPARK_CONF_PROJ       = auto()  # confidence head
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1073,6 +1079,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.PANGU_EMBED:      "pangu-embedded",
     MODEL_ARCH.MISTRAL3:         "mistral3",
     MODEL_ARCH.EAGLE3:           "eagle3",
+    MODEL_ARCH.DFLASH:           "dflash",
     MODEL_ARCH.MISTRAL4:         "mistral4",
     MODEL_ARCH.PADDLEOCR:        "paddleocr",
     MODEL_ARCH.MIMO2:            "mimo2",
@@ -1499,6 +1506,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
     MODEL_TENSOR.FC:                        "fc",
+    MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
+    MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
+    MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
     MODEL_TENSOR.D2T:                       "d2t",
 }
 
@@ -4084,6 +4094,26 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FC,
         MODEL_TENSOR.D2T,
+    ],
+    MODEL_ARCH.DFLASH: [
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FC,
+        MODEL_TENSOR.ENC_OUTPUT_NORM,
+        # optional DSpark heads
+        MODEL_TENSOR.DSPARK_MARKOV_W1,
+        MODEL_TENSOR.DSPARK_MARKOV_W2,
+        MODEL_TENSOR.DSPARK_CONF_PROJ,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,

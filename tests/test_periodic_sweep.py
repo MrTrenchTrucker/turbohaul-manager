@@ -44,7 +44,7 @@ def _make_app(tmp_path, sweep_interval_s=60, sweep_min_age_s=86400):
         ui=UIConfig(static_path=tmp_path / "ui"),
     )
     runtime = RuntimeConfig(
-        queue=QueueConfig(
+        queue=QueueConfig(safety_enabled=False,
             grace_seconds=0, idle_hot_load_seconds=0,
             drained_sigterm_window_active_s=1, drained_sigterm_window_cold_s=1,
             background_sweep_interval_s=sweep_interval_s,

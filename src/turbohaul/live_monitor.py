@@ -31,7 +31,11 @@ from collections import OrderedDict
 
 import httpx
 
-from turbohaul.safety import _read_free_vram_all_mib, _read_total_vram_all_mib
+from turbohaul.safety import (
+    _read_free_vram_all_mib,
+    _read_gpu_util_all_percent,
+    _read_total_vram_all_mib,
+)
 from turbohaul.state import utcnow_iso
 
 
@@ -339,6 +343,15 @@ class LiveSlotsPoller:
             except Exception:  # noqa: BLE001
                 self._mgr._vram_total_mib = None
                 log.warning("VRAM total probe failed — setting _vram_total_mib=None")
+
+        # Per-GPU utilization %, same off-loop cache discipline as
+        # free VRAM above (re-probed every tick, degrades to None, never
+        # blocks the loop) — feeds the MAKE_ROOM_STARVED observability fields.
+        try:
+            self._mgr._gpu_util_pct = await asyncio.to_thread(_read_gpu_util_all_percent)
+        except Exception:  # noqa: BLE001 -- probe failure -> null, never stale/raise
+            self._mgr._gpu_util_pct = None
+            log.warning("GPU util probe failed — setting _gpu_util_pct=None")
 
         # Telemetry — VRAM + process memory sample
         try:
@@ -853,7 +866,45 @@ class LiveResidentsSupervisor:
     def _update_primary_alias(self, residents) -> None:
         """Mirror the most-recently-active resident's generation into the back-compat
         ``live_generation`` alias (None -> status_snapshot/live_stream fall back to
-        idle). 'Most recently active' matches the dispatcher's warm-hint notion."""
+        idle). 'Most recently active' matches the dispatcher's warm-hint notion.
+
+        A swap can leave ``residents`` genuinely empty for
+        one tick -- the outgoing resident already evicted, the incoming one not yet
+        registered -- because the VRAM probes run off-loop, which
+        makes this window observable by this supervisor (a loop that is starved
+        would never sample it). Nulling the alias in that window
+        is indistinguishable, to every consumer, from "nothing is loaded": the FE's
+        SSE anchor stream (api/live_stream.py's ``_current_anchor``) reads ``None``
+        and fires ``idle: true, reset: true`` -- the exact symptom this guard exists to
+        cure. Holding the alias for that one tick avoids it.
+
+        ``mgr._reserving_model_tag`` already names this window
+        precisely: it is set for the ENTIRE ``_route_or_reserve`` critical section
+        (its sole caller) and cleared in that context manager's own ``finally`` on
+        every exit -- so by the time it reads back ``None`` here, either (a) a
+        reservation completed and the new Resident is already registered in
+        ``self._residents`` (inserted synchronously, before the driver is handed to
+        its background task and before ``_route_or_reserve`` returns -- see
+        ``_reserve_and_start_locked``, no ``await`` in between), so the very next
+        tick republishes a real entry for it before ``best`` can go stale, or (b)
+        the reservation was deferred/requeued and there genuinely is nothing to
+        report yet. Only case (a)-in-progress needs holding; this guard is scoped to
+        exactly that by keying on the marker, not on a cap or a clock.
+
+        HOLD, not synthesize: the sibling top-level surface (``status_snapshot``'s
+        ``loading_info``, manager.py) follows the same rule -- it shows the old
+        model name once a new model is known to be incoming, and keeps showing it
+        until the VRAM drops -- i.e. hold, don't invent.
+        Publishing a synthesized entry for
+        the incoming tag here would give the SSE anchor a generation_id with no
+        content yet (the real id needs a PID that doesn't exist until the driver
+        spawns), firing a reset now and a SECOND reset when the real block replaces
+        it -- the exact flap shape ``_store``'s TRANSIENT_HOLD_TICKS/FLAP DEBOUNCE
+        above already fights for a different reason. Holding fires zero resets: the
+        SSE anchor is unchanged, and at cap>=2 the outgoing resident is normally
+        already idle at the moment it is evicted (eviction targets
+        IDLE_EVICTABLE), so the held block is usually already idle-shaped anyway.
+        """
         mgr = self._mgr
         best = None
         best_t: float | None = None
@@ -864,6 +915,12 @@ class LiveResidentsSupervisor:
             t = getattr(r, "last_active_monotonic", 0.0)
             if best_t is None or t > best_t:
                 best, best_t = g, t
+        if best is None and mgr._reserving_model_tag is not None:
+            # A reservation is in flight for this tick's empty registry -- hold
+            # whatever live_generation already is rather than nulling it. Once the
+            # reservation lands (or is abandoned), the next tick's own poll result
+            # decides the alias normally; this is a skip, not a second write path.
+            return
         mgr.live_generation = best
 
     async def _refresh_vram(self) -> None:
@@ -871,7 +928,28 @@ class LiveResidentsSupervisor:
         status_snapshot reads the cache await-free. Probe failure -> None (vram[]
         becomes null, never stale). Skip once shutdown has begun so we don't kick off
         a fresh nvidia-smi thread that would outlive the cancelled supervisor (the
-        subprocess has its own 5s timeout, but starting one at teardown is wasteful)."""
+        subprocess has its own 5s timeout, but starting one at teardown is wasteful).
+
+        Also caches per-GPU utilization % the same way, every tick
+        (never one-time -- utilization changes constantly, unlike total
+        capacity). NOTE: this class does NOT do a one-time boot read of TOTAL
+        VRAM the way LiveSlotsPoller._refresh_vram does -- a boot-time VRAM
+        read is not done here, and
+        none is needed:
+        ``_vram_total_mib`` is populated independently of this poller, by
+        ``_begin_unload_locked`` via ``self._vram_total_mib_fn`` under
+        ``_registry_lock`` the first time a resident with
+        ``reserved_need_mib > 0`` is unloaded (manager.py, immediately after
+        that same call credits ``_pending_reclaim_mib`` -- credit cannot
+        exist without the populate having already been attempted). See the
+        ``_vram_total_mib_fn`` comment in ``TurbohaulManager.__init__``
+        (manager.py): it exists specifically to decouple the orphan-credit
+        reconciler from this poller asymmetry ENTIRELY (a known asymmetry
+        between the two pollers). So the
+        ``gpu{i}_vram_total_mib=`` field reads ``unavailable`` only until the
+        first such eviction on a given card, same as every other consumer of
+        ``_vram_total_mib`` in this file -- not a new or permanent
+        gap."""
         if self._mgr._stop_event.is_set():
             return
         try:
@@ -879,6 +957,12 @@ class LiveResidentsSupervisor:
         except Exception:  # noqa: BLE001 -- probe failure -> null, never stale/raise
             self._mgr._vram_free_mib = None
             log.warning("VRAM free probe failed — setting _vram_free_mib=None")
+
+        try:
+            self._mgr._gpu_util_pct = await asyncio.to_thread(_read_gpu_util_all_percent)
+        except Exception:  # noqa: BLE001 -- probe failure -> null, never stale/raise
+            self._mgr._gpu_util_pct = None
+            log.warning("GPU util probe failed — setting _gpu_util_pct=None")
 
     async def _close_all(self) -> None:
         for poller in list(self._pollers.values()):

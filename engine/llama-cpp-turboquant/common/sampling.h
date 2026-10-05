@@ -46,9 +46,6 @@ void                    common_sampler_accept(struct common_sampler * gsmpl, lla
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 
-// expose the reasoning-budget sampler from the PIMPL struct (used by stale-tail computation)
-const struct llama_sampler * common_sampler_get_rbudget(const struct common_sampler * gsmpl);
-
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 
@@ -92,6 +89,10 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
+
+// get the reasoning budget (max tokens in reasoning block) from the main sampler.
+// returns 0 if no reasoning budget is configured.
+int32_t common_sampler_get_reasoning_budget(const struct common_sampler * gsmpl);
 
 // helpers
 

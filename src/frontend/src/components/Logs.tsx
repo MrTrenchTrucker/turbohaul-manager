@@ -52,7 +52,7 @@ export default function Logs() {
     <div className="space-y-4">
       <h2 className="text-xl font-semibold text-slate-200">Logs</h2>
       <div className="rounded border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-400">
-        <span className="text-slate-300 font-medium">Server-side redaction:</span> keys <span className="font-mono text-slate-300">{`{${REDACTED_KEYS.join(', ')}}`}</span> are stripped before transmission per ARCHITECTURE.md §11.3 — these fields will never appear in payload below.
+        <span className="text-slate-300 font-medium">Server-side redaction:</span> keys <span className="font-mono text-slate-300">{`{${REDACTED_KEYS.join(', ')}}`}</span> are stripped before transmission per ARCHITECTURE.md §8 — these fields will never appear in payload below.
       </div>
       <div className="flex flex-wrap items-end gap-3 rounded border border-slate-700 bg-slate-950 p-3">
         <label className="text-xs text-slate-400">slot_id

@@ -178,9 +178,9 @@ def test_restore_no_identity():
 def test_filename_round_trip():
     """CRITICAL: meta path derived from bin path must match kv_meta_fn output.
     Round-trip safe regardless of port/hash layout."""
-    bin_fn = kv_save_fn('model-27b', 0, 'c0c7d0e9a892e790', port=11500)
+    bin_fn = kv_save_fn('qwen3.6-27b', 0, 'c0c7d0e9a892e790', port=11500)
     meta_from_bin = bin_fn[:-4] + '.json'
-    meta_from_save = kv_meta_fn('model-27b', 0, 'c0c7d0e9a892e790', port=11500)
+    meta_from_save = kv_meta_fn('qwen3.6-27b', 0, 'c0c7d0e9a892e790', port=11500)
     assert meta_from_bin == meta_from_save, (
         f"ROUND-TRIP BREAK: restore looks for '{meta_from_bin}' "
         f"but save wrote '{meta_from_save}'"
@@ -203,7 +203,7 @@ def test_restore_prefix_validity_drives_decision():
     tid = 'agent-ip-192.168.1.10'
     base = [_SYS, _U1, _A1]
     # Real extension: incoming extends the saved chain -> RESTORE (prefix-valid)
-    ext = resolve_kv('restore', {'thread_id': tid, 'model_tag': 'm'}, {
+    ext = resolve_kv('restore', {'thread_id': tid, 'model_tag': 'qwen'}, {
         'saved_tokens': 153953, 'saved_len': 434593, 'incoming_len': 436000,
         'saved_thread_id': tid,
         'saved_chain': _prefix_hash_chain(base),
@@ -211,7 +211,7 @@ def test_restore_prefix_validity_drives_decision():
     })
     assert ext.do_it and ext.resolved_from == 'restore-prefix-valid'
     # Diverged early turn: NOT a prefix -> FRESH regardless of size
-    div = resolve_kv('restore', {'thread_id': tid, 'model_tag': 'm'}, {
+    div = resolve_kv('restore', {'thread_id': tid, 'model_tag': 'qwen'}, {
         'saved_tokens': 153953, 'saved_len': 434593, 'incoming_len': 500000,
         'saved_thread_id': tid,
         'saved_chain': _prefix_hash_chain(base),
@@ -278,6 +278,137 @@ def test_prefix_hash_chain_parity_with_pre_refactor_manager():
         'a163094adce482cb90c2d8e675be2aa3aefe43b88e6cc73b9ad0cb758c65f1ca',
         '4f510d12b3ea4e47d92f96d7791cc6d491192f26e2fabb9308bf457e994877ee',
     ]
+
+
+# --- Tool-call identity: the chain hash must SEE tool-call
+# identity, not just role+content. Every pair below is CAUSAL in both
+# directions: a difference that should be detected IS detected, and a
+# non-difference does NOT spuriously trip the hash (a hash that always
+# differs would pass the "detects a real difference" tests trivially and
+# destroy all legitimate reuse -- that is exactly the failure mode
+# test_prefix_hash_chain_tool_calls_identical_still_matches exists to rule
+# out). ------------------------------------------------------------------
+
+def _old_pre_fix_chain(context):
+    """Reproduces the PRE-fix formula verbatim (role+content only, no
+    tool-call fields) so tests can assert against it directly instead of a
+    hardcoded literal -- this IS the compatibility claim under test, not an
+    assumption: a fresh chain computed today under the OLD formula for a
+    tool-bearing context is what an existing on-disk bin's stamped
+    hash_chain looks like, and the new function must diverge from it at
+    exactly the tool-bearing turn."""
+    import hashlib as _hashlib
+    import json as _json
+    chain = []
+    prev = ""
+    for turn in context:
+        if isinstance(turn, dict):
+            content = turn.get("content", "")
+            role = turn.get("role", "")
+        else:
+            content = str(turn)
+            role = ""
+        if isinstance(content, (list, dict)):
+            content = _json.dumps(content, sort_keys=True, separators=(',', ':'))
+        raw = f"{prev}\x00{role}\x00{content}"
+        h = _hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+        chain.append(h)
+        prev = h
+    return chain
+
+
+def test_prefix_hash_chain_tool_calls_arguments_differ_hashes_differ():
+    """CAUSAL direction 1: same tool, DIFFERENT arguments -> different hash
+    at that turn and every turn after it. This is the exact defect shape: a
+    restore claiming more tokens than the prompt it served."""
+    base = [_SYS, {'role': 'user', 'content': 'search for cats'}]
+    call_a = base + [{'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function',
+         'function': {'name': 'search', 'arguments': '{"q":"foo"}'}}]}]
+    call_b = base + [{'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function',
+         'function': {'name': 'search', 'arguments': '{"q":"bar"}'}}]}]
+    chain_a = _prefix_hash_chain(call_a)
+    chain_b = _prefix_hash_chain(call_b)
+    assert chain_a[:2] == chain_b[:2], "turns before the divergence must still match"
+    assert chain_a[2] != chain_b[2], "differing tool_calls.arguments produced the SAME hash"
+
+
+def test_prefix_hash_chain_tool_call_name_differs_hashes_differ():
+    """CAUSAL direction 1b: same arguments shape, DIFFERENT tool name."""
+    base = [_SYS]
+    call_a = base + [{'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function', 'function': {'name': 'search', 'arguments': '{}'}}]}]
+    call_b = base + [{'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function', 'function': {'name': 'delete', 'arguments': '{}'}}]}]
+    assert _prefix_hash_chain(call_a)[-1] != _prefix_hash_chain(call_b)[-1]
+
+
+def test_prefix_hash_chain_legacy_function_call_differs_hashes_differ():
+    """CAUSAL direction 1c: the pre-tool_calls legacy singular `function_call`
+    shape is equally blind pre-fix and must be equally covered."""
+    base = [_SYS]
+    call_a = base + [{'role': 'assistant', 'content': None,
+                       'function_call': {'name': 'search', 'arguments': '{"q":"foo"}'}}]
+    call_b = base + [{'role': 'assistant', 'content': None,
+                       'function_call': {'name': 'search', 'arguments': '{"q":"bar"}'}}]
+    assert _prefix_hash_chain(call_a)[-1] != _prefix_hash_chain(call_b)[-1]
+
+
+def test_prefix_hash_chain_tool_call_id_differs_hashes_differ():
+    """CAUSAL direction 1d: a role="tool" result answering a DIFFERENT call
+    (different tool_call_id) at an otherwise-identical position."""
+    base = [_SYS, {'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function', 'function': {'name': 'search', 'arguments': '{}'}},
+        {'id': 'call_2', 'type': 'function', 'function': {'name': 'search', 'arguments': '{}'}},
+    ]}]
+    result_a = base + [{'role': 'tool', 'tool_call_id': 'call_1', 'content': 'result text'}]
+    result_b = base + [{'role': 'tool', 'tool_call_id': 'call_2', 'content': 'result text'}]
+    assert _prefix_hash_chain(result_a)[-1] != _prefix_hash_chain(result_b)[-1]
+
+
+def test_prefix_hash_chain_tool_calls_identical_still_matches():
+    """CAUSAL direction 2, the one that earns its keep: two GENUINELY
+    identical tool-calling requests must still hash the SAME. A hash that
+    always differs would pass every test above trivially while destroying
+    all legitimate reuse."""
+    ctx_1 = [_SYS, {'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function', 'function': {'name': 'search', 'arguments': '{"q":"foo"}'}}]}]
+    ctx_2 = [_SYS, {'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function', 'function': {'name': 'search', 'arguments': '{"q":"foo"}'}}]}]
+    assert _prefix_hash_chain(ctx_1) == _prefix_hash_chain(ctx_2)
+
+
+def test_prefix_hash_chain_text_only_context_unaffected_by_fix():
+    """BACKWARD COMPATIBILITY, proven not asserted: for a context with NO
+    tool_calls/function_call/tool_call_id anywhere, the new function's output
+    is byte-identical to the pre-fix formula -- an ordinary text-only saved
+    bin's stamped hash_chain still matches on restore after this fix ships.
+    (test_prefix_hash_chain_known_vector_pin and
+    test_prefix_hash_chain_parity_with_pre_refactor_manager already prove
+    this for their specific fixtures and are UNCHANGED by this fix; this test
+    proves the general claim against _old_pre_fix_chain directly.)"""
+    ctx = [_SYS, _U1, _A1, _U2]
+    assert _prefix_hash_chain(ctx) == _old_pre_fix_chain(ctx)
+
+
+def test_prefix_hash_chain_tool_bearing_context_diverges_from_pre_fix():
+    """THE COMPATIBILITY CLAIM UNDER TEST: a context that DOES carry a
+    tool-calling turn produces a DIFFERENT chain than the pre-fix formula
+    would for the same input -- proving an existing on-disk bin whose stamped
+    hash_chain covers a tool-calling turn will MISS (safe: _is_prefix_match
+    fails closed, triggers a full reprefill) against a freshly-computed
+    chain post-fix, not silently mis-match. This is
+    the deliberate, safe half of the compatibility answer."""
+    ctx = [_SYS, {'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function', 'function': {'name': 'search', 'arguments': '{"q":"foo"}'}}]}]
+    new_chain = _prefix_hash_chain(ctx)
+    old_chain = _old_pre_fix_chain(ctx)
+    assert new_chain[0] == old_chain[0], "the turn BEFORE the tool call must still match"
+    assert new_chain[1] != old_chain[1], "the tool-bearing turn must diverge from the pre-fix hash"
+    # and _is_prefix_match must actually treat that as a real mismatch, not
+    # just differing hex strings that happen to compare unequal in isolation:
+    assert _is_prefix_match(old_chain, new_chain) is False
 
 
 def test_is_prefix_match_saved_equals_incoming():

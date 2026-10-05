@@ -33,11 +33,24 @@ def _slot(*, is_processing, n_prompt, n_prompt_proc, n_decoded):
 
 
 def test_prefill_pct_during_prefill():
+    # "prefill" state (and prompt_progress) is keyed on a LIVE per-tick delta
+    # (dproc > 0 this tick), not a static proc<n_prompt comparison — a single
+    # sample has no prior baseline to diff against, so dproc is always 0 on
+    # it regardless of the numbers involved. Establish a baseline tick first
+    # (0 processed) so the real tick under test has something to diverge
+    # from — this exercises the actual delta computation instead of
+    # bypassing it.
+    poller = _poller()
+    poller._compute(
+        [_slot(is_processing=True, n_prompt=200, n_prompt_proc=0, n_decoded=0)],
+        resp_t=0.0, pid=123, spawn_seq=1, thread_or_slot="t",
+    )
     # mid-prefill: 50 of 200 prompt tokens processed, no output yet.
-    gen = _poller()._compute(
+    gen = poller._compute(
         [_slot(is_processing=True, n_prompt=200, n_prompt_proc=50, n_decoded=0)],
         resp_t=1.0, pid=123, spawn_seq=1, thread_or_slot="t",
     )
+    assert gen["state"] == "prefill"
     assert gen["prefill_pct"] == 25
     # distinct from the existing fractional prompt_progress
     assert gen["prompt_progress"] == 0.25

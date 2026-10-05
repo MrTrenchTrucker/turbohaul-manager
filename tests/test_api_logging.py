@@ -48,7 +48,7 @@ def app_test(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     app = create_app(boot, runtime, auto_start_worker=False, auto_boot_reconcile=False)
     with TestClient(app) as client:
         yield app, client

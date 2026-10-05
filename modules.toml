@@ -1,0 +1,33 @@
+# TurboHaul module registry (decisions/ADR-001). Code outside a registered module is legacy until it is moved into one.
+# Changes to this file change module interfaces and should be reviewed as such. Checked by tools/sop_check.py.
+[project]
+name = "turbohaul-manager"
+line_cap_soft = 300
+line_cap_hard = 500
+# architecture_word_budget: the most words ARCHITECTURE.md may have, counted by tools/sop_check.py (it splits the file on
+# whitespace). A no-growth ratchet: it may shrink, never grow. Trimming the document is separate work.
+architecture_word_budget = 13996
+
+[modules.engine_launch]
+path = "src/turbohaul/engine_launch"
+owns = "The environment each engine (llama-server) process is started with, including which GPU a vision model's projector uses"
+does_not_own = "Choosing the card or split for a model (manager.py placement), building the engine's command-line flags (manifest.py / manager.py argv), starting, health-checking and stopping the process (subprocess_mgr.py), the engine source (engine/)"
+depends_on = []
+public = ["launch_env", "preset_device_mismatch"]
+card = "src/turbohaul/engine_launch/AGENTS.md"
+
+[modules.engine_budget]
+path = "src/turbohaul/engine_budget"
+owns = "How many engine (sidecar) processes one model may run at the same time, from the box-wide max_parallel_sidecars budget and the cards the model fits on (decisions/ADR-002)"
+does_not_own = "Which card an engine goes on (manager.py placement), the context windows inside one engine and the context size (manifest llama_server_flags), measuring the inputs (manager.py), starting and stopping engines (subprocess_mgr.py), migrating saved manifests (manifest.py)"
+depends_on = []
+public = ["EngineBudgetInputs", "EngineBudget", "effective_engine_cap", "context_window_capacity"]
+card = "src/turbohaul/engine_budget/AGENTS.md"
+
+[modules.fastlane_client_names]
+path = "src/turbohaul/fastlane_client_names"
+owns = "Which confirmed container name the Fast Lane Discovered list may show for a client address: candidates from a reverse lookup answer, forward confirmation, shortest wins (decisions/ADR-003)"
+does_not_own = "Doing the lookups, their cache, backoff and background task (legacy code beside fastlane_resolve.py), address normalization (fastlane.py), the census and its field (manager.py), matching requests to rules, the frontend"
+depends_on = []
+public = ["name_candidates", "confirmed_name"]
+card = "src/turbohaul/fastlane_client_names/AGENTS.md"

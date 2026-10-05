@@ -733,7 +733,7 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     return size_s_bytes;
 }
 
-void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, size_t max_cells) const {
     GGML_UNUSED(flags);
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
@@ -745,6 +745,18 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     uint32_t cell_range_begin = size;
     for (uint32_t i = 0; i < size; ++i) {
         const auto & cell = cells[i];
+        // TURBOQUANT: optional position cap -- save only cells [0, max_cells)
+        // so a truncated save yields a CONSISTENT bin (header N, tokens N, cells [0, N)).
+        // Filter on the cell's logical position (cell.pos), which may differ from the
+        // buffer index after shifts. Default SIZE_MAX = full sequence, byte-identical
+        // to prior behaviour.
+        if (max_cells != SIZE_MAX && (uint32_t) cell.pos >= (uint32_t) max_cells) {
+            if (cell_range_begin != size) {
+                cell_ranges.emplace_back(cell_range_begin, i);
+                cell_range_begin = size;
+            }
+            continue;
+        }
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
             ++cell_count;
             uint32_t rs_idx_cur = 0;

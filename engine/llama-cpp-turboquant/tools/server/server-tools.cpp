@@ -133,7 +133,7 @@ struct server_tool_read_file : server_tool {
             {"function", {
                 {"name", name},
                 {"description", "Read the contents of a file. Optionally specify a 1-based line range. "
-                                "If append_loc is true, each line is prefixed with its line number (e.g. \"1\u2192 ...\")."},
+                                "If append_loc is true, each line is prefixed with its line number (e.g. \"1\u2192...\")."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
@@ -181,7 +181,7 @@ struct server_tool_read_file : server_tool {
 
             std::string out_line;
             if (append_loc) {
-                out_line = std::to_string(lineno) + "\u2192 " + line + "\n";
+                out_line = std::to_string(lineno) + "\u2192" + line + "\n";
             } else {
                 out_line = line + "\n";
             }
@@ -568,9 +568,13 @@ struct server_tool_edit_file : server_tool {
             }
             int n = (int) lines.size();
             if (e.line_start == -1) {
-                // -1 means end of file; line_end is ignored — normalize to point past last line
-                e.line_start = n + 1;
-                e.line_end   = n + 1;
+                // -1 targets end of file -> valid for append only; line_end is ignored
+                if (e.mode != "append") {
+                    return {{"error", "line_start -1 (end of file) is only valid for append mode"}};
+                }
+                // append at end of file: insert position is the current line count
+                e.line_start = n;
+                e.line_end   = n;
             } else {
                 if (e.line_start < 1 || e.line_end < e.line_start) {
                     return {{"error", string_format("invalid line range [%d, %d]", e.line_start, e.line_end)}};
@@ -611,8 +615,8 @@ struct server_tool_edit_file : server_tool {
             } else if (e.mode == "delete") {
                 lines.erase(lines.begin() + idx_start, lines.begin() + idx_end + 1);
             } else { // append
-                // idx_end + 1 may equal lines.size() when line_start == -1 (end of file)
-                lines.insert(lines.begin() + idx_end + 1, new_lines.begin(), new_lines.end());
+                // insert after idx_end; idx_end + 1 == lines.size() for end-of-file append
+                lines.insert(lines.begin() + (idx_end + 1), new_lines.begin(), new_lines.end());
             }
         }
 

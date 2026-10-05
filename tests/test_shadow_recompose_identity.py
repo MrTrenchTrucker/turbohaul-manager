@@ -12,7 +12,7 @@ import hashlib
 
 from turbohaul.api.chat_completion import _shadow_recompose_identity as recompose
 
-BASE = "agent-ip-10.0.0.5-abc123def456"  # a realistic IP-fallback base
+BASE = "agent-ip-10.0.0.7-abc123def456"  # a realistic IP-fallback base
 
 
 def _check(name, cond):

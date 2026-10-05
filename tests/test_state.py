@@ -60,7 +60,7 @@ class TestSlotOps:
                 conn,
                 {
                     "slot_id": "slot-1",
-                    "model_tag": "example-35b-moe",
+                    "model_tag": "qwen3.6-35b-moe",
                     "state": "STAGED",
                 },
             )
@@ -71,7 +71,7 @@ class TestSlotOps:
                 conn,
                 {
                     "slot_id": "slot-1",
-                    "model_tag": "example-35b-moe",
+                    "model_tag": "qwen3.6-35b-moe",
                     "state": "ACTIVE",
                     "pid": 12345,
                     "port": 11500,
@@ -174,7 +174,7 @@ class TestReconcileOrphanedSlots:
             assert row["end_reason"] == "boot-reconcile-orphaned-pid"
 
     def test_marks_pid_null_pre_active_orphans_cold(self, tmp_path):
-        """GRIP H-2: slots with pid=NULL in pre-active state are reconciled."""
+        """Slots with pid=NULL in pre-active state are reconciled."""
         with state_db_session(tmp_path / "state.sqlite") as conn:
             upsert_slot(
                 conn, {"slot_id": "s_staged", "model_tag": "m", "state": "STAGED"}

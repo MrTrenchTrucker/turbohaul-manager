@@ -1,7 +1,6 @@
-# Turbohaul-Manager cuda-multi -- broad-architecture variant.
-# Compiles the vendored TurboQuant engine (engine/llama-cpp-turboquant) FROM SOURCE
-# with CUDA arches covering Turing through Blackwell
-# (sm_75 / sm_80 / sm_86 / sm_89 / sm_90 / sm_120).
+# Turbohaul-Manager cuda-multi — broad-architecture variant.
+# Compiles the vendored TurboQuant llama-server FROM SOURCE with CUDA arches covering
+# Turing through Blackwell (sm_75 / sm_80 / sm_86 / sm_89 / sm_90 / sm_120).
 # One image, works on ~99% of CUDA-capable consumer/prosumer NVIDIA cards
 # 2018+ (GTX 16-series and later).
 #
@@ -22,7 +21,7 @@ COPY src/frontend/. ./
 RUN npm run typecheck && npm run build
 
 # ----------------------------------------------------------------------------
-# Stage 2: Compile the vendored TurboQuant engine from source for 6 GPU arches.
+# Stage 2: Compile the vendored TurboQuant llama-server from source for 6 GPU arches.
 # CUDA_ARCHITECTURES is expanded to cover Turing through Blackwell.
 # ----------------------------------------------------------------------------
 FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS llama-binary
@@ -68,6 +67,12 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
 # ----------------------------------------------------------------------------
 FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS runtime
 
+# ffmpeg/ffprobe are deliberately NOT apt-installed here (video
+# decoding is served by an external plugin container through the manager's
+# plugin routing, not local media tooling). Still images (stb_image) and audio
+# (miniaudio) are compiled into the engine and never needed ffmpeg. The
+# ffmpeg/ffprobe PATH entries the engine forks (mtmd-helper.cpp:921-924) are
+# provided below by the PATH shim, not by apt.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       python3.11 python3.11-venv python3.11-dev \
@@ -91,11 +96,48 @@ RUN /opt/venv/bin/pip install --no-cache-dir jsonschema==4.21.1
 # Preserve /opt/turboquant/build/bin so the hardcoded RPATH resolves.
 COPY --from=llama-binary /opt/turboquant/build/bin /opt/turboquant/build/bin
 COPY --from=llama-binary /opt/build_commit.txt /opt/build_commit.txt
+
+# Build-time guard: fail HERE if this layer left a mixed/partial engine (e.g. a
+# fresh libllama-server-impl.so over a stale libllama.so missing a symbol it needs) --
+# not at the first production KV save. binutils is TRANSIENT: installed, used, purged,
+# apt lists cleaned, all in this one RUN layer, so the runtime image never ships it.
+COPY scripts/check_engine_symbols.sh /tmp/check_engine_symbols.sh
+# Second guard: the KV-variant check. It inspects the engine library that this
+# file actually COMPILES FROM SOURCE (not a pre-built library blob),
+# so it watches the engine that is rebuilt on every image build,
+# i.e. what we really ship.
+# It rides the SAME transient binutils install as the symbols check above,
+# because it needs `strings` too: no extra layer, no extra image weight.
+# Enforcing by default (ENFORCE_DEFAULT=1). Set CHECK_ENGINE_KV_VARIANT_ENFORCE=0 to
+# downgrade a failure to a loud warning for a one-off build.
+COPY scripts/check_engine_kv_variant.sh /tmp/check_engine_kv_variant.sh
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends binutils \
+ && bash /tmp/check_engine_symbols.sh /opt/turboquant/build/bin \
+ && bash /tmp/check_engine_kv_variant.sh --require-present /opt/turboquant/build/bin/libllama.so.0.0.0 \
+ && apt-get purge -y --auto-remove binutils \
+ && rm -rf /var/lib/apt/lists/* /tmp/check_engine_symbols.sh /tmp/check_engine_kv_variant.sh
+
 RUN mkdir -p /opt/turbohaul/bin \
  && ln -sf /opt/turboquant/build/bin/llama-server /opt/turbohaul/bin/llama-server
 
 # Frontend bundle.
 COPY --from=frontend-build /work/dist /opt/turbohaul/ui_dist
+
+# The generic PATH shim, installed under each executable name it
+# serves (mirrors the root Dockerfile -- that file is not what this
+# image builds from, so the same shim is installed here). The engine resolves
+# `ffmpeg`/`ffprobe` from PATH exactly as if the binary were baked in; the
+# shim is LOCAL-FIRST (a real local binary execv's with zero hops, so an
+# operator-baked ffmpeg keeps working untouched) and otherwise routes the
+# call through the forwarder to the plugin container's /ws/exec endpoint. The
+# executable name IS the binary parameter (argv[0] of the
+# symlink); optional per-install semantics live in /etc/ffshim/<name>.env.
+# One COPY + symlinks (no per-name copies to drift).
+COPY engine/ffshim/ffshim.py /opt/turbohaul/shim/ffshim.py
+RUN chmod 755 /opt/turbohaul/shim/ffshim.py \
+ && mkdir -p /etc/ffshim \
+ && for name in ffmpeg ffprobe; do ln -sf /opt/turbohaul/shim/ffshim.py /usr/local/bin/$name; done
 
 # Runtime dirs.
 RUN mkdir -p /var/lib/turbohaul /etc/turbohaul \

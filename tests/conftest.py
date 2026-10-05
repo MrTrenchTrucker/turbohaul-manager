@@ -5,6 +5,40 @@ import pytest
 from pathlib import Path
 
 
+def pytest_configure(config):
+    """Session guard: abort LOUDLY when `import turbohaul` resolves
+    outside this checkout.
+
+    A foreign importable turbohaul elsewhere on the host (stale build tree,
+    another checkout on PYTHONPATH, ...) would otherwise let the suite run
+    against it — passing or failing silently, with nothing in the output
+    naming the tree measured. A green (or red) from such a run is evidence
+    about someone else's code. Fail the whole session before any test runs.
+    """
+    try:
+        import turbohaul
+    except ImportError:
+        return  # let pytest surface the import error normally at collection
+    got = Path(turbohaul.__file__).resolve()
+    expected = (config.rootpath / "src" / "turbohaul").resolve()
+    if got.parent != expected:
+        raise pytest.UsageError(
+            f"WRONG TREE: turbohaul imported from {got} — expected under "
+            f"{expected}. This session would measure a FOREIGN checkout; "
+            f"aborting. Remove the foreign tree from PYTHONPATH/sys.path "
+            f"(or restore this checkout's src/) and re-run."
+        )
+
+
+def pytest_report_header(config):
+    """Every run's log records which tree it measured."""
+    try:
+        import turbohaul
+        return f"turbohaul tree: {Path(turbohaul.__file__).resolve()}"
+    except ImportError:
+        return "turbohaul tree: <not importable — no src/ pin active>"
+
+
 @pytest.fixture
 def temp_state_dir():
     """Sandboxed /var/lib/turbohaul-equivalent for testing."""

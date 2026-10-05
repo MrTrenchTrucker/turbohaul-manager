@@ -41,7 +41,7 @@ def app_test(tmp_path):
         ui=UIConfig(static_path=tmp_path / "ui"),
     )
     runtime = RuntimeConfig(
-        queue=QueueConfig(),
+        queue=QueueConfig(safety_enabled=False),
         pull=PullConfig(per_stream_max_bytes=1024 * 1024 * 100),  # 100MB cap for tests
     )
     app = create_app(boot, runtime, auto_start_worker=False, auto_boot_reconcile=False)
@@ -179,7 +179,7 @@ class TestPullHf:
             app.state.http_client_factory = _make_mock_httpx_factory([data])
             r = client.post(
                 "/api/pull-hf",
-                json={"repo_id": "example-org/example-model-0.5B", "filename": "model.gguf"},
+                json={"repo_id": "Qwen/Qwen2.5-0.5B", "filename": "model.gguf"},
             )
             assert r.status_code == 200, r.text
             body = r.json()
@@ -191,7 +191,7 @@ class TestPullHf:
 class TestPullOllamaRegistry:
     def test_pull_returns_501(self, app_test):
         app, client = app_test
-        r = client.post("/api/pull", json={"name": "example-model:7b"})
+        r = client.post("/api/pull", json={"name": "llama2:7b"})
         assert r.status_code == 501
 
 

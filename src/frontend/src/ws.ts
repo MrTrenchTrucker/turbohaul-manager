@@ -5,7 +5,7 @@ export interface WsSubscription {
   close: () => void;
 }
 
-// Reconnect pattern: production-validated exponential backoff, 1s -> 30s cap.
+// Reconnect uses exponential backoff, 1s -> 30s cap.
 export function subscribeWsState(handler: WsHandler): WsSubscription {
   let ws: WebSocket | null = null;
   let stopped = false;

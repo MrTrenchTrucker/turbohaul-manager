@@ -10,7 +10,7 @@
 7. Evicted slot emits audit event via the pool path (NOT state_db_session)
 8. Consecutive evictions don't starve idle-expiry tick — fire-and-forget
    asyncio.create_task on _teardown_idle_holder + idle-handle identity guard
-9. _pop_first_non_evicted_from is bounded — incremental drain per call
+9. _pop_first_non_unloaded_from is bounded — incremental drain per call
 """
 import asyncio
 from unittest.mock import MagicMock
@@ -25,6 +25,23 @@ from turbohaul.config import (
 )
 from turbohaul.queue import TurbohaulQueue
 from turbohaul.slot import Slot, SlotEvictedError
+
+
+def _write_manifest_yaml(manifests_root, tag: str):
+    """Helper: write a minimal valid manifest so the model-tag exists.
+
+    The /v1/chat/completions route checks that a manifest exists
+    (read_manifest -> 404 "model not found"), so this file's fixture
+    registers one. Mirrors the identical helper already used in
+    test_api_chat_completion.py so both files register test models the same
+    way.
+    """
+    (manifests_root / f"{tag}.yaml").write_text(
+        f"""model_tag: {tag}
+gguf_blob_sha256: "{'a' * 64}"
+gguf_size_bytes: 1000
+"""
+    )
 
 
 # ============================================================================
@@ -116,12 +133,13 @@ def _make_app(tmp_path):
         ui=UIConfig(static_path=tmp_path / "ui"),
     )
     runtime = RuntimeConfig(
-        queue=QueueConfig(
+        queue=QueueConfig(safety_enabled=False,
             grace_seconds=0, idle_hot_load_seconds=0,
             drained_sigterm_window_active_s=1, drained_sigterm_window_cold_s=1,
         ),
         pull=PullConfig(),
     )
+    _write_manifest_yaml(storage_root / "manifests", "m")
     app = create_app(boot, runtime, auto_start_worker=True, auto_boot_reconcile=False)
     mgr = app.state.manager
 
@@ -278,7 +296,7 @@ async def test_8_consecutive_evictions_create_task_fire_and_forget(tmp_path):
     mgr = app.state.manager
     teardown_calls: list[str] = []
 
-    async def capturing_teardown(reason):
+    async def capturing_teardown(reason, *, expires_at=None):
         teardown_calls.append(reason)
 
     mgr._teardown_idle_holder = capturing_teardown

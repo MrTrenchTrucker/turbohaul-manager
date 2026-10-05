@@ -74,29 +74,25 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def open_state_db(
-    state_db_path: Path, check_same_thread: bool = True,
-) -> sqlite3.Connection:
-    """Open + initialize state.sqlite. Idempotent.
+# Only the FIRST open of a given database can contend. `PRAGMA
+# journal_mode=WAL` takes an EXCLUSIVE lock to convert the journal; on an
+# already-WAL database it is a no-op read taking no lock at all (it
+# returns 'wal' at once while another connection holds BEGIN EXCLUSIVE). So
+# first opens are serialised through `_OPEN_LOCK` and every later open runs the
+# same work lock-free.
+_OPEN_LOCK = threading.Lock()
+_INITIALISED: set[tuple[int, int]] = set()  # (st_dev, st_ino) of converted DBs
 
-    PRAGMA busy_timeout = 5000 so transient SQLITE_BUSY
-    on concurrent open_state_db calls retry-wait up to 5s instead of
-    failing the request with HTTP 500. There are 8 direct callers
-    (boot_reconcile + submit + _process_slot + _teardown + _force_cold +
-    _audit + _audit_event_only + state_db_session) so contention IS real
-    on burst traffic + concurrent audit writes.
 
-    Each thread gets its own connection via `init_audit_pool`
-    (thread-local, check_same_thread=True — no cross-thread sharing).
-    All other callers keep the sqlite3 default (True).
+def _apply_pragmas_and_schema(conn: sqlite3.Connection) -> None:
+    """Pragmas + idempotent schema. Runs on EVERY open, unconditionally.
+
+    Factored out of `open_state_db` so the serialised first-open branch and the
+    lock-free later-open branch run the SAME code. The two branches differ only
+    in whether `_OPEN_LOCK` is held — never in what they do. Do not add a skip
+    here: whether the per-database work can be skipped on a warm open is a
+    separate question that needs its own measurement.
     """
-    state_db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(
-        str(state_db_path),
-        isolation_level=None,
-        check_same_thread=check_same_thread,
-    )
-    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -122,6 +118,85 @@ def open_state_db(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utcnow_iso()),
         )
+
+
+def open_state_db(
+    state_db_path: Path, check_same_thread: bool = True,
+) -> sqlite3.Connection:
+    """Open + initialize state.sqlite. Idempotent.
+
+    Transient SQLITE_BUSY on concurrent opens retry-waits up to 5s
+    instead of failing the request with HTTP 500.
+    The retry-wait comes from `sqlite3.connect()` below:
+    `connect()` defaults to `timeout=5.0` and that parameter IS the busy
+    timeout, so it is already 5000ms before the first statement runs.
+    The explicit `PRAGMA busy_timeout=5000` in `_apply_pragmas_and_schema`
+    restates that value at the point of use: it is redundant with the
+    `connect()` timeout, but it keeps the intent visible and survives any
+    future change to the `connect()` call.
+    The `connect()` timeout is what arms the wait; the pragma only
+    restates it.
+
+    Contention IS real on burst traffic + concurrent audit writes:
+    `open_state_db` is called directly from manager.py,
+    through `state_db_session`, and once per thread
+    by `init_audit_pool`.
+
+    Each thread gets its own connection via `init_audit_pool`
+    (thread-local, check_same_thread=True — no cross-thread sharing).
+    All other callers keep the sqlite3 default (True).
+
+    The FIRST open of a database is serialised through `_OPEN_LOCK`;
+    later opens do the same work with no lock. Without the serialisation,
+    concurrent first opens of a fresh DB (threads released together) could
+    fail with OperationalError "database is locked" on the journal_mode
+    pragma; serialising the first open removes that failure.
+
+    ⚠ `_INITIALISED` is process-global, so this serialises WITHIN a process
+    only. Two processes racing the same fresh DB are NOT protected by this
+    lock; the lock is per process.
+
+    WHY THE FAST PATH IS SAFE WITHOUT THE LOCK — do not "simplify" this away:
+      · It reads `_INITIALISED` with no lock held. A `set` membership test is
+        atomic against `set.add` under CPython, so it can read a stale answer
+        but never a torn one.
+      · A stale MISS (converted already, not yet observed) is harmless: the
+        thread takes the lock it did not need and does the same work. Cost only.
+      · A stale HIT is the only interesting outcome, and it cannot arise from
+        ordering: the key is added AFTER `_apply_pragmas_and_schema` returns and
+        while the lock is still held. So `key in _INITIALISED` implies the WAL
+        conversion for that file has COMPLETED — that ordering, not the lock, is
+        what makes the lock-free branch correct.
+      · There is deliberately NO re-check inside the lock. Both branches run the
+        work unconditionally, so there is nothing to skip; the set decides only
+        whether the lock is held.
+      · Residual: inode REUSE could hand a stale key to a different new DB.
+        ⭐ Under this design that is BENIGN — the schema is still re-applied on
+        every open, so a stale key costs a MISSED LOCK, never a missing table.
+        The worst case is an unserialised first open on that one database.
+    """
+    state_db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        str(state_db_path),
+        isolation_level=None,
+        check_same_thread=check_same_thread,
+    )
+    conn.row_factory = sqlite3.Row
+    # Keyed on FILE IDENTITY, not the path spelling: sqlite3.connect() has
+    # already created the file, so (st_dev, st_ino) exists here. Reading it is
+    # much cheaper than Path.resolve(), and it is stronger — a
+    # database deleted and recreated gets a NEW inode, so it is correctly
+    # treated as fresh and its conversion is serialised again. A path key would
+    # match the stale entry, skip the lock, and hand back the very race this
+    # fixes on a genuinely fresh database.
+    st = state_db_path.stat()
+    key = (st.st_dev, st.st_ino)
+    if key in _INITIALISED:
+        _apply_pragmas_and_schema(conn)
+    else:
+        with _OPEN_LOCK:
+            _apply_pragmas_and_schema(conn)
+            _INITIALISED.add(key)
     return conn
 
 
@@ -372,7 +447,7 @@ def reconcile_orphaned_slots(conn: sqlite3.Connection, live_pids: set[int]) -> i
        'boot-reconcile-pre-active-orphan'. These cannot be live since they
        were never assigned a pid (caller crashed pre-spawn).
 
-    Second-pass fix: previously pid=NULL slots survived reboots in pre-active
+    pid=NULL slots would otherwise survive reboots in pre-active
     state forever; the second pass below catches them.
     """
     cur = conn.execute(

@@ -1,0 +1,73 @@
+0.00.066.620 I log_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.066.623 I device_info:
+0.00.249.802 I   - CUDA0   : GPU-VENDOR DEVICE-MODEL (<total> MiB, <free> MiB free)
+0.00.430.506 I   - CUDA1   : GPU-VENDOR DEVICE-MODEL (<total> MiB, <free> MiB free)
+0.00.430.520 I   - CPU     : CPU-VENDOR DEVICE-MODEL (<total> MiB, <free> MiB free)
+0.00.430.642 I system_info: n_threads = 12 (n_threads_batch = 12) / 24 | CUDA : ARCHS = <archs> | USE_GRAPHS = 1 | PEER_MAX_BATCH_SIZE = 128 | FA_ALL_QUANTS = 1 | NATIVE_FP4 = 1 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.430.728 I srv          init: using 23 threads for HTTP server
+0.00.430.815 I srv         start: binding port with default address family
+0.00.431.959 I srv  llama_server: loading model
+0.00.431.972 I srv    load_model: loading model '/var/lib/turbohaul/blobs/sha256/df/df27a780435b7b45c2597536112ea3cb091f8544c3d0c3318d9f4258b31f7adf'
+0.02.660.613 I srv    load_model: [spec] estimated memory usage of MTP context is 9181.25 MiB
+0.02.660.631 I common_init_result: fitting params to device memory ...
+0.02.660.631 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.04.612.706 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 999, abort
+0.26.174.251 W llama_context: n_ctx_seq (500224) > n_ctx_train (262144) -- possible training context overflow
+0.26.178.994 W llama_kv_cache: auto-asymmetric: GQA ratio 8:1 (n_head=16, n_head_kv=2) — upgrading K from turbo3 to q8_0 to prevent quality degradation. Disable with TURBO_AUTO_ASYMMETRIC=0
+0.27.337.354 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.27.373.365 I srv    load_model: creating MTP draft context against the target model '/var/lib/turbohaul/blobs/sha256/df/df27a780435b7b45c2597536112ea3cb091f8544c3d0c3318d9f4258b31f7adf'
+0.27.373.419 W llama_context: n_ctx_seq (500224) > n_ctx_train (262144) -- possible training context overflow
+0.27.406.615 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 8204.25 MiB on device 1: cudaMalloc failed: out of memory
+0.27.406.626 E ggml_gallocr_reserve_n_impl: failed to allocate CUDA1 buffer of size 8602780160
+0.27.406.628 E graph_reserve: failed to allocate compute buffers
+0.27.406.634 W sched_reserve: compute buffer allocation failed, retrying without pipeline parallelism
+0.27.692.586 W srv    load_model: cache_reuse is not supported by this context, it will be disabled
+0.27.692.592 I srv    load_model: initializing slots, n_slots = 1
+0.27.692.598 W srv    load_model: the slot context (500224) exceeds the training context of the model (262144) - using rope scaling to extend
+0.27.709.339 I common_context_can_seq_rm: the context supports bounded partial sequence removal
+0.27.720.545 I common_speculative_impl_draft_mtp: adding speculative implementation 'draft-mtp'
+0.27.720.551 I common_speculative_impl_draft_mtp: - n_max=3, n_min=0, p_min=0.00, n_embd=2048, backend_sampling=1
+0.27.720.553 I common_speculative_impl_draft_mtp: - gpu_layers=-1, cache_k=f16, cache_v=f16, ctx_tgt=yes, ctx_dft=yes, devices=[default]
+0.28.139.611 I srv    load_model: speculative decoding context initialized
+0.28.139.616 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 500224
+0.28.139.627 W srv    load_model: LLAMA_SERVER_SLOTS_DEBUG = 1
+0.28.139.853 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+0.28.139.854 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+0.28.139.855 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.28.139.855 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 256
+0.28.139.879 I srv          init: idle slots will be saved to prompt cache and cleared upon starting a new task
+0.28.149.432 I init: chat template, example_format: '<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+Hi there<|im_end|>
+<|im_start|>user
+How are you?<|im_end|>
+<|im_start|>assistant
+<think>
+'
+0.28.156.429 I srv          init: init: chat template, thinking = 1
+0.28.156.462 I srv  llama_server: model loaded
+0.28.156.465 I srv  llama_server: server is listening on http://127.0.0.1:11500
+0.28.156.470 I srv  update_slots: all slots are idle
+0.30.162.813 I srv  update_slots: all slots are idle
+0.30.175.975 I srv  update_slots: all slots are idle
+0.30.206.383 I srv  params_from_: Chat format: peg-native
+0.30.206.525 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+0.30.206.526 I srv  get_availabl: updating prompt cache
+0.30.206.531 I srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+0.30.206.535 I srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 500224 tokens, 8589934592 est)
+0.30.206.536 I srv  get_availabl: prompt cache update took 0.01 ms
+0.30.206.556 I reasoning-budget: activated, budget=9192 tokens
+0.30.231.818 I slot launch_slot_: id  0 | task 2 | processing task, is_child = 0
+0.30.301.816 I slot create_check: id  0 | task 2 | created context checkpoint 1 of 32 (pos_min = 7, pos_max = 7, n_tokens = 8, size = 62.829 MiB)
+0.30.380.417 I slot print_timing: id  0 | task 2 | prompt eval time =      90.95 ms /    12 tokens (    7.58 ms per token,   131.94 tokens per second)
+0.30.380.420 I slot print_timing: id  0 | task 2 |        eval time =      57.35 ms /     8 tokens (    7.17 ms per token,   139.48 tokens per second)
+0.30.380.421 I slot print_timing: id  0 | task 2 |       total time =     148.30 ms /    20 tokens
+0.30.380.425 I slot print_timing: id  0 | task 2 |    graphs reused =          1
+0.30.380.425 I slot print_timing: id  0 | task 2 | draft acceptance = 1.00000 (    5 accepted /     5 generated)
+0.30.380.448 I statistics        draft-mtp: #calls(b,g,a) =    1      2      2, #gen drafts =      2, #acc drafts =     2, #gen tokens =      5, #acc tokens =     5, dur(b,g,a) = 0.002, 10.816, 0.001 ms
+0.30.380.471 I slot      release: id  0 | task 2 | stop processing: n_tokens = 19, truncated = 0
+0.30.380.481 I srv  update_slots: all slots are idle
+0.30.395.729 I srv    operator(): operator(): cleaning up before exit...

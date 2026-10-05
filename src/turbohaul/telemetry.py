@@ -281,6 +281,35 @@ class FlapTelemetry:
             "model_tag": getattr(slot, "model_tag", ""),
         })
 
+    def on_turn_dispatch(self, slot: Any) -> None:
+        """Called at the true engine handoff for
+        ONE turn, on BOTH the cold/anchor path and the warm ACTIVE_MATCH
+        grace-reuse path -- the case existing prefill_start is silent for
+        (most arrivals in practice). Placed
+        AFTER _probe_and_save_clean_kv / immediately before stream_ready_event.set()
+        on both paths, never before -- firing earlier would fold that probe's
+        occasional real KV-restore/save latency into the PREFILL bucket
+        (new_event -> first_token) instead of WAIT, biasing exactly the split
+        this event exists to make trustworthy. ADDITIVE: prefill_start has
+        its own separate name, timing and call sites.
+
+        request_arrival -> this event  = WAIT (queueing/stranding, where scheduling defects show up)
+        this event -> first_token      = PREFILL (physics, scales with context)
+
+        Carries prompt_tokens only, not reused_tokens: engine_reused_tokens is
+        never known this early (see _log_kv_reuse_outcome, stamped only once
+        wait_state == "completed" and matched to a live engine heartbeat) --
+        shipping it here would be null or wrong on the one path this event is
+        for.
+        """
+        slot_id = getattr(slot, "slot_id", "unknown")
+        self._emit("turn_dispatch", {
+            "slot_id": slot_id,
+            "thread_id": getattr(slot, "thread_id", ""),
+            "model_tag": getattr(slot, "model_tag", ""),
+            "prompt_tokens": getattr(slot, "admission_ctx_len", 0) or 0,
+        })
+
     def on_first_token(self, slot: Any, ttft_ms: float) -> None:
         """Called when the first token is received (TTFT measurement)."""
         slot_id = getattr(slot, "slot_id", "unknown")

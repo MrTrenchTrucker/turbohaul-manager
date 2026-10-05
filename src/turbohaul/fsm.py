@@ -24,10 +24,26 @@ LEGAL_TRANSITIONS: dict[SlotState, set[SlotState]] = {
     # from queue.remove() while its DB state stays STAGED forever — the
     # alternating-pattern bug observed under a rapid 10-request burst.
     SlotState.STAGED: {SlotState.LOADING, SlotState.COLD, SlotState.ACTIVE_MATCH},
-    SlotState.LOADING: {SlotState.ACTIVE, SlotState.LOADING_FAIL, SlotState.COLD},  # +COLD per hardening review H-5
+    SlotState.LOADING: {SlotState.ACTIVE, SlotState.LOADING_FAIL, SlotState.COLD},  # +COLD: a load may also go straight to COLD
     # Retry from LOADING_FAIL → re-STAGED; on retry-exhaust → POPPED
     SlotState.LOADING_FAIL: {SlotState.STAGED, SlotState.POPPED},
-    SlotState.ACTIVE: {SlotState.GRACE, SlotState.ACTIVE_MATCH},
+    # ACTIVE → POPPED is legal because of the fast-lane design rules: a
+    # designated victim gets no grace timer and is surrendered the instant it
+    # is designated, so no grace state is ever entered for it. That forbids the
+    # victim entering GRACE at all,
+    # but _serve_on_resident always ends with transition(slot, POPPED). Without
+    # this edge a victim that skips the GRACE entry is still ACTIVE there and
+    # transition() raises, so a designated-victim check would have to sit BELOW
+    # the grace entry and skip only the WAIT. The cause is structural, in this
+    # table, not a sloppy ordering.
+    # The widening is safe site by site: of the nine
+    # transition(..., POPPED) sites in manager.py, seven arrive in GRACE or
+    # LOADING_FAIL, one (_force_cold) is dynamically guarded by
+    # `if SlotState.POPPED in legal` and cannot raise, and one already arrives
+    # ACTIVE with the raise swallowed. Widening a row only removes a loud
+    # failure (the raise); it never adds one, so the extra edge cannot make
+    # a currently working path fail.
+    SlotState.ACTIVE: {SlotState.GRACE, SlotState.ACTIVE_MATCH, SlotState.POPPED},
     SlotState.GRACE: {SlotState.GRACE_BUSY, SlotState.POPPED, SlotState.ACTIVE},
     # GRACE-BUSY: matched follow-up running on warm slot; back to GRACE or pop
     SlotState.GRACE_BUSY: {SlotState.GRACE, SlotState.POPPED},

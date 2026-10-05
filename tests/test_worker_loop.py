@@ -5,9 +5,10 @@ llama-server is spawned. Phase 6 smoke E2E uses the real backend.
 """
 import asyncio
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from turbohaul.config import (
     BootConfig,
@@ -25,7 +26,9 @@ from turbohaul.state import open_state_db
 from turbohaul.subprocess_mgr import SidecarHandle
 
 
-def _boot_runtime(tmp_path, grace_seconds=0, idle_hot_load_seconds=0):
+def _boot_runtime(
+    tmp_path, grace_seconds=0, idle_hot_load_seconds=0, max_parallel_sidecars=1,
+):
     storage_root = tmp_path / "state"
     storage_root.mkdir()
     (storage_root / "blobs").mkdir()
@@ -47,11 +50,13 @@ def _boot_runtime(tmp_path, grace_seconds=0, idle_hot_load_seconds=0):
     )
     runtime = RuntimeConfig(
         queue=QueueConfig(
+            safety_enabled=False,
             grace_seconds=grace_seconds,
             idle_hot_load_seconds=idle_hot_load_seconds,
             drained_sigterm_window_active_s=1,
             drained_sigterm_window_cold_s=1,
             loading_health_timeout_s=10,
+            max_parallel_sidecars=max_parallel_sidecars,
         ),
         pull=PullConfig(),
     )
@@ -223,9 +228,12 @@ class TestWorkerLoopFullCycle:
     async def test_two_slots_processed_sequentially(self, tmp_path):
         boot, runtime = _boot_runtime(tmp_path, grace_seconds=0)
         spawn_calls = []
+        both_spawned = asyncio.Event()
 
         def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
             spawn_calls.append(model_tag)
+            if len(spawn_calls) >= 2:
+                both_spawned.set()
             return _make_fake_handle(model_tag, port)
 
         async def fake_health(*a, **k):
@@ -248,7 +256,12 @@ class TestWorkerLoopFullCycle:
         s1 = await mgr.submit(model_tag="m1", prompt="first")
         s2 = await mgr.submit(model_tag="m2", prompt="second")
         mgr._worker_task = asyncio.create_task(mgr.worker_loop())
-        await asyncio.sleep(0.8)
+        # Wait on the actual condition (both spawns landed), not a fixed
+        # sleep — the drained_sigterm_window_active_s=1 config above (plus
+        # fixed startup latency) leaves under 0.4s of margin against a fixed
+        # 0.8s sleep, so a wall-clock guess is inherently marginal here. The
+        # timeout below is a failure bound, not the success condition.
+        await asyncio.wait_for(both_spawned.wait(), timeout=5.0)
         await mgr.shutdown()
 
         assert spawn_calls == ["m1", "m2"]  # FIFO order
@@ -350,7 +363,7 @@ class TestIdleHotWire:
         assert spawn_call_count[0] == 1
 
     async def test_same_model_queued_stays_warm_with_idle_disabled(self, tmp_path):
-        """Residency: two SAME-model requests (distinct
+        """Residency floor: two SAME-model requests (distinct
         threads) served back-to-back with idle disabled (idle_hot_load_seconds=0,
         i.e. the keep_alive=0 edge) must NOT teardown+respawn between them — the
         second warm-inherits because the residency floor keeps the resident model
@@ -467,7 +480,7 @@ class TestIdleHotWire:
         # gpt-y also sigterm at shutdown
         assert sigterm_calls.count("gpt-y") >= 1
     async def test_bogus_model_tag_preserves_idle_holder(self, tmp_path):
-        """A bogus model_tag must NOT tear down the idle holder."""
+        """Bogus model_tag must NOT tear down idle holder."""
         boot, runtime = _boot_runtime(
             tmp_path, grace_seconds=0, idle_hot_load_seconds=120,
         )
@@ -524,7 +537,7 @@ class TestIdleHotWire:
             # WITHOUT tearing down the idle holder.
             with pytest.raises(RuntimeError, match="no manifest"):
                 await mgr.submit_and_wait(
-                    "bogus-model", "prompt-bogus", thread_id="t2",
+                    "qwen-pretend", "prompt-bogus", thread_id="t2",
                 )
             # Holder must STILL be the real-model warm sidecar
             assert mgr._idle_handle is not None, (
@@ -532,7 +545,7 @@ class TestIdleHotWire:
             )
             assert mgr._idle_model_tag == "real-model"
             # No bogus-spawn fired (we bailed before spawn)
-            assert "bogus-model" not in spawn_calls
+            assert "qwen-pretend" not in spawn_calls
             # No sigterm fired on the holder
             assert "real-model" not in sigterm_calls
         finally:
@@ -547,7 +560,7 @@ class TestIdleHotWire:
 #   The streaming ACTIVE_MATCH branch in worker_loop unconditionally called
 #   _complete_fn for the matched slot, ignoring its stream=True flag. The
 #   matched slot's stream_ready_event was never set; the route then waited
-#   for SLOT_READY_TIMEOUT_S=600s before failing. Every turn ≥ 2 of a
+#   for SLOT_READY_TIMEOUT_S=600s before failing. Every turn ≥ 2 of an AI harness
 #   multi-tool agent loop hit this and hung for 10 minutes.
 #
 # These two tests pin the contract:
@@ -586,7 +599,7 @@ class TestActiveMatchStreaming:
         route unblocks, (c) NOT call _complete_fn (would open a 2nd sidecar
         connection and break the single-slot invariant).
 
-        Regression guarded: previously the matched slot's stream_ready_event
+        Regression guarded: before the fix the matched slot's stream_ready_event
         was never set; routes hung 600s on SLOT_READY_TIMEOUT_S.
         """
         boot, runtime = _boot_runtime(
@@ -632,7 +645,7 @@ class TestActiveMatchStreaming:
                 client_meta={"kind": "openai-chat-completion-stream", "stream": True},
             )
             # Wait for worker to bring anchor to ACTIVE + set stream_ready_event.
-            # The 5s wait_for cap is the timeout guard; pre-fix this would have
+            # The 5s wait_for cap is the failure timeout; pre-fix this would have
             # waited 600s. Anything > 0.5s here is a CI red flag, see below.
             t0_anchor = time.monotonic()
             await asyncio.wait_for(anchor.stream_ready_event.wait(), timeout=5.0)
@@ -775,8 +788,8 @@ class TestActiveMatchStreaming:
             )
             assert matched.slot_id in slot_ids_completed, (
                 f"_complete_fn never called for matched slot {matched.slot_id}; "
-                "ACTIVE_MATCH non-streaming branch regression — the streaming "
-                "fix must not bleed into this code path. "
+                "ACTIVE_MATCH non-streaming branch regression — the streaming fix "
+                "must not bleed into this code path. "
                 f"Got calls for: {slot_ids_completed}"
             )
             # Contract: warm-reuse → only ONE spawn for both slots
@@ -790,13 +803,154 @@ class TestActiveMatchStreaming:
 
 
 @pytest.mark.asyncio
+class TestKeepAliveActiveMatchGuard:
+    """cap<=1 path (_process_slot's ACTIVE_MATCH
+    promotion). A request that omits keep_alive_s must not
+    overwrite an already-stored EXPLICIT keep_alive intent from the anchor
+    (or a prior matched follow-up) — last-EXPLICIT-writer-wins, not
+    last-writer-wins. Explicit values must still win (regression guard).
+    """
+
+    async def _mgr_with_worker(self, tmp_path, grace_seconds=5):
+        boot, runtime = _boot_runtime(tmp_path, grace_seconds=grace_seconds)
+        _seed_manifest(boot, "m1")
+        spawn_calls = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            spawn_calls.append(model_tag)
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(*a, **k):
+            return True
+
+        async def fake_sigterm(*a, **k):
+            return True, "sigterm-clean"
+
+        async def fake_vram(*a, **k):
+            return True, None
+
+        async def fake_complete(slot, handle):
+            return {"ok": True}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+            complete_fn=fake_complete,
+        )
+        mgr.runtime.queue.safety_enabled = False
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        return mgr, spawn_calls
+
+    async def test_omitted_keep_alive_preserves_anchor_intent(self, tmp_path):
+        """Anchor sends keep_alive_s=0 (explicit). A same-thread ACTIVE_MATCH
+        follow-up with NO keep_alive_s in client_meta must leave the stored
+        intent at 0, not reset it to None. Pre-fix: RED (unconditional
+        overwrite clobbers 0 -> None)."""
+        mgr, spawn_calls = await self._mgr_with_worker(tmp_path)
+        try:
+            anchor = await mgr.submit(
+                model_tag="m1", prompt="anchor", thread_id="t1",
+                client_meta={"kind": "openai-chat-completion", "keep_alive_s": 0},
+                wait_for_completion=True,
+            )
+            await asyncio.wait_for(anchor.completion_future, timeout=5.0)
+            assert mgr._latest_keep_alive_s == 0, (
+                "anchor's explicit keep_alive=0 must be captured"
+            )
+            await asyncio.sleep(0.05)  # breather: let the GRACE loop start polling
+
+            matched = await mgr.submit(
+                model_tag="m1", prompt="followup", thread_id="t1",
+                client_meta={"kind": "openai-chat-completion"},  # no keep_alive_s
+                wait_for_completion=True,
+            )
+            await asyncio.wait_for(matched.completion_future, timeout=5.0)
+
+            assert mgr._latest_keep_alive_s == 0, (
+                "ACTIVE_MATCH follow-up with omitted keep_alive_s must NOT reset "
+                f"the anchor's explicit intent; got {mgr._latest_keep_alive_s!r}"
+            )
+            assert spawn_calls == ["m1"], (
+                f"expected warm ACTIVE_MATCH reuse, no second spawn; got {spawn_calls}"
+            )
+        finally:
+            await mgr.shutdown()
+
+    async def test_explicit_keep_alive_still_overwrites(self, tmp_path):
+        """Regression guard: an EXPLICIT follow-up keep_alive_s must still win
+        over the anchor's. Already-correct pre-fix; must stay correct post-fix."""
+        mgr, spawn_calls = await self._mgr_with_worker(tmp_path)
+        try:
+            anchor = await mgr.submit(
+                model_tag="m1", prompt="anchor", thread_id="t1",
+                client_meta={"kind": "openai-chat-completion", "keep_alive_s": 0},
+                wait_for_completion=True,
+            )
+            await asyncio.wait_for(anchor.completion_future, timeout=5.0)
+            assert mgr._latest_keep_alive_s == 0
+            await asyncio.sleep(0.05)
+
+            matched = await mgr.submit(
+                model_tag="m1", prompt="followup", thread_id="t1",
+                client_meta={"kind": "openai-chat-completion", "keep_alive_s": 600},
+                wait_for_completion=True,
+            )
+            await asyncio.wait_for(matched.completion_future, timeout=5.0)
+
+            assert mgr._latest_keep_alive_s == 600, (
+                "explicit follow-up keep_alive_s=600 must overwrite the anchor's 0; "
+                f"got {mgr._latest_keep_alive_s!r}"
+            )
+        finally:
+            await mgr.shutdown()
+
+    async def test_new_anchor_does_not_inherit_stale_keep_alive(self, tmp_path):
+        """Entry-clear regression guard (untouched by this fix): a brand
+        new anchor cycle on a DIFFERENT thread, itself omitting keep_alive_s,
+        must not inherit a stale nonzero value left behind by a fully-popped
+        prior chain."""
+        mgr, spawn_calls = await self._mgr_with_worker(tmp_path, grace_seconds=0)
+        try:
+            chain_a = await mgr.submit(
+                model_tag="m1", prompt="chain-a", thread_id="t1",
+                client_meta={"kind": "openai-chat-completion", "keep_alive_s": 300},
+                wait_for_completion=True,
+            )
+            await asyncio.wait_for(chain_a.completion_future, timeout=5.0)
+            # grace_seconds=0 -> chain A's GRACE loop exits immediately and
+            # clears _latest_keep_alive_s (POPPED) before chain B.
+            for _ in range(100):
+                if mgr._latest_keep_alive_s is None:
+                    break
+                await asyncio.sleep(0.02)
+            assert mgr._latest_keep_alive_s is None, (
+                "chain A's POPPED clear should have reset the scalar to None "
+                "before chain B starts"
+            )
+
+            chain_b = await mgr.submit(
+                model_tag="m1", prompt="chain-b", thread_id="t2",
+                client_meta={"kind": "openai-chat-completion"},  # no keep_alive_s
+                wait_for_completion=True,
+            )
+            await asyncio.wait_for(chain_b.completion_future, timeout=5.0)
+            assert mgr._latest_keep_alive_s is None, (
+                "chain B (no keep_alive_s) must not inherit chain A's stale 300; "
+                f"got {mgr._latest_keep_alive_s!r}"
+            )
+        finally:
+            await mgr.shutdown()
+
+
+@pytest.mark.asyncio
 class TestLoadingWedgeFix:
     """FSM-wedge fix: a model-load that CRASHES (child exits) must not pin the
     single slot in LOADING for the full loading_health_timeout_s. The REAL
     wait_until_healthy (NOT injected) receives handle.is_alive and bails fast, so
     the existing LOADING_FAIL->POPPED cleanup fires in ~one poll interval and the
     worker_loop stays free to drain the queue. Pre-fix this hung ~600s = the
-    no-reply the operator saw.
+    no-reply an operator saw.
     """
 
     async def test_dead_child_during_load_fails_fast_and_queue_drains(self, tmp_path):
@@ -867,3 +1021,668 @@ class TestLoadingWedgeFix:
                 assert "loading-fail" in row["end_reason"]
         finally:
             conn.close()
+
+
+@pytest.mark.asyncio
+class TestWarmInheritIdentityIsolation:
+    """The idle-hot warm-inherit block (same-model second request reusing the
+    idle sidecar) must only ever adopt the idle holder's IDENTITY fields
+    (session_id/role/is_* labels) on a genuine continuation signal -- a
+    same-thread re-cue that lost its session_id, or an explicit same-session
+    match -- and never on session-less absence alone (that admits any
+    brand-new unrelated caller). It must also never adopt `messages`: the
+    outbound source is slot.context (see test_complete_messages_source.py),
+    a separate field this block does not touch."""
+
+    async def _run_two_requests(
+        self, tmp_path, *, first_thread, second_thread,
+        first_client_meta, second_client_meta,
+    ):
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=120
+        )
+        captured = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(*a, **k):
+            return True
+
+        async def fake_sigterm(handle, **k):
+            return True, "sigterm-clean"
+
+        async def fake_vram(**k):
+            return True, 100
+
+        async def fake_complete(slot, handle):
+            captured.append({
+                "client_meta": dict(slot.client_meta or {}),
+                "context": slot.context,
+            })
+            return {"ok": True}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram, complete_fn=fake_complete,
+        )
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        try:
+            await mgr.submit_and_wait(
+                "gpt-x", "prompt-1", thread_id=first_thread,
+                context=[{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+                client_meta=first_client_meta,
+            )
+            await asyncio.sleep(0.05)  # let the first slot enter idle-hot
+            await mgr.submit_and_wait(
+                "gpt-x", "prompt-2", thread_id=second_thread,
+                context=[{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+                client_meta=second_client_meta,
+            )
+        finally:
+            await mgr.shutdown()
+        return captured
+
+    async def test_substitution_and_isolation_sessionless_new_caller(self, tmp_path):
+        """SUBSTITUTION + ISOLATION: a session-less request on a DIFFERENT
+        thread than the idle holder is a brand-new unrelated caller. It must
+        get its OWN prompt (context) -- reproducing what the original bug
+        would have substituted -- and must NOT inherit the idle holder's
+        session_id or role."""
+        captured = await self._run_two_requests(
+            tmp_path,
+            first_thread="t1", second_thread="t2",  # DIFFERENT thread
+            first_client_meta={
+                "session_id": "s1", "role": "main",
+                "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+            },
+            second_client_meta={
+                "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+            },
+        )
+        second = captured[1]
+        # SUBSTITUTION: own prompt, not the idle holder's.
+        assert second["context"] == [{"role": "user", "content": "SECOND_CALLER_CONTENT"}]
+        # ISOLATION: no identity crossed over from the unrelated first caller.
+        assert second["client_meta"].get("session_id") is None
+        assert second["client_meta"].get("role") is None
+
+    async def test_both_sessionless_different_threads_no_identity_adoption(self, tmp_path):
+        """Two absent session ids must not compare equal: a session-less
+        caller on a DIFFERENT thread than a session-less idle holder is an
+        unrelated caller (thread mismatch also keeps the re-cue disjunct
+        False) and must keep its own identity/classification fields, not
+        adopt the idle holder's."""
+        captured = await self._run_two_requests(
+            tmp_path,
+            first_thread="t1", second_thread="t2",  # DIFFERENT thread
+            first_client_meta={
+                "role": "main", "is_curator": True,
+                "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+            },
+            second_client_meta={
+                "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+            },
+        )
+        second = captured[1]
+        assert second["client_meta"].get("session_id") is None
+        assert second["client_meta"].get("role") is None
+        assert second["client_meta"].get("is_curator") is None
+        assert second["context"] == [{"role": "user", "content": "SECOND_CALLER_CONTENT"}]
+
+    async def test_recue_preserved_matching_thread_adopts_identity_not_messages(
+        self, tmp_path,
+    ):
+        """RE-CUE PRESERVED: a legitimate re-cue -- SAME thread_id as the idle
+        holder, but the incoming request lost its session_id (the tool-call
+        re-cue case) -- still adopts identity (session_id/role), and still
+        does NOT adopt messages (its own context is used instead)."""
+        captured = await self._run_two_requests(
+            tmp_path,
+            first_thread="t1", second_thread="t1",  # SAME thread -- genuine re-cue
+            first_client_meta={
+                "session_id": "s1", "role": "main",
+                "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+            },
+            second_client_meta={
+                "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+            },
+        )
+        second = captured[1]
+        assert second["client_meta"].get("session_id") == "s1"
+        assert second["client_meta"].get("role") == "main"
+        # Identity adopted, but content is still the caller's own.
+        assert second["context"] == [{"role": "user", "content": "SECOND_CALLER_CONTENT"}]
+
+    async def test_recue_preserved_label_classified_idle_holder(self, tmp_path):
+        """RE-CUE PRESERVED, label case: the idle holder was LABEL-classified
+        (is_curator), not literal-role. A same-thread re-cue must come out of
+        the adopt with the SAME _bin_role classification as before the fix --
+        a session_id+literal-role-only copy would silently demote it."""
+        from turbohaul.manager import _bin_role
+
+        first_client_meta = {
+            "session_id": "s1", "is_curator": True,
+            "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+        }
+        captured = await self._run_two_requests(
+            tmp_path,
+            first_thread="t1", second_thread="t1",
+            first_client_meta=first_client_meta,
+            second_client_meta={
+                "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+            },
+        )
+        second = captured[1]
+        assert second["client_meta"].get("is_curator") is True
+        assert _bin_role(second["client_meta"]) == _bin_role(first_client_meta) == "curator"
+
+    async def test_explicit_same_session_still_adopts_identity(self, tmp_path):
+        """The untouched disjunct: an explicit same-session_id match (not a
+        re-cue) still adopts identity fields -- unchanged behaviour."""
+        captured = await self._run_two_requests(
+            tmp_path,
+            first_thread="t1", second_thread="t2",  # different thread...
+            first_client_meta={
+                "session_id": "s1", "role": "main",
+                "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+            },
+            second_client_meta={
+                "session_id": "s1",  # ...but explicit SAME session_id
+                "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+            },
+        )
+        second = captured[1]
+        assert second["client_meta"].get("role") == "main"
+        assert second["context"] == [{"role": "user", "content": "SECOND_CALLER_CONTENT"}]
+
+
+class TestWarmInheritRoleClobberFix:
+    """Role-clobber guard (label-copy-without-messages poisoning).
+    _is_same_session only
+    proves the incoming request shares the idle holder's session_id -- NOT
+    that it is the same role. A curator can legitimately share session_id
+    with its parent main session (spawned "for" that session). Before the
+    fix, the warm-inherit copy loop only overwrites keys PRESENT in the idle
+    holder's client_meta -- it never clears keys absent there, so an
+    incoming curator identified via is_curator=True survives untouched
+    (is_curator still wins _class_from_label's priority order even with a
+    stray is_main=True also present). The real clobber needs the incoming's
+    OWN identity to be establishable ONLY via the literal-role back-compat
+    fallback (no is_curator boolean) -- _class_from_label checks
+    is_curator > is_compression > is_sub_agent > is_main BEFORE ever
+    consulting a literal role string, so copying the idle holder's
+    is_main=True onto an incoming curator identified only by role="curator"
+    makes _class_from_label resolve to CLASS_MAIN, completely silently
+    overriding the incoming's own correct classification -- and the
+    last_main_client_meta refresh would then trust the (real) curator's own
+    messages as main's own transcript."""
+
+    async def _run_two_requests(
+        self, tmp_path, *, first_thread, second_thread,
+        first_client_meta, second_client_meta,
+    ):
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=120
+        )
+        captured = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(*a, **k):
+            return True
+
+        async def fake_sigterm(handle, **k):
+            return True, "sigterm-clean"
+
+        async def fake_vram(**k):
+            return True, 100
+
+        async def fake_complete(slot, handle):
+            captured.append({
+                "client_meta": dict(slot.client_meta or {}),
+                "context": slot.context,
+            })
+            return {"ok": True}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram, complete_fn=fake_complete,
+        )
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        try:
+            await mgr.submit_and_wait(
+                "gpt-x", "prompt-1", thread_id=first_thread,
+                context=[{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+                client_meta=first_client_meta,
+            )
+            await asyncio.sleep(0.05)
+            await mgr.submit_and_wait(
+                "gpt-x", "prompt-2", thread_id=second_thread,
+                context=[{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+                client_meta=second_client_meta,
+            )
+        finally:
+            await mgr.shutdown()
+        return captured
+
+    async def test_discriminator_curator_sharing_main_session_keeps_own_role(
+        self, tmp_path,
+    ):
+        """MUST FAIL before the fix: idle holder is main (is_main=True, no
+        literal role). Incoming curator shares the SAME session_id (legit --
+        spawned for that session) and identifies itself ONLY via the
+        back-compat literal role="curator" (no is_curator boolean, exactly
+        the case _class_from_label's own docstring says exists for back-
+        compat). _is_same_session is True, so the pre-fix loop copies
+        is_main=True from idle onto the incoming curator's client_meta --
+        which now resolves to CLASS_MAIN via _class_from_label's own
+        priority order, completely silently discarding the curator's own
+        role="curator" literal."""
+        from turbohaul.manager import _bin_role
+
+        second_client_meta = {
+            "session_id": "s-shared", "role": "curator",
+            "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+        }
+        captured = await self._run_two_requests(
+            tmp_path,
+            first_thread="t1", second_thread="t2",  # different thread, SAME session
+            first_client_meta={
+                "session_id": "s-shared", "is_main": True,
+                "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+            },
+            second_client_meta=second_client_meta,
+        )
+        second = captured[1]
+        assert second["client_meta"].get("role") == "curator"
+        assert second["client_meta"].get("is_main") is not True, (
+            "idle holder's is_main=True was copied onto the incoming "
+            "curator's client_meta -- role clobber via _class_from_label's "
+            "priority order (is_main now beats the curator's own literal "
+            "role fallback)"
+        )
+        assert _bin_role(second["client_meta"]) == "curator", (
+            "the incoming curator's own identity must still resolve to "
+            "'curator' after warm-inherit, not 'main'"
+        )
+
+    async def test_good_shape_survives_genuine_recue_still_adopts_identity(
+        self, tmp_path,
+    ):
+        """Pairing assertion: this fix must not break the LEGITIMATE re-cue
+        case (already covered by TestWarmInheritIdentityIsolation, repeated
+        here as a same-file belt-and-suspenders check) -- a session-less
+        same-thread continuation with NO classification of its own still
+        adopts the idle holder's identity."""
+        captured = await self._run_two_requests(
+            tmp_path,
+            first_thread="t1", second_thread="t1",  # SAME thread -- genuine re-cue
+            first_client_meta={
+                "session_id": "s1", "is_main": True,
+                "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+            },
+            second_client_meta={
+                "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+            },
+        )
+        second = captured[1]
+        assert second["client_meta"].get("session_id") == "s1"
+        assert second["client_meta"].get("is_main") is True
+
+
+@pytest.mark.asyncio
+class TestWarmRecueIdentityLiveTwoResidentCap:
+    """The SAME warm-inherit identity guard as the two
+    classes above, but proven on the LIVE cap>=2 dispatch path
+    (_route_or_reserve -> _restore_warm_recue_identity), not the dead
+    _process_slot body those classes exercise. Two things the classes above
+    cannot prove on their own: (1) that a resident's per-resident
+    idle_client_meta/idle_thread_id -- a DIFFERENT data source than
+    _process_slot's manager-global singleton -- actually carries the parked
+    occupant's identity by the time the new call site reads it (not just that
+    the observed OUTCOME looks right, which could pass for an unrelated
+    reason); (2) that the must-not-adopt assertions have real teeth now, by
+    showing them fail against a deliberately unconditional-adopt mutant."""
+
+    async def _run_two_requests_spied(
+        self, tmp_path, *, first_thread, second_thread,
+        first_client_meta, second_client_meta, max_parallel_sidecars,
+        restore_fn=None,
+    ):
+        """Same harness shape as the two classes above's own _run_two_requests,
+        with two additions: an explicit max_parallel_sidecars (the scenario
+        requires cap=2), and a spy wrapped around
+        TurbohaulManager._restore_warm_recue_identity so the test can assert
+        it was actually CALLED with the expected arguments -- not just that
+        the final client_meta happened to look right."""
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=120,
+            max_parallel_sidecars=max_parallel_sidecars,
+        )
+        captured = []
+        recue_calls = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(*a, **k):
+            return True
+
+        async def fake_sigterm(handle, **k):
+            return True, "sigterm-clean"
+
+        async def fake_vram(**k):
+            return True, 100
+
+        async def fake_complete(slot, handle):
+            captured.append({
+                "client_meta": dict(slot.client_meta or {}),
+                "context": slot.context,
+            })
+            return {"ok": True}
+
+        mgr = TurbohaulManager(
+            boot, runtime,
+            spawn_fn=fake_spawn, health_fn=fake_health,
+            sigterm_fn=fake_sigterm, vram_fn=fake_vram, complete_fn=fake_complete,
+        )
+        real_restore = TurbohaulManager._restore_warm_recue_identity
+        target = restore_fn or real_restore
+
+        def spy(self_mgr, idle_client_meta, idle_thread_id, slot):
+            recue_calls.append({
+                "idle_client_meta": dict(idle_client_meta) if idle_client_meta else idle_client_meta,
+                "idle_thread_id": idle_thread_id,
+            })
+            return target(self_mgr, idle_client_meta, idle_thread_id, slot)
+
+        mgr._restore_warm_recue_identity = spy.__get__(mgr, TurbohaulManager)
+
+        mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+        try:
+            await mgr.submit_and_wait(
+                "gpt-x", "prompt-1", thread_id=first_thread,
+                context=[{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+                client_meta=first_client_meta,
+            )
+            await asyncio.sleep(0.05)  # let the first slot enter idle-hot
+            await mgr.submit_and_wait(
+                "gpt-x", "prompt-2", thread_id=second_thread,
+                context=[{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+                client_meta=second_client_meta,
+            )
+        finally:
+            await mgr.shutdown()
+        assert mgr.runtime.queue.max_parallel_sidecars == max_parallel_sidecars, (
+            "cap must be set explicitly in the test, never inherited"
+        )
+        return captured, recue_calls
+
+    async def test_two_resident_cap_explicit_recue_adopts_identity_via_the_real_call_site(
+        self, tmp_path,
+    ):
+        """Boots at max_parallel_sidecars=2 EXPLICITLY (the
+        deployed cap). Drives a REAL same-thread warm re-cue through
+        worker_loop -> _dispatch_loop -> _route_or_reserve -- no hand-built
+        Resident, no hand-set client_meta on the manager. Asserts BOTH the
+        integration (the new call site was actually invoked with the parked
+        occupant's real identity, proving the per-resident idle_client_meta/
+        idle_thread_id data source is populated and read correctly --
+        a key check) AND the outcome (session_id/role/is_curator survive)."""
+        captured, recue_calls = await self._run_two_requests_spied(
+            tmp_path,
+            first_thread="t1", second_thread="t1",  # SAME thread -- genuine re-cue
+            first_client_meta={
+                "session_id": "s-two-resident-cap", "role": "main", "is_curator": False,
+                "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+            },
+            second_client_meta={
+                "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+            },
+            max_parallel_sidecars=2,
+        )
+        # INTEGRATION proof: the helper was actually called, with
+        # the FIRST caller's real identity already parked as idle_client_meta
+        # -- not None, not empty, not some other resident's leftover state.
+        assert len(recue_calls) >= 1, (
+            "_restore_warm_recue_identity was never called -- the new call "
+            "site in _route_or_reserve did not run"
+        )
+        seen_real_idle_meta = [
+            c for c in recue_calls
+            if c["idle_client_meta"] and c["idle_client_meta"].get("session_id") == "s-two-resident-cap"
+        ]
+        assert seen_real_idle_meta, (
+            f"helper was called but never with the first caller's parked "
+            f"identity (session_id=s-two-resident-cap) -- calls were: {recue_calls}"
+        )
+        assert any(c["idle_thread_id"] == "t1" for c in seen_real_idle_meta), (
+            "idle_thread_id did not carry the parked occupant's real thread_id"
+        )
+        # OUTCOME: session_id/role/is_curator survive the re-cue.
+        second = captured[1]
+        assert second["client_meta"].get("session_id") == "s-two-resident-cap"
+        assert second["client_meta"].get("role") == "main"
+        assert second["client_meta"].get("is_curator") is False
+        assert second["context"] == [{"role": "user", "content": "SECOND_CALLER_CONTENT"}]
+
+    async def test_over_eager_mutant_fuses_two_clients_identity_RED(self, tmp_path):
+        """The trap to guard against: a fix that adopts identity
+        UNCONDITIONALLY -- including across genuinely different clients --
+        passes a naive must-adopt assertion and is a WORSE bug than the original
+        defect (it fuses two conversations' identities). This mutant skips
+        every guard (_is_recue / _is_same_session / cross-role-clobber
+        refusal) and copies the idle holder's identity onto ANY incoming
+        slot unconditionally. Run against the EXACT scenario
+        test_substitution_and_isolation_sessionless_new_caller (a different
+        thread, unrelated session-less caller) -- with the real guard this
+        must NOT adopt; this test proves that assertion FAILS against the
+        mutant, which is what makes the real guard's passing version
+        meaningful evidence rather than a vacuous green."""
+        def over_eager_unconditional_adopt(self_mgr, idle_client_meta, idle_thread_id, slot):
+            if not idle_client_meta:
+                return
+            inc_cm = slot.client_meta if isinstance(slot.client_meta, dict) else {}
+            for k in (
+                "session_id", "role", "is_main", "is_sub_agent",
+                "is_curator", "is_compression",
+            ):
+                if k in idle_client_meta:
+                    inc_cm[k] = idle_client_meta[k]
+            slot.client_meta = inc_cm
+
+        captured, _ = await self._run_two_requests_spied(
+            tmp_path,
+            first_thread="t1", second_thread="t2",  # DIFFERENT thread -- unrelated caller
+            first_client_meta={
+                "session_id": "s1", "role": "main",
+                "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+            },
+            second_client_meta={
+                "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+            },
+            max_parallel_sidecars=2,
+            restore_fn=over_eager_unconditional_adopt,
+        )
+        second = captured[1]
+        # This is the SAME assertion test_substitution_and_isolation_sessionless_new_caller
+        # makes with the REAL guard (and which passes there). Against the
+        # over-eager mutant it must FAIL -- proving the must-not-adopt
+        # assertion is not vacuous: it CAN go red, and it does exactly when
+        # identity is fused across two different clients.
+        with pytest.raises(AssertionError):
+            assert second["client_meta"].get("session_id") is None
+            assert second["client_meta"].get("role") is None
+
+    async def test_two_resident_cap_sticky_multiinstance_recue_adopts_identity_via_route_to(
+        self, tmp_path,
+    ):
+        """Mutant-testing follow-up: pins the OTHER
+        live call site -- _route_to()'s closure inside _route_or_reserve's
+        multi-instance gate, reached via the STICKY branch.
+        Every other test in this class/file uses model_tag
+        "gpt-x", which has no manifest on disk -- _effective_cap("gpt-x")
+        therefore returns 1 (default-inert), the multi-instance gate
+        `if eff_cap > 1 or len(insts) > 1 or ...` is never entered, and
+        every scenario falls through to the plain HIT branch.
+        A mutant proved this directly: unwiring the
+        _restore_warm_recue_identity call inside _route_to
+        left the whole 7-test suite green, because nothing
+        drives that closure.
+
+        This test drives it HONESTLY -- a real on-disk manifest
+        (one card per engine: auto_place with split_mode none) + a patched VRAM probe
+        with room for two cards, both real state the routing code itself
+        reads, not a hand-built Resident or hand-set client_meta:
+
+          1st submit_and_wait (session_id=s-sticky, thread_id=t1): no
+          instance exists yet -> _sticky_resident_key finds nothing ->
+          falls to the SPAWN branch, which reserves+starts a
+          new Resident AND calls _remember_affinity(tag, "sess:s-sticky",
+          resident_key) itself -- the affinity map entry this test depends
+          on is written by production code, not seeded by the test.
+
+          (sleep to let the resident finish serving and park
+          IDLE_EVICTABLE, stamping idle_client_meta/idle_thread_id from
+          grace_tip -- same wait the sibling cap=2 test above uses.)
+
+          2nd submit_and_wait (SAME session_id, so SAME sticky key): the
+          multi-instance gate is entered again, _sticky_resident_key(slot,
+          tag) now HITS the affinity entry from step 1, the resident is
+          not DEAD -> _route_to(rr) runs -- THIS is the call site
+          the mutant showed was unpinned. Only one instance is ever
+          spawned (asserted below) -- proving the second request routed
+          via STICKY re-use, not a second cold spawn that would trivially
+          also pick up identity via the SPAWN path's own fresh
+          rank_client_meta stamp.
+        """
+        boot, runtime = _boot_runtime(
+            tmp_path, grace_seconds=0, idle_hot_load_seconds=120,
+            max_parallel_sidecars=2,
+        )
+        tag = "gpt-multi-sticky"
+        manifest_path = boot.storage.manifests_path / f"{tag}.yaml"
+        manifest_path.write_text(yaml.safe_dump({
+            "model_tag": tag,
+            "gguf_blob_sha256": "c" * 64,
+            "gguf_size_bytes": 1024 * 1024 * 1024,
+            "context_size": 2048,
+            "expected_vram_bytes": 1024 * 1024 * 1024,
+            "auto_place": True,
+            "llama_server_flags": {"split_mode": "none"},
+        }))
+
+        captured = []
+        recue_calls = []
+        spawn_ports = []
+
+        def fake_spawn(binary, gguf, port, model_tag, argv, **_kw):
+            spawn_ports.append(port)
+            return _make_fake_handle(model_tag, port)
+
+        async def fake_health(*a, **k):
+            return True
+
+        async def fake_sigterm(handle, **k):
+            return True, "sigterm-clean"
+
+        async def fake_vram(**k):
+            return True, 100
+
+        async def fake_complete(slot, handle):
+            captured.append({
+                "client_meta": dict(slot.client_meta or {}),
+                "context": slot.context,
+            })
+            return {"ok": True}
+
+        with patch(
+            "turbohaul.safety._read_free_vram_all_mib", return_value=[8192, 8192],
+        ), patch(
+            "turbohaul.manager._read_free_vram_all_mib", return_value=[8192, 8192],
+        ):
+            mgr = TurbohaulManager(
+                boot, runtime,
+                spawn_fn=fake_spawn, health_fn=fake_health,
+                sigterm_fn=fake_sigterm, vram_fn=fake_vram,
+                complete_fn=fake_complete,
+            )
+            real_restore = TurbohaulManager._restore_warm_recue_identity
+
+            def spy(self_mgr, idle_client_meta, idle_thread_id, slot):
+                recue_calls.append({
+                    "idle_client_meta": (
+                        dict(idle_client_meta) if idle_client_meta else idle_client_meta
+                    ),
+                    "idle_thread_id": idle_thread_id,
+                })
+                return real_restore(self_mgr, idle_client_meta, idle_thread_id, slot)
+
+            mgr._restore_warm_recue_identity = spy.__get__(mgr, TurbohaulManager)
+
+            mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+            try:
+                await mgr.submit_and_wait(
+                    tag, "prompt-1", thread_id="t1",
+                    context=[{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+                    client_meta={
+                        "session_id": "s-sticky", "role": "main", "is_curator": False,
+                        "messages": [{"role": "user", "content": "FIRST_CALLER_CONTENT"}],
+                    },
+                )
+                await asyncio.sleep(0.05)  # let the first slot enter idle-hot
+                await mgr.submit_and_wait(
+                    tag, "prompt-2", thread_id="t1",
+                    context=[{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+                    client_meta={
+                        "session_id": "s-sticky",
+                        "messages": [{"role": "user", "content": "SECOND_CALLER_CONTENT"}],
+                    },
+                )
+            finally:
+                await mgr.shutdown()
+
+        # Precondition: only ONE instance was ever spawned -- the second
+        # request routed via STICKY re-use of the first (_route_to), not a
+        # second cold spawn. If this fails, the scenario setup is wrong
+        # (e.g. VRAM/manifest not actually admitting a sticky hit) and the
+        # rest of this test would be proving nothing about _route_to.
+        assert len(spawn_ports) == 1, (
+            f"expected exactly one spawn (second request should STICKY-route "
+            f"via _route_to, not cold-spawn a second instance) -- got "
+            f"{len(spawn_ports)} spawns"
+        )
+        assert mgr.runtime.queue.max_parallel_sidecars == 2
+
+        # INTEGRATION proof: _restore_warm_recue_identity was actually
+        # called with the first caller's real parked identity -- this can
+        # only have happened via the _route_to closure's call site, since
+        # the multi-instance gate (not the legacy HIT branch) is what ran
+        # given the one-card-per-engine manifest.
+        assert len(recue_calls) >= 1, (
+            "_restore_warm_recue_identity was never called -- the _route_to "
+            "call site did not run"
+        )
+        seen_real_idle_meta = [
+            c for c in recue_calls
+            if c["idle_client_meta"]
+            and c["idle_client_meta"].get("session_id") == "s-sticky"
+        ]
+        assert seen_real_idle_meta, (
+            f"helper was called but never with the first caller's parked "
+            f"identity (session_id=s-sticky) -- calls were: {recue_calls}"
+        )
+        assert any(c["idle_thread_id"] == "t1" for c in seen_real_idle_meta), (
+            "idle_thread_id did not carry the parked occupant's real thread_id"
+        )
+
+        # OUTCOME: session_id/role/is_curator survive the sticky re-cue.
+        second = captured[1]
+        assert second["client_meta"].get("session_id") == "s-sticky"
+        assert second["client_meta"].get("role") == "main"
+        assert second["client_meta"].get("is_curator") is False
+        assert second["context"] == [{"role": "user", "content": "SECOND_CALLER_CONTENT"}]

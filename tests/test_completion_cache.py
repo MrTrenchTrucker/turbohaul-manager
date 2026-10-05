@@ -53,7 +53,7 @@ def _boot_runtime(tmp_path, grace_seconds=0, idle_hot_load_seconds=0):
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
     runtime = RuntimeConfig(
-        queue=QueueConfig(
+        queue=QueueConfig(safety_enabled=False,
             grace_seconds=grace_seconds,
             idle_hot_load_seconds=idle_hot_load_seconds,
             drained_sigterm_window_active_s=1,

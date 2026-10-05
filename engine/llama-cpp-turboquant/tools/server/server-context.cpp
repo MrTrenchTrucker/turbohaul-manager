@@ -11,7 +11,6 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
-#include "reasoning-budget.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -105,7 +104,19 @@ constexpr char     TQ_CKPT_MAGIC[8]       = { 'T', 'Q', 'C', 'K', 'P', 'T', '\0'
 // pre-hardening sidecar reject on the version check (no v1 blob — which lacks
 // these fields — is ever parsed by a v2 reader). Keep bumping on any within-commit
 // header/layout change.
-constexpr uint32_t TQ_CKPT_FORMAT_VERSION = 2;
+//
+// v3 (D-Flash NeoX rotation): D-Flash drafters moved from normal to half-split
+// RoPE, so draft-K persisted by a pre-change engine occupies a different
+// rotational space than a post-change engine expects. `create_checkpoint` writes
+// draft KV unconditionally, and the guard that would otherwise catch a
+// cross-build mismatch — `tq_compute_engine_build_id()` — is inert for every
+// build made from a source tree with no `.git` directory (a container build, say), so
+// BUILD_NUMBER is 0 and BUILD_COMMIT is "unknown", and the id is identical
+// across builds, so it cannot tell two builds apart.
+// The version check is therefore the only thing standing between a stale draft
+// sidecar and a silently mis-rotated restore. Bumping only invalidates
+// older D-Flash sidecars.
+constexpr uint32_t TQ_CKPT_FORMAT_VERSION = 3;
 
 // FNV-1a 64-bit offset basis — shared by the fingerprint AND the per-entry
 // content hashes so WRITE and READ compute identically.
@@ -340,11 +351,37 @@ static bool tq_write_ckpt_sidecar(
 // graceful behavior. NOTHING here touches llama_state_seq_set_data_ext; this is a
 // pure pre-filter so a stale blob can never reach load_tgt/load_dft later.
 //
-// cur_size_tgt / cur_size_dft MUST be the CURRENT per-seq PARTIAL_ONLY sizes
+// cur_size_tgt / cur_size_dft are the CURRENT per-seq PARTIAL_ONLY sizes
 // (llama_state_seq_get_size_ext(..., LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) — the
 // SAME flag the ladder was captured with (create_checkpoint) and the SAME flag
-// load_tgt/load_dft use — so an equal size here is exactly the load-time
-// precondition. For recurrent/hybrid memory this size is a per-config constant.
+// load_tgt/load_dft use.
+//
+// sz_tgt IS checked exactly against cur_size_tgt below, per entry: for
+// recurrent/hybrid memory this size is a per-config constant, so one live
+// snapshot is a valid precondition for every entry in the ladder.
+//
+// sz_dft is intentionally NOT checked the same way — only for non-emptiness
+// (matching exp_has_draft). The draft/MTP context's PARTIAL_ONLY size is
+// POSITION-DEPENDENT: it grows with n_tokens, so different ladder entries
+// legitimately carry different correct sz_dft values, while cur_size_dft is a
+// single snapshot of whatever the live draft context holds right now (empty,
+// at restore time). An exact per-entry equality check against that one
+// snapshot would reject every multi-entry draft-MTP sidecar, since the
+// per-entry sz_dft values legitimately differ, forcing a full
+// CLEAR+reprefill instead of a ladder-rewind on every restore, so it is not
+// used. Do not add per-entry sz_dft equality here without first deriving each
+// entry's OWN expected dft size (not one live snapshot); the exact-equality
+// approach would reject valid sidecars.
+//
+// What DOES still guard this path against a wrong/stale draft blob without an
+// exact per-entry sz_dft check: engine_build_id and model_hash below reject
+// the WHOLE sidecar on any engine-build or target-model mismatch, bin_nwrite
+// ties this sidecar to the specific `.bin` it was written alongside, and the
+// per-entry FNV content hash (hash_dft) catches a corrupt payload of whatever
+// size was stored. None of these catch a wrong-but-internally-consistent
+// sz_dft — e.g. from a draft-model or draft-KV-cache-type change that leaves
+// every other header field unchanged — which is a known gap, and one that
+// a one-line equality check cannot close.
 static bool tq_read_and_validate_ckpt_sidecar(
         const std::string &                             path,
         uint64_t exp_model_hash,
@@ -610,9 +647,13 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+            return false;
+        }
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+                return false;
+            }
         }
 
         return true;
@@ -1371,6 +1412,13 @@ private:
             }
         }
 
+        // set by the draft/MTP memory-measurement catch below (only reachable when fit_params
+        // is on); consumed just after the target model loads, once its architecture is known,
+        // to emit the structured SPEC_DOWNGRADED signal a supervising process or UI needs to notify the user.
+        bool        spec_downgraded = false;
+        std::string spec_downgrade_component;
+        std::string spec_downgrade_detail;
+
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
             const bool spec_mtp = std::find(params_base.speculative.types.begin(),
@@ -1411,9 +1459,25 @@ private:
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
                 try {
-                    auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
-                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                    common_device_memory_data_vec dmd;
+                    if (has_draft) {
+                        // DFlash/DSpark drafters build their compute graph against the target's
+                        // tok_embd/output when their own GGUF omits them (disk-space saving) --
+                        // give the measurement the same parent it would have at real construction
+                        // time, or it fails on every such drafter before it can report anything.
+                        auto mparams_tgt = common_model_params_to_llama(params_base);
+                        auto cparams_tgt = common_context_params_to_llama(params_base);
+
+                        dmd = common_get_device_memory_data_with_parent(
+                            params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                            params_base.model.path.c_str(), &mparams_tgt, &cparams_tgt,
+                            devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                    } else {
+                        // MTP's draft context lives on the target model itself -- no parent needed.
+                        dmd = common_get_device_memory_data(
+                            params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                            devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                    }
 
                     GGML_ASSERT(!params_base.fit_params_target.empty());
                     size_t total = 0;
@@ -1442,8 +1506,33 @@ private:
                             has_draft ? "draft model" : "MTP context",
                             total / (1024.0 * 1024.0));
                 } catch (const std::exception & e) {
-                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
-                            has_draft ? "draft model" : "MTP context", e.what());
+                    // A failure here means llama_init_from_model could not even construct a
+                    // throwaway context for this exact model+cparams combination. For a
+                    // missing-tensor-export incompatibility (the known case: an architecture
+                    // that never assigns a per-layer tensor a drafter needs), the REAL
+                    // construction below would hit a GGML_ASSERT -- an unconditional process
+                    // abort that bypasses "if (ctx_dft == nullptr) return false" entirely, no
+                    // matter how that check is written. The only place this is interceptable
+                    // at all is here. Disable speculation and let the target load and serve on
+                    // its own -- this is a DOWNGRADE (ran fine, minus speculation), not a
+                    // FAILED spawn -- the structured SPEC_DOWNGRADED line (with the target's
+                    // architecture, once known) is emitted after the target model loads below.
+                    spec_downgraded          = true;
+                    spec_downgrade_component = has_draft ? "draft" : "mtp";
+                    spec_downgrade_detail    = e.what();
+
+                    params_base.speculative.types.erase(
+                        std::remove_if(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                            [](common_speculative_type t) {
+                                return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE
+                                    || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3
+                                    || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP
+                                    || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+                                    || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+                            }),
+                        params_base.speculative.types.end());
+                    params_base.speculative.draft.mparams.path.clear();
+                    params_base.speculative.draft.mparams.hf_repo.clear();
                 }
             }
         }
@@ -1456,6 +1545,23 @@ private:
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        if (spec_downgraded) {
+            // Structured, greppable-by-contract signal for a supervising process to relay to the
+            // frontend -- status is a fixed literal (downgraded, never failed: the target
+            // loaded and will serve normally, just without speculation), arch is the
+            // target's own general.architecture (now known), reason is a small stable code
+            // for machine consumption, detail is free text for a human reading the log only.
+            char arch_buf[128] = {0};
+            const bool have_arch = llama_model_meta_val_str(
+                model_tgt, "general.architecture", arch_buf, sizeof(arch_buf)) >= 0;
+
+            SRV_WRN("[spec] SPEC_DOWNGRADED arch=%s component=%s reason=%s detail=%s\n",
+                    have_arch ? arch_buf : "unknown",
+                    spec_downgrade_component.c_str(),
+                    "draft_context_init_failed",
+                    spec_downgrade_detail.c_str());
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -1509,6 +1615,10 @@ private:
             cparams.ctx_other = ctx_tgt;
 
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+            if (ctx_dft == nullptr) {
+                SRV_ERR("%s", "failed to create draft context\n");
+                return false;
+            }
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
@@ -2895,8 +3005,25 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // TURBOQUANT (savestate): honour the optional save prefix limit.
+                    // When present (> 0), write at most min(limit, full) tokens AND the KV
+                    // cells at positions [0, limit) — a CONSISTENT truncated bin, so a
+                    // restore computes stale = bin - LCP <= 0 and takes the FAST branch.
+                    // Absent/invalid => full save, byte-identical to prior behaviour.
+                    size_t effective_count = token_count;
+                    size_t max_cells = SIZE_MAX;
+                    if (task.slot_action.save_token_limit > 0) {
+                        const size_t limit = (size_t) task.slot_action.save_token_limit;
+                        effective_count  = std::min(token_count, limit);
+                        max_cells        = effective_count;
+                    }
+
+                    const size_t nwrite = llama_state_seq_save_file_capped(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), effective_count, max_cells);
+                    if (nwrite == 0) {
+                        send_error(task, "Unable to save slot, save returned 0 bytes", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     // TURBOQUANT (savestate) — E1: persist the
                     // recurrent-state checkpoint ladder next to the `.bin` as a
                     // validated `<filepath>.ckpt` sidecar. BEST-EFFORT: any failure
@@ -2959,7 +3086,7 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = true;
-                    res->n_tokens = token_count;
+                    res->n_tokens = effective_count;
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
@@ -2997,7 +3124,6 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
-
                     // TURBOQUANT (savestate) — E2: read + FULLY
                     // validate the checkpoint-ladder sidecar and ASSIGN it to the
                     // slot (clear-then-populate, NEVER append). ANY absence / header
@@ -3069,18 +3195,6 @@ private:
                     // create_checkpoint pos_min/pos_max are metadata-only and
                     // do NOT truncate the KV. Instead we capture the restored
                     // token count for stale-tail calculation at prefill time.
-                    //
-                    // OPTION B (savestate) — flag is KEPT set on
-                    // EVERY successful restore (valid OR empty ladder) to retain the
-                    // CUDA suffix-isolation barrier required at parallel>1. The
-                    // Option-B search-guard change (@~2895 / stale-tail @~3235) is
-                    // DELIBERATELY WITHHELD: forcing the checkpoint-search to run
-                    // under a set flag double-applies with the flag-gated stale-tail
-                    // block (which assumes the search did NOT run) and can CLEAR the
-                    // freshly search-restored KV. Per the RC escape-hatch this is a
-                    // STOP-and-REPORT conflict, not paper-over. Until resolved, a
-                    // restored slot keeps the v5 get_common_prefix path; the ladder
-                    // is validated + populated here but not yet consumed by search.
                     slot->prompt_checkpoint_restored = true;
                     slot->n_restored_tokens = (int32_t) token_count;
 
@@ -3811,18 +3925,17 @@ private:
                      // NOT truncate the KV. So checkpoint-seeding cannot help with
                      // stale removal. The only correct strategies are seq_rm (small
                      // stale) or full clear (large stale).
-                     if (slot.prompt_checkpoint_restored) {
+                     //
+                     // n_restored_tokens > 0: the warm context-checkpoint restore
+                     // path sets prompt_checkpoint_restored without setting
+                     // n_restored_tokens, so without this guard stale = 0 - cache
+                     // is always negative here, taking the strict-extension skip
+                     // below and never running the seq_rm trim in the else branch.
+                     // A cold SLOT_RESTORE always sets both fields together, so
+                     // this guard changes nothing for cold restores.
+                     if (slot.prompt_checkpoint_restored && slot.n_restored_tokens > 0) {
                          int32_t stale = slot.n_restored_tokens - slot.n_prompt_tokens_cache;
 
-                         // reasoning-budget: Subtract reasoning budget when reasoning is configured.
-                          // The budget value is set at model load time and is stable.
-                          // Using it as an upper bound ensures reasoning tokens don't inflate
-                          // the stale count and trigger the CLEAR + reprefill slow path.
-                          if (slot.smpl) {
-                                if (const auto * rbudget = common_sampler_get_rbudget(slot.smpl.get())) {
-                                    stale -= common_reasoning_budget_get_budget(rbudget);
-                                }
-                            }
                         if (stale <= 0) {
                             // STRICT EXTENSION: input fully covers restored seq.
                             // No removal — appended tokens decode at positions > KV max.
@@ -3838,45 +3951,23 @@ private:
                                     common_context_seq_rm(ctx_dft.get(), slot.id, rm_p0, -1);
                                 }
                             } else {
-                                bool did_rewind = false;
-                                // TURBOQUANT (savestate) — Option-ii: ladder-rewind.
-                                // If the sidecar checkpoint ladder is populated, scan for the best
-                                // checkpoint at/before the divergence point and rewind to it instead
-                                // of a full CLEAR + reprefill. This preserves the recurrent state
-                                // at the checkpoint, avoiding the slow path.
-                                if (tq_ckpt_sidecar_enabled() && !slot.prompt.checkpoints.empty()) {
-                                    // B1: iterate rbegin→rend (largest-first, most recent checkpoint = minimal rewind)
-                                    // B2: after load_tgt/load_dft, trim stale attention KV cells (PARTIAL_ONLY
-                                    //     restores RECURRENT only; untrimmed attention = duplicate positions)
-                                    for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
-                                        const auto & cp = *it;
-                                        if ((int32_t) cp.n_tokens <= slot.n_prompt_tokens_cache) {
-                                            cp.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                            if (ctx_dft) {
-                                                cp.load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                            }
-                                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, cp.pos_max + 1, -1);
-                                            if (ctx_dft) {
-                                                llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, cp.pos_max + 1, -1);
-                                            }
-                                            slot.n_prompt_tokens_cache = (int32_t) cp.n_tokens;
-                                            SLT_WRN(slot, "restored slot: ladder-rewind to checkpoint (n_tokens=%" PRId64 ", pos=[%d,%d], stale=%d) instead of CLEAR\n",
-                                                    cp.n_tokens, cp.pos_min, cp.pos_max, stale);
-                                            did_rewind = true;
-                                            break;
-                                        }
-                                    }
+                                // RS bound exceeded — cannot partial-remove. CLEAR whole seq + reprefill.
+                                SLT_WRN(slot, "restored slot: large stale=%d > n_rs_seq=%u, CLEAR + reprefill\n", stale, n_rs_seq);
+                                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                if (ctx_dft) {
+                                    llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, -1, -1);
                                 }
-                                if (!did_rewind) {
-                                    // RS bound exceeded — cannot partial-remove. CLEAR whole seq + reprefill.
-                                    SLT_WRN(slot, "restored slot: large stale=%d > n_rs_seq=%u, CLEAR + reprefill\n", stale, n_rs_seq);
-                                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
-                                    if (ctx_dft) {
-                                        llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, -1, -1);
-                                    }
-                                    slot.prompt.tokens.clear();          // reset token vector — decode loop will reprefill all input
-                                    slot.n_prompt_tokens_cache = 0;      // no cached tokens — full re-prefill from pos 0
-                                }
+                                slot.prompt.tokens.clear();          // reset token vector — decode loop will reprefill all input
+                                slot.n_prompt_tokens_cache = 0;      // no cached tokens — full re-prefill from pos 0
+                                // The checkpoint ladder holds saved snapshots of the KV region we
+                                // just wiped above. Its pos_min/pos_max/n_tokens tuples describe the
+                                // pre-clear sequence, not the fresh reprefill that follows. A later
+                                // request's checkpoint search keys purely on pos_min/pos_max/pos_next
+                                // (no content or session identity check), so a stale entry left here
+                                // could be matched and loaded against KV content that no longer
+                                // corresponds to it. Clear the ladder alongside the KV/token reset so
+                                // there is nothing stale left to match.
+                                slot.prompt.checkpoints.clear();
                             }
                         }
                     } else {
@@ -5732,6 +5823,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     }
     std::string filepath = params.slot_save_path + filename;
 
+    // TURBOQUANT (savestate): optional save_token_limit — save only the first N tokens/cells.
+    // Absent or invalid => save the full slot, byte-identical to prior behaviour.
+    int64_t save_token_limit = -1;
+    if (request_data.contains("save_token_limit")) {
+        const json & v = request_data.at("save_token_limit");
+        if (v.is_number_integer() && v.get<int64_t>() > 0) {
+            save_token_limit = v.get<int64_t>();
+        }
+    }
+
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
@@ -5739,6 +5840,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.save_token_limit = save_token_limit;
         rd.post_task(std::move(task));
     }
 

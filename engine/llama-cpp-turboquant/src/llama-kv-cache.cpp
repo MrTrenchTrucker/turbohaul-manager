@@ -2254,7 +2254,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
-void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, size_t max_cells) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2286,6 +2286,13 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
+            }
+
+            // TURBOQUANT: optional position cap -- save only cells [0, max_cells)
+            // so a truncated save yields a CONSISTENT bin (header N, tokens N, cells [0, N)).
+            // Default SIZE_MAX = full sequence, byte-identical to prior behaviour.
+            if (add_cell && max_cells != SIZE_MAX && (uint32_t) cells.pos_get(i) >= (uint32_t) max_cells) {
+                add_cell = false;
             }
 
             if (add_cell) {

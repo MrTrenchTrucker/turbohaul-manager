@@ -345,7 +345,28 @@ class TestAutoPlaceIntegration:
             finally:
                 await mgr.shutdown()
 
-    async def test_auto_place_refused_when_both_cards_full(self, tmp_path):
+    async def test_auto_place_both_cards_full_stays_queued_not_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        """Re-points test_auto_place_refused_when_both_cards_full after an
+        intentional behavior change. Same scenario, unchanged: an
+        over-commit QUEUES (never refuses in-band), with nothing
+        idle-evictable. What changed: once a request is queued, it stays
+        queued; it is not cancelled unless the client explicitly cancels
+        it. So it no longer exhausts the bounded
+        evict-pending budget and fails with VramOverCommitError. It stays
+        QUEUED forever instead. The backoff AND the derived cap are both
+        monkeypatched small -- backoff alone is not enough: the old code's
+        cap is a real ~60-derived value at grace_seconds=0, so a bounded
+        wait window needs the cap forced small too, or a run against
+        the previous code never reaches exhaustion inside the window. The
+        previous code is the version that refused an over-commit after the
+        bounded budget was spent, instead of keeping the request queued
+        (an over-commit must still be pending when the wait window
+        ends)."""
+        monkeypatch.setattr("turbohaul.manager._VRAM_DEFER_BACKOFF_S", 0.01)
+        monkeypatch.setattr("turbohaul.manager._VRAM_DEFER_MIN_DEFERS", 20)
+        monkeypatch.setattr("turbohaul.manager._VRAM_DEFER_MAX_DEFERS", 20)
         boot, runtime = _boot_runtime_multislot(
             tmp_path, safety_min_free_vram_mib=1000,
         )
@@ -353,12 +374,30 @@ class TestAutoPlaceIntegration:
         mgr = _mk(boot, runtime, **_mocks_capturing_argv([]))
         with _vram([1500, 1500]):
             mgr._worker_task = asyncio.create_task(mgr.worker_loop())
+            f = None
             try:
-                with pytest.raises(RuntimeError):
-                    await asyncio.wait_for(
-                        mgr.submit_and_wait("m1", "p", thread_id="t1"), timeout=5,
+                f = asyncio.create_task(mgr.submit_and_wait("m1", "p", thread_id="t1"))
+                try:
+                    await asyncio.wait_for(asyncio.shield(f), timeout=2)
+                except asyncio.TimeoutError:
+                    pass  # expected -- still queued, no exhaustion
+                else:
+                    pytest.fail(
+                        "the slot resolved instead of staying queued -- "
+                        "both cards are full in this scenario"
                     )
+                assert not f.done(), (
+                    "An over-commit with nothing idle-evictable "
+                    "must stay QUEUED forever now, never refused via the "
+                    "old exhaustion 503"
+                )
             finally:
+                if f is not None and not f.done():
+                    f.cancel()
+                    try:
+                        await f
+                    except BaseException:
+                        pass
                 await mgr.shutdown()
 
     async def test_each_used_card_keeps_safety_floor_free(self, tmp_path):

@@ -1283,6 +1283,23 @@ class TensorNameMap:
         MODEL_TENSOR.ENC_OUTPUT_NORM: (
             "encoder.final_layer_norm", # t5
             "layer_norm",               # neobert
+            "model.hidden_norm",        # dflash
+        ),
+
+        MODEL_TENSOR.FC: (
+            "model.fc", # dflash
+        ),
+
+        MODEL_TENSOR.DSPARK_MARKOV_W1: (
+            "model.markov_head.markov_w1", # dspark
+        ),
+
+        MODEL_TENSOR.DSPARK_MARKOV_W2: (
+            "model.markov_head.markov_w2", # dspark
+        ),
+
+        MODEL_TENSOR.DSPARK_CONF_PROJ: (
+            "model.confidence_head.proj", # dspark
         ),
 
         MODEL_TENSOR.CLS: (

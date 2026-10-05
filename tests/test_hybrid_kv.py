@@ -9,6 +9,7 @@ import pytest
 
 from turbohaul.manifest import (
     Manifest,
+    ModelManifest,
 )
 from turbohaul.safety import (
     GateResult,
@@ -124,7 +125,13 @@ class TestAllSafetyGatesHybrid:
             results = all_safety_gates(
                 min_free_ram_mib=1024,
                 min_free_vram_mib=512,
-                max_load_per_core=0.9,
+                # Uses a never-refuse sentinel (99.0) so the result does not
+                # depend on host load (this test never inspects the aggregate,
+                # just the kv_cache_fit gate), matching the neighbouring
+                # max_iowait_percent idiom. Hermetic by construction,
+                # not by accident (no os.getloadavg patch needed).
+                # The CPU-busy gate is effectively disabled here.
+                max_cpu_busy_percent=99.0,
                 max_iowait_percent=30.0,
                 ctx_size=65536,
                 gguf_size_bytes=_qwen27b_bytes(),
@@ -157,7 +164,7 @@ class TestManifestArchFields:
     def test_existing_manifest_without_arch_parses(self):
         """A manifest without arch or hybrid_kv_ratio fields should parse fine
         with defaults (arch='', hybrid_kv_ratio=1.0)."""
-        m = Manifest(
+        m = ModelManifest(
             model_tag="qwen3.6-35b-moe",
             display_name="Qwen 3.6 35B",
             gguf_blob_sha256=SAMPLE_SHA,
@@ -171,9 +178,9 @@ class TestManifestArchFields:
 
     def test_qwen35_manifest_with_hybrid_ratio(self):
         """A qwen35 manifest with hybrid_kv_ratio < 1.0 parses and validates."""
-        m = Manifest(
-            model_tag="qwen35-35b-q2g64",
-            display_name="Hybrid 35B",
+        m = ModelManifest(
+            model_tag="qwen35-35b-lowbit",
+            display_name="Example 35B low-bit",
             gguf_blob_sha256=SAMPLE_SHA,
             gguf_size_bytes=5_000_000_000,
             context_size=131072,
@@ -187,13 +194,13 @@ class TestManifestArchFields:
     def test_hybrid_kv_ratio_clamped_to_unit_interval(self):
         """hybrid_kv_ratio must be in [0.0, 1.0] (Pydantic Field ge=0.0, le=1.0)."""
         with pytest.raises(Exception):
-            Manifest(
+            ModelManifest(
                 model_tag="test",
                 gguf_blob_sha256=SAMPLE_SHA,
                 hybrid_kv_ratio=1.5,
             )
         with pytest.raises(Exception):
-            Manifest(
+            ModelManifest(
                 model_tag="test",
                 gguf_blob_sha256=SAMPLE_SHA,
                 hybrid_kv_ratio=-0.1,
@@ -247,3 +254,47 @@ class TestExistingModelRegression:
                 kv_cache_quant="f16", no_kv_offload=True)
         assert r.ok
         assert "host RAM" in r.detail
+
+
+class TestHybridKvAnnouncement:
+    """The discount is a static manifest property, so it is announced ONCE per
+    model. Two of the three call sites sit on the per-spawn and per-slot paths,
+    where an unconditional log line repeats on every request for the busiest
+    model and stops being read."""
+
+    @staticmethod
+    def _announcer():
+        from turbohaul.manager import TurbohaulManager
+
+        class _Probe:
+            _announce_hybrid_kv = TurbohaulManager._announce_hybrid_kv
+
+            def __init__(self):
+                self._hybrid_kv_announced = set()
+
+        return _Probe()
+
+    def test_announced_once_per_model(self, caplog):
+        probe = self._announcer()
+        with caplog.at_level("INFO", logger="turbohaul.manager"):
+            for _ in range(5):
+                probe._announce_hybrid_kv("model-a", 0.25, "footprint")
+        hits = [r for r in caplog.records if "hybrid KV discount active" in r.getMessage()]
+        assert len(hits) == 1, f"expected one announcement, got {len(hits)}"
+
+    def test_default_ratio_is_silent(self, caplog):
+        """A ratio of 1.0 is the default (no discount) and must never announce."""
+        probe = self._announcer()
+        with caplog.at_level("INFO", logger="turbohaul.manager"):
+            for _ in range(3):
+                probe._announce_hybrid_kv("model-b", 1.0, "spawn gate")
+        assert [r for r in caplog.records if "hybrid KV discount active" in r.getMessage()] == []
+
+    def test_distinct_models_each_announce(self, caplog):
+        probe = self._announcer()
+        with caplog.at_level("INFO", logger="turbohaul.manager"):
+            probe._announce_hybrid_kv("model-a", 0.25, "footprint")
+            probe._announce_hybrid_kv("model-b", 0.50, "spawn gate")
+            probe._announce_hybrid_kv("model-a", 0.25, "spawn safety gate")
+        hits = [r for r in caplog.records if "hybrid KV discount active" in r.getMessage()]
+        assert len(hits) == 2, f"one per distinct model expected, got {len(hits)}"

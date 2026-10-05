@@ -4,6 +4,7 @@
 server:
   host: 127.0.0.1  # validator-enforced default; uvicorn binds 0.0.0.0 only when
                    # --allow-public-bind / TURBOHAUL_ALLOW_PUBLIC_BIND=1 is set.
+                   # See the server-binding notes in the docs.
   port: 11401
   allow_public_bind: false
 
@@ -29,7 +30,13 @@ queue:
   grace_seconds: 30
   idle_hot_load_seconds: 120
   max_grace_extensions: 5
-  loading_health_timeout_s: 600
+  # 120s, not the 60s code default. Cold loads of large models take tens of
+  # seconds, so this value must leave headroom above a healthy load.
+  # The stall warning fires at the MIDPOINT of this timeout, so at 60s the midpoint
+  # would be 30s and every healthy large-model load would log a stall warning - exactly the
+  # noise the warning was designed to avoid. At 120s the midpoint is 60s, clear of
+  # a healthy load, while a genuine hang still surfaces in ~2min instead of 10.
+  loading_health_timeout_s: 120
   drained_sigterm_window_active_s: 15
   drained_sigterm_window_cold_s: 5
 
@@ -45,3 +52,6 @@ pull:
 
 persist:
   max_bytes: 42949672960  # 40 GiB default
+
+kv:
+  covered_scaffold_strip: true  # strip reasoning scaffolding from saved history so it matches a future resend

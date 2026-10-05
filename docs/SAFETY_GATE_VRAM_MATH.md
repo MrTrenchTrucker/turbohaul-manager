@@ -6,7 +6,7 @@ The load-bearing part of this system is the VRAM math: a closed-form estimate of
 
 The same VRAM math also backs **cross-resident reservation** — deciding whether a second model may be loaded alongside one that is already warm.
 
-This document explains exactly how that estimate is computed and how the decision is made. Everything below is deterministic integer arithmetic, and every rounding step truncates **downward**, so the design deliberately errs toward *refusing* a risky spawn rather than admitting one that could OOM.
+This document explains exactly how that estimate is computed and how the decision is made. Everything below is deterministic arithmetic that produces whole-MiB figures, and every rounding step truncates **downward**. Truncation can only under-count by a small amount, so the margin toward *refusing* a risky spawn rather than admitting one that could OOM comes from the design's conservative defaults instead: an unrecognized cache type is counted as f16, every layer is counted as attention when the layout is unknown, a fixed overhead floor is always added, and a multi-slot spawn with no VRAM probe is refused.
 
 ---
 
@@ -25,10 +25,10 @@ The manifest carries top-level sizing fields plus an allowlisted dictionary of i
 | `expected_vram_bytes` | manifest | int, default 0 | Operator-declared total GPU footprint. Feeds the coarse VRAM-floor check and is the authoritative footprint for expert-offload configs. |
 | `hybrid_kv_ratio` | manifest | float in [0.0, 1.0], default 1.0 | Fraction of layers that grow a per-token KV cache. Applied **only** on the legacy path (see §4). |
 | `kv_bytes_per_token` | manifest | float or unset, floor ≥ 1024 | Operator-**measured** effective KV cost in bytes/token. Highest-precedence KV tier when present. |
-| `arch` | manifest | str, default `""` | Architecture identifier. The hybrid discount activates only when this matches a designated hybrid-architecture identifier. |
+| `arch` | manifest | str, default `""` | Per-model opt-in to the dimension-aware KV tier. Any **non-empty** value (the string itself is never compared against an architecture name) makes the model eligible for Tier 2 when its GGUF parses. It does **not** gate `hybrid_kv_ratio`. |
 | `ctx_size` | server flags | int [1, 2_000_000] | The actual context window handed to the server; preferred over `context_size`. |
-| `cache_type_k` | server flags | enum, absent ⇒ `f16` | KV-cache quant type for the K half. |
-| `cache_type_v` | server flags | enum, absent ⇒ falls back to `cache_type_k` | KV-cache quant type for the V half. |
+| `cache_type_k` | server flags | enum, absent ⇒ `turbo3` (default, injected at manifest parse) | KV-cache quant type for the K half. |
+| `cache_type_v` | server flags | enum, absent ⇒ `turbo3` (default, injected at manifest parse) | KV-cache quant type for the V half. An explicit manifest value always wins over the injected default. |
 | `parallel` | server flags | int [1, 256], default 1 | Concurrent server slots; each extra slot adds a flat compute floor. |
 | `split_mode` | server flags | enum {none, layer, row, tensor}, default `layer` | GPU placement — single card vs. spanning all cards. |
 | `main_gpu` | server flags | int [0, 16], default 0 | Card index used when `split_mode == none`. |
@@ -48,14 +48,18 @@ A small, dependency-free GGUF header reader pulls the model's real attention geo
 | `<arch>.attention.key_length` | Per-head K dimension. |
 | `<arch>.attention.value_length` | Per-head V dimension. |
 | `<arch>.embedding_length`, `<arch>.attention.head_count` | Fallback used to derive per-head dims when `key_length`/`value_length` are absent (`embedding_length // head_count`). |
+| `<arch>.attention.sliding_window` | Sliding-window size. Present ⇒ the non-full-attention layers are sliding-window (capped per layer), absent ⇒ they are fixed-state recurrent layers (free). |
+| `<arch>.nextn_predict_layers` | Multi-token-prediction draft-head layer count. `0` on any model lacking the key. |
 
 The parsed dims are considered usable only when `block_count > 0`, `n_head_kv > 0`, `key_length > 0`, and `value_length > 0`; otherwise the reader yields nothing and the estimate falls back.
 
+When `<arch>.full_attention_interval` is absent, the interval is derived from a per-layer `<arch>.attention.head_count` array — but only when that array is exactly `block_count` long and describes a strictly periodic two-tier split, so an incidental head-count variation can never be mistaken for a real hybrid layout. Anything else yields an interval of 0, which falls back to counting every layer as attention.
+
 ### 1.3 Live system state
 
-- **Free VRAM per GPU** — `nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits`, one integer (MiB) per visible CUDA device, in index order. Total VRAM is probed at boot.
+- **Free VRAM per GPU** — `nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits`, one integer (MiB) per GPU that `nvidia-smi` reports, in index order. Total VRAM per card is read once and cached; the gate math below does not use it.
 - **Free system RAM** — `MemAvailable` from `/proc/meminfo` (KiB).
-- **CPU load / IO-wait** — `os.getloadavg`, `os.cpu_count`, and two samples of the `/proc/stat` `cpu` line for the sibling load and IO-wait gates.
+- **CPU busy % / IO-wait** — two samples of the `/proc/stat` `cpu` line for the sibling CPU-utilization and IO-wait gates (`os.getloadavg`/`os.cpu_count` are not read by any gate in the battery).
 
 ---
 
@@ -79,7 +83,7 @@ A KV cache grows one K entry and one V entry **per token, per attention layer**.
 measured bytes/token   >   dimension-aware GGUF dims   >   legacy file-size heuristic
 ```
 
-The higher a tier, the more accurate it is; each falls back to the next when its inputs are missing. All three scale **linearly** with context length.
+The higher a tier, the more accurate it is; each falls back to the next when its inputs are missing. Each tier scales **linearly** with context length, except that in Tier 2 a sliding-window layer stops growing once the context passes its window (see below).
 
 A guard short-circuits the whole thing:
 
@@ -122,14 +126,41 @@ kv_mib      = total_bytes // (1024 * 1024)
 
 ### Tier 2 — dimension-aware (real GGUF geometry)
 
-Taken when parsed attention dims are present and the derived attention-layer count is > 0. K and V are computed as two separate terms, each with its own per-head dimension and its own quant scale (the constant `2` is the byte size of an f16 element):
+Eligibility is decided before the estimator runs. Parsed dims are handed to it only when the model's GGUF yields at least one derivable sliding-window layer, **or** the manifest sets a non-empty `arch`. Any other model — including one whose header parses cleanly — falls through to Tier 3.
+
+When dims are supplied and the derived attention-layer count is > 0, K and V are computed as two separate terms, each with its own per-head dimension and its own quant scale (the constant `2` is the byte size of an f16 element):
 
 ```
 k_bytes_f16        = n_attn_layers * n_head_kv * key_length   * 2
 v_bytes_f16        = n_attn_layers * n_head_kv * value_length * 2
 eff_bytes_per_token = k_bytes_f16 * scale_k + v_bytes_f16 * scale_v
 total_bytes        = int(eff_bytes_per_token * ctx_size)
-kv_mib             = total_bytes // (1024 * 1024)
+```
+
+Two conditional terms are then added to `total_bytes`.
+
+**Sliding-window layers.** A sliding-window layer does not grow past its window, but it is not free either — it is capped, not zero. Conflating it with a fixed-state recurrent layer under-counts any sliding model:
+
+```
+swa_capped_tokens = min(ctx_size, sliding_window)   if n_swa_layers > 0 and window else 0
+swa_k_bytes_f16   = n_swa_layers * n_head_kv * key_length   * 2
+swa_v_bytes_f16   = n_swa_layers * n_head_kv * value_length * 2
+total_bytes      += int((swa_k_bytes_f16 * scale_k + swa_v_bytes_f16 * scale_v)
+                        * swa_capped_tokens)
+```
+
+**Multi-token-prediction draft context.** Added only when the manifest's `spec_type` is one of `draft-mtp`, `draft-dflash` or `draft-dspark` **and** the GGUF declares `nextn_predict_layers > 0` — never fabricated. The draft cache runs f16 regardless of the manifest's `cache_type_k`/`cache_type_v`, so its scale is **always** 1.0, and it is sized at the target's full context, not the draft length:
+
+```
+draft_bytes_per_token = nextn_predict_layers * n_head_kv
+                        * (key_length + value_length) * 2 * MTP_DRAFT_MARGIN
+total_bytes          += int(draft_bytes_per_token * ctx_size)
+```
+
+`MTP_DRAFT_MARGIN` is `1.05`: a proportional safety margin, so it scales with whichever model's geometry it is applied to.
+
+```
+kv_mib = total_bytes // (1024 * 1024)
 ```
 
 The attention-layer count is derived from the hybrid interval. When no interval is declared, **every** layer is counted as attention — an intentional over-estimate that never under-reserves:
@@ -158,7 +189,7 @@ kv_mib               = total_kib // 1024
 
 ### 4.1 `hybrid_kv_ratio` and why the first two tiers ignore it
 
-Some architectures interleave **attention** layers (whose KV grows with sequence length) with **SSM/recurrent** layers (which hold a fixed-size state that does **not** grow per token). `hybrid_kv_ratio` is the attention fraction of layers — a discount that stops the legacy path from sizing every layer as a growing cache. The default of `1.0` is a no-op multiply, keeping non-hybrid models byte-identical to the pre-hybrid behavior. It is honored only when `arch` matches the designated hybrid-architecture identifier; for any other arch it is forced to `1.0`.
+Some architectures interleave **attention** layers (whose KV grows with sequence length) with **SSM/recurrent** layers (which hold a fixed-size state that does **not** grow per token). `hybrid_kv_ratio` is the attention fraction of layers — a discount that stops the legacy path from sizing every layer as a growing cache. The default of `1.0` is a no-op multiply, keeping non-hybrid models byte-identical to the pre-hybrid behavior. It is applied to any model whose manifest declares a value below `1.0` — the estimator does not cross-check the declared value against `arch` or against the model's real geometry, so an incorrect ratio silently under-reserves. Treat it, like `expected_vram_bytes`, as a load-bearing number that must be measured.
 
 Crucially, **Tier 1 and Tier 2 do not apply it**:
 
@@ -187,6 +218,14 @@ if nvidia-smi is unreadable:  free_for_fit = None
 
 With exactly one physical GPU, `sum([x]) == min([x]) == x`, so every branch collapses to that single card and behavior is identical to a naive GPU-0-only check. The multi-GPU logic is a strict, behavior-preserving superset.
 
+```
+# Both VRAM gates then subtract VRAM already pledged to a concurrent load:
+occupied      = sum(reserved_need_mib of still-loading siblings on the same card)
+effective_free = free_for_fit - occupied
+```
+
+A sibling that is already loaded is **not** counted here — its VRAM is already absent from the live reading, so charging it again would double-count. Only a sibling that is still booting, on the card this spawn will land on, is subtracted. If the subtraction goes negative the gate refuses outright rather than comparing a nonsense figure.
+
 ### 5.2 The coarse floor check (`check_free_vram`)
 
 A first, manifest-driven check compares free VRAM against the larger of a fixed floor and the model's declared footprint:
@@ -194,7 +233,8 @@ A first, manifest-driven check compares free VRAM against the larger of a fixed 
 ```
 expected_mib = expected_vram_bytes // (1024 * 1024)
 threshold    = max(min_free_vram_mib, expected_mib)     # min_free_vram_mib default 512
-REFUSE if free_for_fit < threshold
+REFUSE if effective_free < 0
+REFUSE if effective_free < threshold
 ```
 
 `min_free_vram_mib` is a **floor on the required-free amount** — it is *not* subtracted from measured free VRAM. Even a tiny model must leave at least that floor free. If the probe is missing, this check passes.
@@ -206,7 +246,8 @@ This is the load-bearing gate. Instead of trusting a hand-declared footprint, it
 ```
 p             = max(1, parallel)
 par_extra_mib = (p - 1) * 256          # PER_SLOT_COMPUTE_FLOOR_MIB = 256
-overhead_mib  = 1024                    # activation/scratch floor (configurable)
+overhead_mib  = 1024                    # activation/scratch floor; a fixed
+                                        # constant, not a config knob
 ```
 
 The context-linear KV term is the **aggregate** window that the inference server splits across slots, so it is counted **once** and never multiplied by the slot count. Only the flat 256 MiB buffer is charged per *additional* slot.
@@ -242,42 +283,65 @@ vram_need = expected_vram_mib + overhead_mib + par_extra_mib
 REFUSE if vram_need > free_for_fit
 ```
 
-This override applies only when `expected_vram_bytes > 0`; otherwise the gate falls back to the closed form (which over-counts for offload configs), so keeping that value accurate is the operator's responsibility for context-bump safety.
+This override applies only when the declared footprint is at least 1 MiB (`expected_vram_bytes // (1024 * 1024) > 0`); otherwise the gate falls back to the closed form (which over-counts for offload configs), so keeping that value accurate is the operator's responsibility for context-bump safety.
 
 ### 5.5 Cross-resident reservation
 
-The same math backs co-residence of two warm models. This is intentionally narrow: a second model may load alongside existing ones **only** when the incoming model and every already-loaded sibling are all `split_mode == none` on **distinct** `main_gpu` cards. The reservation charges only siblings still in a loading state on the **same** card (an already-loaded sibling is already reflected in the live free-VRAM reading; charging it again would double-count):
+The same math backs co-residence of warm models. This is intentionally narrow: a second model may load alongside existing ones **only** when the incoming model and every already-loaded sibling are all `split_mode == none`. They may share one card or sit on different cards — placement is decided by the per-card budget, not by a distinct-card rule. A single `layer`/`row`/`tensor` sibling anywhere refuses the whole admission, because a card-spanning model makes per-card budgeting unprovable. The reservation charges only siblings still in a loading state on the **same** card (an already-loaded sibling is already reflected in the live free-VRAM reading; charging it again would double-count):
 
 ```
 reserve = sum(reserved_need_mib of still-loading siblings on the SAME main_gpu)
 ADMIT if (free_for_fit - reserve) >= need
 ```
 
-A note on the reservation footprint: pre-spawn budget accounting uses `max(declared_footprint, closed_form_body_plus_kv)` as a conservative floor, and the live gate then re-checks against real free VRAM at spawn time.
+A note on the reservation footprint: pre-spawn budget accounting uses `max(declared_footprint, closed_form_body_plus_kv) + (parallel - 1) * 256` as a conservative floor — except for an expert-offload config with a declared footprint, which uses `declared_footprint + (parallel - 1) * 256` instead. The live gate then re-checks against real free VRAM at spawn time.
+
+### 5.6 Two independent gates beside the fit check
+
+**Host-RAM fit for offloaded weights (`moe_ram_fit`).** The expert-offload branch of the fit check returns before it reaches its own host-RAM sub-check, so a config that sets *both* expert offload and host-RAM KV would have neither term checked against RAM. This gate closes that: it sums the exactly-derived offloaded expert bytes and the host-RAM KV figure and refuses if the total will not fit.
+
+```
+need_mib = expert_offloaded_mib + kv_ram_mib
+PASS immediately if need_mib <= 0        # a model using neither offload: a no-op
+REFUSE if need_mib > MemAvailable_KiB // 1024
+```
+
+The expert figure is derived from the GGUF's per-block expert-tensor byte layout against the manifest's `n_cpu_moe` count, not estimated; when `n_cpu_moe` is 0 or unset (including a bare `cpu_moe: true`) or the layout cannot be read, it is 0 and the expert term no-ops.
+
+**Placement arity (`tensor_split_devices`).** A manifest's `tensor_split` ratio must have exactly one element per visible device. Device count is a runtime property — the same manifest may be read on a different box — so this cannot be enforced by the static manifest validator and runs here instead, against the live probe:
+
+```
+PASS if no tensor_split is set, or the probe is unavailable
+REFUSE if tensor_split.count(",") + 1 != visible_device_count
+```
+
+The engine has its own backstop for this, but the manager refuses first with a clear error rather than risking an out-of-memory from wrong placement.
 
 ---
 
 ## 6. The full gate sequence
 
-The fit checks above run as part of a five-gate battery, evaluated in a **fixed order** with **no short-circuiting** — every gate always runs, so the audit trail and the error returned to the caller carry the complete picture. **All gates must pass** for the spawn to proceed; if any gate reports failure, the manager marks the load failed, writes an audit record, moves the slot to a failed/popped state **without launching any server process**, and fails the caller's request with a message concatenating every failed gate's detail. The whole subsystem can be disabled with a single runtime flag, in which case the manager spawns unconditionally.
+The fit checks above run as part of a **seven-gate battery**, evaluated in a **fixed order** with **no short-circuiting** — every gate always runs, so the audit trail carries the complete picture. **All gates must pass** for the spawn to proceed; if any gate reports failure, the manager marks the load failed, writes an audit record naming every failed gate and its detail, and moves the slot to a failed/popped state **without launching any server process**. On both the single-slot path and the multi-slot dispatcher path the caller's error carries the concatenated per-gate detail (the detail is also available in the log and the audit record). On the multi-slot dispatcher path two things can happen before that final refusal: when every failing gate is a VRAM gate and a release already in flight on the affected card(s) could free memory, the spawn waits (bounded by `queue.spawn_reclaim_wait_max_s`, default 10 s) and re-runs the gates; and if the same model already has another running engine, the request is handed to that engine instead of failing. The whole subsystem can be disabled with a single runtime flag (`queue.safety_enabled`), in which case the manager spawns unconditionally.
 
-| # | Gate | Passes when | Missing-probe behavior |
+| # | Gate (`GateResult.name`) | Passes when | Missing-probe behavior |
 |---|---|---|---|
-| 1 | Free system RAM | `MemAvailable // 1024 ≥ min_free_ram_mib` | Pass |
-| 2 | Free VRAM (floor vs. declared) | `free_for_fit ≥ max(min_free_vram_mib, expected_mib)` | Pass |
-| 3 | Closed-form KV-cache fit | `predicted total ≤ free_for_fit` | Pass at `parallel = 1`; **refuse** at `parallel > 1` |
-| 4 | CPU load per core | `loadavg[0] / cpu_count ≤ max_load_per_core` | Pass |
-| 5 | Disk IO-wait % | sampled `%iowait ≤ max_iowait_percent` | Pass (also passes on zero delta) |
+| 1 | `ram` — free system RAM | `MemAvailable // 1024 ≥ min_free_ram_mib` | Pass |
+| 2 | `vram` — free VRAM floor vs. declared | `effective_free ≥ max(min_free_vram_mib, expected_mib)` | Pass |
+| 3 | `kv_cache_fit` — closed-form fit | `predicted total ≤ effective_free` | Pass at `parallel = 1`; **refuse** at `parallel > 1` |
+| 4 | `moe_ram_fit` — offloaded experts + host-RAM KV | `expert_offloaded_mib + kv_ram_mib ≤ MemAvailable // 1024` | Pass (a pure no-op when both terms are 0) |
+| 5 | `cpu_util` — CPU busy % | sampled `busy_percent ≤ max_cpu_busy_percent` | Pass |
+| 6 | `iowait` — disk IO-wait % | sampled `%iowait ≤ max_iowait_percent` | Pass (also passes on zero delta) |
+| 7 | `tensor_split_devices` — placement arity | `tensor_split` element count equals the visible device count | Pass (also passes when no `tensor_split` is set) |
 
 Every gate **degrades open** — a missing or unreadable probe returns a pass rather than blocking — with the single exception of the multi-slot no-probe case in Gate 3. Gates 2 and 3 are **complementary, not redundant**: Gate 2 uses the hand-declared footprint, while Gate 3 recomputes from context size + body + quant. Bumping the context window in the manifest is caught by Gate 3 even if the declared footprint was never re-tuned to match.
 
 ```
-gates  = [free_ram, free_vram, kv_cache_fit, cpu_load, iowait]
+gates  = [free_ram, free_vram, kv_cache_fit, moe_ram_fit,
+          cpu_util, iowait, tensor_split_devices]
 failed = [g for g in gates if not g.ok]
 spawn proceeds only if failed == []
 # on refusal:
 detail = "; ".join(f"{g.name}: {g.detail}" for g in failed)
-fail caller with: f"safety gates refused spawn: {detail}"
 ```
 
 ---
@@ -304,13 +368,13 @@ total_mib          = 17408 + 9792 + 1024 + 0 = 28224 MiB    (~27.6 GiB)
 - On **one 32 GB card** (~31,000 MiB free): `28224 ≤ 31000` → **PASS**.
 - On **two 24 GB cards, layer split** (budget `≈ 46000` MiB): `28224 ≤ 46000` → **PASS** — the exact model that failed on one card fits once the budget aggregates both.
 
-Two knobs lower the requirement and can flip a refusal into a fit on the 24 GB card. Quantizing the KV to `q8_0` (`scale = 0.5`): `kb_per_token = 76`, `kv_mib = (76 * 65536) // 1024 = 4864 MiB`, `total = 23296 MiB`. Or dropping the context to 8K with `q8_0`: `kv_mib = (76 * 8192) // 1024 = 608 MiB`, `total = 19040 MiB ≤ 23000` → **PASS**.
+Two knobs lower the requirement and can flip a refusal into a fit on the 24 GB card. Quantizing the KV to `q8_0` (`scale = 0.5`): `kb_per_token = 76`, `kv_mib = (76 * 65536) // 1024 = 4864 MiB`, `total = 23296 MiB` (still above 23,000 MiB, so this alone does not flip the result). Also dropping the context to 8K with `q8_0`: `kv_mib = (76 * 8192) // 1024 = 608 MiB`, `total = 19040 MiB ≤ 23000` → **PASS**.
 
 ### 7.2 Large-context model that fits only via a measured override
 
 A 27B-class **hybrid** model with a **17 GiB** body, run at a **128K** context (`ctx_size = 131072`), f16 KV, on **one 24 GB card** (~23,000 MiB free).
 
-**Without an override (dimension-aware tier).** With parsed dims of `n_attn_layers = 16`, `n_head_kv = 16`, `key_length = value_length = 128`:
+**Without an override (dimension-aware tier).** The manifest sets a non-empty `arch`, so the dimension-aware tier is eligible, and with parsed dims of `n_attn_layers = 16`, `n_head_kv = 16`, `key_length = value_length = 128`:
 
 ```
 k_bytes_f16 = 16 * 16 * 128 * 2 = 65536 bytes/token
@@ -322,7 +386,7 @@ total_mib   = 17408 + 16384 + 1024 = 34816 MiB               (~34 GiB)
 
 `34816 > 23000` → **REFUSE** (and it would still be refused on a 32 GB card).
 
-**With a measured override.** The operator measures the model's real effective KV cost on hardware — the hybrid recurrent layers hold fixed state, so the true per-token cost is far below the geometry-only estimate — and records `kv_bytes_per_token = 32768` (32 KiB/token). Tier 1 uses it verbatim:
+**With a measured override.** The operator measures the model's real effective KV cost on hardware — in this illustrative case it comes out well below the geometry-only estimate — and records `kv_bytes_per_token = 32768` (32 KiB/token). Tier 1 uses it verbatim:
 
 ```
 kv_mib    = (32768 * 131072) // (1024*1024) = 4096 MiB       (4 GiB)

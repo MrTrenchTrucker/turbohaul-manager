@@ -21,11 +21,11 @@ class TestSlotState:
 
 class TestSlot:
     def test_new_generates_slot_id(self):
-        s = Slot.new("model-35b-moe")
+        s = Slot.new("qwen3.6-35b-moe")
         assert s.slot_id.startswith("slot-")
         assert len(s.slot_id) > len("slot-")
         assert s.state == SlotState.RECEIVED
-        assert s.model_tag == "model-35b-moe"
+        assert s.model_tag == "qwen3.6-35b-moe"
 
     def test_new_with_thread_id(self):
         s = Slot.new("m", thread_id="thr-abc")

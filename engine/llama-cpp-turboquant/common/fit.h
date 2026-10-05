@@ -54,3 +54,19 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
+
+// Load a parent model + context with no_alloc, then return the per-device memory breakdown
+// of a child model + context measured with the parent set as its cparams.ctx_other (e.g. a
+// DFlash/DSpark draft model measured against its target).
+common_device_memory_data_vec common_get_device_memory_data_with_parent(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+                         const char * path_parent,
+           const llama_model_params * mparams_parent,
+         const llama_context_params * cparams_parent,
+    std::vector<ggml_backend_dev_t> & devs,
+                           uint32_t & hp_ngl,
+                           uint32_t & hp_n_ctx_train,
+                           uint32_t & hp_n_expert,
+                     ggml_log_level   log_level);

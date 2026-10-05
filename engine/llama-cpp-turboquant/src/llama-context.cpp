@@ -101,10 +101,10 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
-                throw std::runtime_error("EAGLE3 requires ctx_other to be set (this warning is normal during memory fitting)");
+                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
         }
@@ -1383,7 +1383,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
-    const int64_t n_embd = hparams.n_embd_inp();
+    const int64_t n_embd = hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
@@ -3082,7 +3082,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     return file.tell();
 }
 
-size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count, size_t max_cells) {
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
@@ -3094,7 +3094,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 
     // save the context state using stream saving
     llama_io_write_file io(&file);
-    state_seq_write_data(io, seq_id, 0);
+    state_seq_write_data(io, seq_id, 0, max_cells);
 
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
@@ -3148,11 +3148,11 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     return io.n_bytes();
 }
 
-size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, size_t max_cells) {
     GGML_UNUSED(seq_id);
 
     if (memory) {
-        memory->state_write(io, seq_id, flags);
+        memory->state_write(io, seq_id, flags, max_cells);
     }
 
     return io.n_bytes();
@@ -4039,6 +4039,17 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 
     try {
         return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_file_capped(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count, size_t max_cells) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count, max_cells);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
         return 0;

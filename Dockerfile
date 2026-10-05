@@ -3,12 +3,11 @@
 # Stage 1: Build the React+Vite frontend bundle.
 # Stage 2: Install the Python package and copy the bundle.
 #
-# NOTE: This slim image does NOT include the llama-server binary. The binary is
-# mounted at runtime from /opt/turbohaul/bin/llama-server. This decouples the
-# TurboQuant engine compile (which requires a GPU + CUDA build tools) from the
-# management-plane image -- the binary is built/audited separately. For a single
-# self-contained image with the engine baked in, use Dockerfile.engine-src or
-# Dockerfile.cuda-multi instead.
+# NOTE: This image does NOT include the llama-server binary. The binary is mounted
+# at runtime from /opt/turbohaul/bin/llama-server (see docker-compose.yml). This
+# decouples the TurboQuant engine compile (which requires GPU + CUDA build
+# tools) from the management-plane image, and keeps the supply chain simple:
+# the binary is shipped and audited separately.
 
 # ----------------------------------------------------------------------------
 # Stage 1: Frontend
@@ -40,6 +39,19 @@ RUN pip install --no-cache-dir .
 
 # Frontend bundle from stage 1.
 COPY --from=frontend-build /work/dist /opt/turbohaul/ui_dist
+
+# The generic PATH shim, installed under each executable name it
+# serves. The engine resolves `ffmpeg`/`ffprobe` from PATH exactly as if the
+# binary were baked in; the shim is LOCAL-FIRST (a real local binary execv's
+# with zero hops, so an operator-baked ffmpeg keeps working untouched) and
+# otherwise sends the call through the forwarder to the plugin container's
+# /ws/exec endpoint. The executable name IS the binary
+# parameter (argv[0] of the symlink); optional per-install semantics live in
+# /etc/ffshim/<name>.env. One COPY + symlinks (no per-name copies to drift).
+COPY engine/ffshim/ffshim.py /opt/turbohaul/shim/ffshim.py
+RUN chmod 755 /opt/turbohaul/shim/ffshim.py \
+ && mkdir -p /etc/ffshim \
+ && for name in ffmpeg ffprobe; do ln -sf /opt/turbohaul/shim/ffshim.py /usr/local/bin/$name; done
 
 # Runtime directories (state + config).
 RUN mkdir -p /var/lib/turbohaul /etc/turbohaul /opt/turbohaul/bin \

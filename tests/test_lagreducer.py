@@ -12,10 +12,11 @@ Covers the 3 changes in manager.py (DESIGN_LAGREDUCER.md), SAVE path only:
   3. FM-7 degenerate — a 0-turn incoming chain never forces a save.
 
 The single-series gate, the #103 clean stamp, and the RESTORE path are
-NOT touched (still covered by test_ws2_classifier.py / test_wave_return.py /
+NOT touched (still covered by test_classifier.py / test_wave_return.py /
 test_kv_policy.py).
 """
 import json
+import logging
 import os
 import types
 
@@ -34,11 +35,11 @@ from turbohaul.config import (
     UIConfig,
 )
 from turbohaul.kv_policy import _prefix_hash_chain, kv_meta_fn
-from turbohaul.manager import TurbohaulManager
+from turbohaul.manager import KV_DECLINE_NEVER_OVERWRITE_SMALLER, TurbohaulManager
 from turbohaul.slot import Slot
 
 
-# --- fixtures (mirror test_ws2_classifier.py / test_wave_return.py) --------------
+# --- fixtures (mirror test_classifier.py / test_wave_return.py) --------------
 @pytest.fixture
 def mgr(tmp_path):
     storage_root = tmp_path / "state"
@@ -58,7 +59,7 @@ def mgr(tmp_path):
         ),
         ui=UIConfig(static_path=tmp_path / "ui_dist"),
     )
-    runtime = RuntimeConfig(queue=QueueConfig(), pull=PullConfig())
+    runtime = RuntimeConfig(queue=QueueConfig(safety_enabled=False), pull=PullConfig())
     return TurbohaulManager(boot, runtime)
 
 
@@ -113,6 +114,18 @@ class _ProbeSaveClient:
             os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
             with open(tmp_path, "wb") as f:
                 f.write(b"dummy kv cache data")
+        if "/v1/chat/completions" in url:
+            # Plain-probe regime (covered_scaffold_strip off): the real
+            # sidecar's /v1/chat/completions reply carries the tokenized
+            # prompt's usage. The manager's strict clean stamp
+            # keys off usage.prompt_tokens as its save evidence, so the fake
+            # reports the slot's own engine-reported count — exactly what the
+            # engine would return for the same render.
+            _n = (self._slots_payload[0].get("n_prompt_tokens") or 1) if self._slots_payload else 1
+            return _SaveResp({"status": "ok",
+                               "usage": {"prompt_tokens": _n,
+                                         "completion_tokens": 0,
+                                         "total_tokens": _n}})
         return _SaveResp({"status": "ok"})
 
 
@@ -134,17 +147,18 @@ def make_httpx(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _covered_scaffold_strip_off(monkeypatch):
-    """Fix B ships default-ON, which swaps the clean-probe prefill TRANSPORT to
-    /apply-template + /completion. This suite verifies the TRANSPORT-INDEPENDENT
-    never-demote / throttle / grow-monotone / FM-7 SAVE logic against the flag-OFF
-    (byte-identical-to-today) messages transport; the Fix B default-ON render+strip
-    transport + clean-bin write is covered in tests/test_covered_scaffold_strip.py."""
-    monkeypatch.setenv("TURBOHAUL_COVERED_SCAFFOLD_STRIP", "0")
+def _covered_scaffold_strip_off(mgr):
+    """The covered-scaffold strip ships default-ON, which swaps the clean-probe prefill
+    TRANSPORT to /apply-template + /completion. This suite verifies the
+    TRANSPORT-INDEPENDENT never-demote / throttle / grow-monotone / zero-turn-guard SAVE logic
+    against the flag-OFF (byte-identical-to-today) messages transport; the default-ON
+    render+strip transport + clean-bin write is covered in
+    tests/test_covered_scaffold_strip.py."""
+    mgr.runtime.kv.covered_scaffold_strip = False
 
 
-# path-safe example model tag for a 27B model (matches the other suites)
-_MODEL_TAG = "example-model-27b"
+# path-safe example model tag (matches the other suites)
+_QWEN = "qwen3.6-27b"
 _PORT = 59500
 
 
@@ -191,24 +205,24 @@ async def test_never_demote_multislot_force_clean_preserves_anchor(mgr, kv_dir, 
     clean anchor (True->False), and must not write ANY non-clean bin under the anchor
     thread identity."""
     anchor_chain = _prefix_hash_chain(_msgs(12))
-    _write_clean_bin(kv_dir, _MODEL_TAG, _PORT, "t", 0, anchor_chain, prompt_len=100000)
-    before = _read_meta(kv_dir, _MODEL_TAG, 0, "t")
+    _write_clean_bin(kv_dir, _QWEN, _PORT, "t", 0, anchor_chain, prompt_len=100000)
+    before = _read_meta(kv_dir, _QWEN, 0, "t")
     assert before["clean_prefix"] is True
 
     # engine reports TWO populated slots -> _eff_force_clean=False on a force_clean save
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100},
                         {"id": 1, "n_prompt_tokens": 100}])
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=_msgs(20), client_meta={})
+    slot = Slot.new(_QWEN, thread_id="t", context=_msgs(20), client_meta={})
 
-    await mgr._save_slot_kv(_PORT, _MODEL_TAG, slot, force_clean=True)
+    await mgr._save_slot_kv(_PORT, _QWEN, slot, force_clean=True)
 
-    after = _read_meta(kv_dir, _MODEL_TAG, 0, "t")
+    after = _read_meta(kv_dir, _QWEN, 0, "t")
     assert after["clean_prefix"] is True                 # NOT demoted
     assert after["n_context_turns"] == before["n_context_turns"]
     assert after["hash_chain"] == before["hash_chain"]   # anchor bytes untouched
     # co-resident slot1 KV was NOT written under the anchor thread identity
     th = TurbohaulManager._thread_hash("t")
-    assert not (kv_dir / kv_meta_fn(_MODEL_TAG, 1, th, _PORT)).exists()
+    assert not (kv_dir / kv_meta_fn(_QWEN, 1, th, _PORT)).exists()
     assert _n_save_posts(posts) == 0                      # aborted before the save POST
 
 
@@ -216,15 +230,27 @@ async def test_never_demote_multislot_force_clean_preserves_anchor(mgr, kv_dir, 
 async def test_single_slot_force_clean_still_overwrites_clean_bin(mgr, kv_dir, make_httpx):
     """Precision guard: the never-demote abort fires ONLY on the multi-slot demote
     case. A legitimate single-slot force_clean re-save (_eff_force_clean=True) still
-    (over)writes the clean bin -> the grow path is not blocked."""
-    _write_clean_bin(kv_dir, _MODEL_TAG, _PORT, "t", 0, _prefix_hash_chain(_msgs(10)))
+    (over)writes the clean bin -> the grow path is not blocked.
+
+    A force_clean save must carry probe evidence (in production the
+    only force_clean caller is the probe path, which records the clean-render
+    token count first) — pre-seed it exactly as the probe would, then exercise
+    the overwrite/grow semantics this test exists to pin."""
+    _write_clean_bin(kv_dir, _QWEN, _PORT, "t", 0, _prefix_hash_chain(_msgs(10)))
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])  # exactly ONE populated slot
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+    # The register holds CleanPrefillEvidence — the
+    # probe's count BOUND to THIS context's turn-hash chain (coherent
+    # extent: the slot reports the same 100, so the coherence gate passes by
+    # construction; the chain is this 15-turn save context's).
+    from turbohaul.manager import CleanPrefillEvidence, _chain_fp
+    mgr._clean_prefill_tokens[_PORT] = CleanPrefillEvidence(
+        count=100, chain_fp=_chain_fp(_prefix_hash_chain(_msgs(15))), arm="plain")
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
                     client_meta={"messages": _msgs(15)})
 
-    await mgr._save_slot_kv(_PORT, _MODEL_TAG, slot, force_clean=True)
+    await mgr._save_slot_kv(_PORT, _QWEN, slot, force_clean=True)
 
-    after = _read_meta(kv_dir, _MODEL_TAG, 0, "t")
+    after = _read_meta(kv_dir, _QWEN, 0, "t")
     assert after["clean_prefix"] is True
     assert after["n_context_turns"] == 15                # grew via the legit clean save
     assert _n_save_posts(posts) == 1
@@ -240,15 +266,15 @@ async def test_throttle_skips_below_min_growth(mgr, kv_dir, make_httpx):
     # SPEC-V2 REWORK: probe defers disk to unload; this test pins the flush/deferred path
     # (spec-v2 default threshold is 1 — pin 4 on the instance so the skip branch is exercised)
     mgr.LAGREDUCER_MIN_GROWTH_TURNS = 4
-    _write_clean_bin(kv_dir, _MODEL_TAG, _PORT, "t", 0, _prefix_hash_chain(_msgs(10)),
+    _write_clean_bin(kv_dir, _QWEN, _PORT, "t", 0, _prefix_hash_chain(_msgs(10)),
                      prompt_len=40000)
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
                     client_meta={"messages": _msgs(13)}, admission_ctx_len=50000)
 
     await mgr._probe_and_save_clean_kv(_handle(), slot)
 
-    assert _read_meta(kv_dir, _MODEL_TAG, 0, "t")["n_context_turns"] == 10   # not re-saved
+    assert _read_meta(kv_dir, _QWEN, 0, "t")["n_context_turns"] == 10   # not re-saved
     assert posts == []                                                 # skipped pre-probe
 
 
@@ -256,16 +282,16 @@ async def test_throttle_skips_below_min_growth(mgr, kv_dir, make_httpx):
 async def test_throttle_fires_at_min_growth(mgr, kv_dir, make_httpx):
     """Incoming grew exactly +4 (== MIN_GROWTH) -> the throttle allows the re-save;
     the anchor grows to the incoming turn count and stays clean."""
-    _write_clean_bin(kv_dir, _MODEL_TAG, _PORT, "t", 0, _prefix_hash_chain(_msgs(10)),
+    _write_clean_bin(kv_dir, _QWEN, _PORT, "t", 0, _prefix_hash_chain(_msgs(10)),
                      prompt_len=40000)
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
                     client_meta={"messages": _msgs(14)}, admission_ctx_len=50000)
 
     # SPEC-V2 REWORK: probe defers disk to unload; this test pins the flush/deferred path
     await mgr._probe_and_save_clean_kv(_handle(), slot, save_to_disk=True)
 
-    after = _read_meta(kv_dir, _MODEL_TAG, 0, "t")
+    after = _read_meta(kv_dir, _QWEN, 0, "t")
     assert after["n_context_turns"] == 14        # re-saved: anchor grew 10 -> 14
     assert after["clean_prefix"] is True         # still a valid anchor
     assert _n_save_posts(posts) == 1             # the re-save fired
@@ -276,13 +302,13 @@ async def test_no_clean_bin_saves_unconditionally(mgr, kv_dir, make_httpx):
     """No clean anchor yet -> the throttle does not gate: the first clean save fires
     regardless of turn count (bootstrap the anchor)."""
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
                     client_meta={"messages": _msgs(6)}, admission_ctx_len=50000)
 
     # SPEC-V2 REWORK: probe defers disk to unload; this test pins the flush/deferred path
     await mgr._probe_and_save_clean_kv(_handle(), slot, save_to_disk=True)
 
-    after = _read_meta(kv_dir, _MODEL_TAG, 0, "t")
+    after = _read_meta(kv_dir, _QWEN, 0, "t")
     assert after["clean_prefix"] is True
     assert after["n_context_turns"] == 6
     assert _n_save_posts(posts) == 1
@@ -295,23 +321,23 @@ async def test_no_clean_bin_saves_unconditionally(mgr, kv_dir, make_httpx):
 async def test_grow_monotone_across_resaves(mgr, kv_dir, make_httpx):
     """n_context_turns increases across re-saves and never regresses: 10 -> 16 -> 22,
     each jump >= MIN_GROWTH."""
-    _write_clean_bin(kv_dir, _MODEL_TAG, _PORT, "t", 0, _prefix_hash_chain(_msgs(10)),
+    _write_clean_bin(kv_dir, _QWEN, _PORT, "t", 0, _prefix_hash_chain(_msgs(10)),
                      prompt_len=40000)
 
     # SPEC-V2 REWORK: probe defers disk to unload; this test pins the flush/deferred path
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
     await mgr._probe_and_save_clean_kv(
-        _handle(), Slot.new(_MODEL_TAG, thread_id="t", context=None,
+        _handle(), Slot.new(_QWEN, thread_id="t", context=None,
                             client_meta={"messages": _msgs(16)}, admission_ctx_len=50000),
         save_to_disk=True)
-    assert _read_meta(kv_dir, _MODEL_TAG, 0, "t")["n_context_turns"] == 16
+    assert _read_meta(kv_dir, _QWEN, 0, "t")["n_context_turns"] == 16
 
     posts2 = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
     await mgr._probe_and_save_clean_kv(
-        _handle(), Slot.new(_MODEL_TAG, thread_id="t", context=None,
+        _handle(), Slot.new(_QWEN, thread_id="t", context=None,
                             client_meta={"messages": _msgs(22)}, admission_ctx_len=60000),
         save_to_disk=True)
-    grown = _read_meta(kv_dir, _MODEL_TAG, 0, "t")
+    grown = _read_meta(kv_dir, _QWEN, 0, "t")
     assert grown["n_context_turns"] == 22        # strictly grew, never shrank
     assert grown["clean_prefix"] is True
     assert _n_save_posts(posts) == 1 and _n_save_posts(posts2) == 1
@@ -322,19 +348,100 @@ async def test_never_overwrite_with_smaller_belt(mgr, kv_dir, make_httpx):
     """The prompt_len belt still holds: a saved clean bin whose prompt_len >= the
     incoming ctx len is NOT overwritten (even though the turn count grew a lot)."""
     big_chain = _prefix_hash_chain(_msgs(20))
-    _write_clean_bin(kv_dir, _MODEL_TAG, _PORT, "t", 0, big_chain, prompt_len=60000)
+    _write_clean_bin(kv_dir, _QWEN, _PORT, "t", 0, big_chain, prompt_len=60000)
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
     # admission_ctx_len (50000) < saved prompt_len (60000) -> belt returns early,
     # even though incoming turn count (40) would clear the throttle.
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
                     client_meta={"messages": _msgs(40)}, admission_ctx_len=50000)
 
     await mgr._probe_and_save_clean_kv(_handle(), slot)
 
-    after = _read_meta(kv_dir, _MODEL_TAG, 0, "t")
+    after = _read_meta(kv_dir, _QWEN, 0, "t")
     assert after["n_context_turns"] == 20        # unchanged (not overwritten-with-smaller)
     assert after["prompt_len"] == 60000
     assert posts == []
+
+
+# ================================================================================
+# 3b. Equal-length saves: equal length is not automatically the same
+# content, and is not automatically different content either: the belt must
+# tell the two apart via the content hash chain already computed for both
+# sides, not via length alone.
+# ================================================================================
+@pytest.mark.asyncio
+async def test_equal_length_identical_content_still_declines(mgr, kv_dir, make_httpx, caplog):
+    """An equal-length incoming save whose content hash chain matches what's
+    already saved is NOT freshness -- it's the exact same content, and
+    overwriting it is pure wasted SSD I/O. The belt must still decline
+    this via its OWN never-overwrite-with-smaller reason, same as a
+    plain length compare would.
+
+    Identical content necessarily means identical turn count too (the
+    chain IS one hash per turn), so the SEPARATE zero-growth throttle a
+    few lines below would ALSO decline this scenario if the belt let it
+    through -- meaning "no save happened" alone does not actually pin the
+    belt's own content-identical branch; a mutation that silently disabled
+    it here would still pass on the throttle's coattails. Assert the
+    specific reason_name via the real emitted log line instead, so the
+    two decline paths can't be confused for each other."""
+    chain = _prefix_hash_chain(_msgs(10))
+    _write_clean_bin(kv_dir, _QWEN, _PORT, "t", 0, chain, prompt_len=50000)
+    posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
+                     client_meta={"messages": _msgs(10)}, admission_ctx_len=50000)
+
+    with caplog.at_level(logging.INFO):
+        await mgr._probe_and_save_clean_kv(_handle(), slot, save_to_disk=True)
+
+    after = _read_meta(kv_dir, _QWEN, 0, "t")
+    assert after["hash_chain"] == chain            # unchanged
+    assert after["prompt_len"] == 50000
+    assert posts == []
+    decline_lines = [r.getMessage() for r in caplog.records
+                      if r.getMessage().startswith("KV_SAVE_DECLINE")]
+    assert len(decline_lines) == 1, decline_lines
+    assert f"reason_name={KV_DECLINE_NEVER_OVERWRITE_SMALLER}" in decline_lines[0], (
+        f"expected the belt's own never-overwrite reason, got: {decline_lines[0]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_equal_length_different_content_is_allowed_through(mgr, kv_dir, make_httpx):
+    """The positive case: an equal-length incoming save whose content hash
+    chain DIFFERS from what's saved (e.g. an edited/regenerated turn, same
+    total admission length) is genuinely fresher -- a plain `>=`
+    length compare would discard it purely because length tied. This occurs
+    on a long-running thread at a model swap, with equal lengths.
+    Distinct from a smaller, compression-labelled incoming save
+    -- this is the equal-length,
+    role-agnostic case."""
+    # save_to_disk=True (the unload-seam path, matching a model-
+    # swap) hardcodes _min_growth=1 regardless of
+    # LAGREDUCER_MIN_GROWTH_TURNS -- give the incoming one extra turn purely
+    # to clear that SEPARATE, unrelated throttle gate; the property under
+    # test is admission_ctx_len equality (the belt's own "length"), not
+    # turn-count equality.
+    old_chain = _prefix_hash_chain(_msgs(10))
+    _write_clean_bin(kv_dir, _QWEN, _PORT, "t", 0, old_chain, prompt_len=50000)
+    posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
+    # same admission length, one more turn (clears the zero-growth throttle),
+    # DIFFERENT content -> a genuinely different chain.
+    new_messages = [{"role": ("user" if i % 2 == 0 else "assistant"),
+                      "content": f"EDITED-turn-{i}-content"} for i in range(11)]
+    new_chain = _prefix_hash_chain(new_messages)
+    assert new_chain != old_chain  # sanity: this scenario really is a content diff
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
+                     client_meta={"messages": new_messages}, admission_ctx_len=50000)
+
+    await mgr._probe_and_save_clean_kv(_handle(), slot, save_to_disk=True)
+
+    after = _read_meta(kv_dir, _QWEN, 0, "t")
+    assert after["hash_chain"] == new_chain, (
+        "equal-length incoming with DIFFERENT content must overwrite the "
+        f"stale bin -- got {after['hash_chain']}"
+    )
+    assert _n_save_posts(posts) == 1
 
 
 # ================================================================================
@@ -344,13 +451,13 @@ async def test_never_overwrite_with_smaller_belt(mgr, kv_dir, make_httpx):
 async def test_degenerate_empty_messages_no_save(mgr, kv_dir, make_httpx):
     """Empty admission messages -> no clean bin is written and no probe/save fires."""
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
                     client_meta={"messages": []}, admission_ctx_len=50000)
 
     await mgr._probe_and_save_clean_kv(_handle(), slot)
 
     th = TurbohaulManager._thread_hash("t")
-    assert not (kv_dir / kv_meta_fn(_MODEL_TAG, 0, th, _PORT)).exists()
+    assert not (kv_dir / kv_meta_fn(_QWEN, 0, th, _PORT)).exists()
     assert posts == []
 
 
@@ -360,11 +467,11 @@ async def test_degenerate_zero_turn_chain_no_save(mgr, kv_dir, make_httpx, monke
     a save (the guard, not just the empty-list check, blocks it)."""
     monkeypatch.setattr(manager_mod, "_prefix_hash_chain", lambda *a, **k: [])
     posts = make_httpx([{"id": 0, "n_prompt_tokens": 100}])
-    slot = Slot.new(_MODEL_TAG, thread_id="t", context=None,
+    slot = Slot.new(_QWEN, thread_id="t", context=None,
                     client_meta={"messages": _msgs(5)}, admission_ctx_len=50000)
 
     await mgr._probe_and_save_clean_kv(_handle(), slot)
 
     th = TurbohaulManager._thread_hash("t")
-    assert not (kv_dir / kv_meta_fn(_MODEL_TAG, 0, th, _PORT)).exists()
+    assert not (kv_dir / kv_meta_fn(_QWEN, 0, th, _PORT)).exists()
     assert posts == []

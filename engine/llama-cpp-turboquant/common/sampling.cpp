@@ -168,11 +168,6 @@ struct common_sampler {
     mutable int64_t t_total_us = 0;
 };
 
-// expose the reasoning-budget sampler from the PIMPL struct (used by stale-tail computation)
-const struct llama_sampler * common_sampler_get_rbudget(const struct common_sampler * gsmpl) {
-    return gsmpl ? gsmpl->rbudget : nullptr;
-}
-
 std::string common_params_sampling::print() const {
     char result[1024];
 
@@ -672,6 +667,13 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+int32_t common_sampler_get_reasoning_budget(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->rbudget) {
+        return 0;
+    }
+    return common_reasoning_budget_get_budget(gsmpl->rbudget);
 }
 
 // helpers

@@ -1,0 +1,66 @@
+[
+ {
+  "module": "engine_launch",
+  "name": "launch_env",
+  "signature": "(argv, base_env)",
+  "doc": "The full environment for one engine launch, built from its final argv and the",
+  "file": "src/turbohaul/engine_launch/env.py",
+  "line": 42
+ },
+ {
+  "module": "engine_launch",
+  "name": "preset_device_mismatch",
+  "signature": "(argv, base_env)",
+  "doc": "One-line warning text when an operator's preset MTMD_BACKEND_DEVICE names a",
+  "file": "src/turbohaul/engine_launch/env.py",
+  "line": 69
+ },
+ {
+  "module": "engine_budget",
+  "name": "EngineBudgetInputs",
+  "signature": "",
+  "doc": "Everything the cap needs, measured by the caller.",
+  "file": "src/turbohaul/engine_budget/__init__.py",
+  "line": 41
+ },
+ {
+  "module": "engine_budget",
+  "name": "EngineBudget",
+  "signature": "",
+  "doc": "The decision, with the reason attached so a log can say which limit applied.",
+  "file": "src/turbohaul/engine_budget/__init__.py",
+  "line": 69
+ },
+ {
+  "module": "engine_budget",
+  "name": "effective_engine_cap",
+  "signature": "(inp)",
+  "doc": "TOTAL engines this tag may run, given the measured inputs.",
+  "file": "src/turbohaul/engine_budget/__init__.py",
+  "line": 97
+ },
+ {
+  "module": "engine_budget",
+  "name": "context_window_capacity",
+  "signature": "(inp, engines_total)",
+  "doc": "Total concurrent context windows this tag can serve.",
+  "file": "src/turbohaul/engine_budget/__init__.py",
+  "line": 140
+ },
+ {
+  "module": "fastlane_client_names",
+  "name": "name_candidates",
+  "signature": "(reverse_answer)",
+  "doc": "Candidate names for one reverse lookup answer, whole name first.",
+  "file": "src/turbohaul/fastlane_client_names/__init__.py",
+  "line": 26
+ },
+ {
+  "module": "fastlane_client_names",
+  "name": "confirmed_name",
+  "signature": "(address, forward)",
+  "doc": "The name to show for ``address``, or ``None`` when no candidate confirms.",
+  "file": "src/turbohaul/fastlane_client_names/__init__.py",
+  "line": 54
+ }
+]

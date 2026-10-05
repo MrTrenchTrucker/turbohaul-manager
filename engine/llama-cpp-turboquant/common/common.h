@@ -161,6 +161,8 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -362,8 +364,40 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        // MTP, DFlash and DSpark all draft multiple tokens per step against the
+        // target's own recurrent state, so the target needs the same rollback-
+        // sequence reservation regardless of where the drafter's own state lives
+        // (note that DFlash/DSpark allocate a separate ctx_dft, same as
+        // DRAFT_SIMPLE -- this reservation is about the TARGET side only).
+        //
+        // EAGLE3 needs the same treatment upstream but is intentionally left
+        // out here, based on what it actually touches:
+        // EAGLE3 does NOT need it in this fork. Its draft mechanism
+        // (common_speculative_impl_draft_eagle3) is a separate small model
+        // consuming hidden-state features extracted from specific target
+        // layers (target_layer_ids) -- it never reads or writes the target's
+        // recurrent-state (R/S) tensors that n_rs_seq sizes, unlike MTP/
+        // DFlash/DSpark, which draft directly against that state.
+        //
+        // NOTE (the opposite is easy to assume):
+        // those R/S tensors DO exist on commonly used target models. The
+        // llm_arch_is_recurrent/llm_arch_is_hybrid gate (llama-arch.cpp:871
+        // and :885) lists LLM_ARCH_QWEN35 and LLM_ARCH_QWEN35MOE among the
+        // HYBRID architectures, and those are supported archs here. So the
+        // gate is NOT a second independent reason EAGLE3 is safe -- the
+        // discriminator is what EAGLE3 touches, not what the target allocates
+        // (see the paragraph above). As a second safeguard, even if this
+        // reasoning were wrong,
+        // draft-eagle3 is excluded at TWO independent sites in
+        // turbohaul-manager's own manifest layer
+        // (SAFE_LLAMA_FLAG_STRING_ENUMS["spec_type"] and
+        // SPEC_TYPES_NEEDING_RS_SEQ, manifest.py), both noting this reasoning --
+        // EAGLE3 cannot be configured/loaded through turbohaul-manager at all today, so
+        // there is no live exposure either way.
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP
+                || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+                || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;

@@ -1,10 +1,14 @@
 """Tests for chat-completion routes (/v1/chat/completions + /api/chat)."""
 import asyncio
+import re
+import time
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from turbohaul import load_verify_log
+from turbohaul import manager as manager_module
 from turbohaul.api.main import create_app
 from turbohaul.config import (
     BootConfig,
@@ -24,6 +28,20 @@ def _make_handle(model_tag: str, port: int) -> SidecarHandle:
     proc.pid = 12345
     proc.poll.return_value = None
     return SidecarHandle(proc=proc, port=port, model_tag=model_tag)
+
+
+# The same OOM engine-log signature the resident-driver/single-slot
+# suites use, so a real (unstubbed) classify_load_failure call reads it as
+# "oom" and the manager's own machinery -- not a test-injected shortcut --
+# sets slot.oom_requeue_pending.
+_OOM_SCAN = {
+    "engine_errors_detected": True,
+    "engine_error_lines": [
+        "E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 884.62 MiB "
+        "on device 0: cudaMalloc failed: out of memory"
+    ],
+    "reason": None,
+}
 
 
 @pytest.fixture
@@ -49,7 +67,7 @@ def app_with_completion(tmp_path):
     )
     # Use minimum grace so the worker_loop completes promptly in tests
     runtime = RuntimeConfig(
-        queue=QueueConfig(
+        queue=QueueConfig(safety_enabled=False,
             grace_seconds=0,
             idle_hot_load_seconds=0,
             drained_sigterm_window_active_s=1,
@@ -186,7 +204,7 @@ def app_completion_autostart(tmp_path):
     (storage_root / "blobs").mkdir()
     (storage_root / "manifests").mkdir()
     (storage_root / "import-staging").mkdir()
-    # chat/completion routes now 404 on an unknown model tag, so the
+    # Chat/completion routes now 404 on an unknown model tag, so the
     # tags this fixture's tests dispatch against ("m" / "test-model") need a
     # manifest present. Individual tests may still overwrite "m" via
     # _write_manifest_yaml(..., reasoning_budget=...) for their own scenario.
@@ -207,7 +225,7 @@ def app_completion_autostart(tmp_path):
         ui=UIConfig(static_path=tmp_path / "ui"),
     )
     runtime = RuntimeConfig(
-        queue=QueueConfig(
+        queue=QueueConfig(safety_enabled=False,
             grace_seconds=0, idle_hot_load_seconds=0,
             drained_sigterm_window_active_s=1, drained_sigterm_window_cold_s=1,
         ),
@@ -340,7 +358,7 @@ class TestStreamPayloadBuilder:
         assert payload["thinking_budget_tokens"] == 500
 
     def test_build_payload_forwards_tool_call_fields(self):
-        """tools / tool_choice / parallel_tool_calls / function_call /
+        """The tools / tool_choice / parallel_tool_calls / function_call /
         functions must be passed through to llama-server when present. Structured
         values (list of tool defs, dict tool_choice, etc.) are forwarded as-is.
         """
@@ -366,7 +384,7 @@ class TestStreamPayloadBuilder:
                 "tool_choice": tool_choice_obj,
                 "parallel_tool_calls": False,
             },
-            model="example-27b",
+            model="qwen3.6-27b-dense",
             messages=[{"role": "user", "content": "what's the weather?"}],
         )
         assert payload["tools"] == tools
@@ -600,6 +618,398 @@ class TestSseHeartbeat:
 
 
 # ============================================================================
+# stream_gen's SLOT_READY_TIMEOUT_S deadline must not
+# count down while slot.oom_requeue_pending is True (see the tests
+# below).
+# ============================================================================
+
+
+class TestPausableReadyDeadline:
+    def test_deadline_paused_while_oom_requeue_parked(
+        self, app_completion_autostart, monkeypatch
+    ):
+        """The ready-deadline must not fire slot_ready_timeout while the slot
+        is OOM-requeue-parked, even after several multiples of the (tiny,
+        for test speed) SLOT_READY_TIMEOUT_S have elapsed. The slot is parked
+        via the REAL mechanism (an unhealthy first attempt + a real OOM
+        engine-log signature -> _requeue_on_oom_load_failure), not a
+        test-injected flag -- _spawn_for_resident unconditionally clears
+        oom_requeue_pending at the top of every admission attempt, so setting
+        it from outside that machinery would just get wiped out. Nothing in
+        this test ever calls _make_room_signal.notify_all(), so (per the
+        companion's own documented backstock-timeout behaviour) the health
+        check is never invoked a second time -- always-unhealthy, exactly
+        like the resident-driver suite's own fake_health, never a hang.
+
+        NOTE on ending the stream: starlette's TestClient runs the whole ASGI
+        response to completion before handing any of it back to a
+        synchronous ``client.stream()`` reader (proven empirically while
+        writing this test -- breaking out of ``r.iter_bytes()`` early does
+        NOT stop the server-side generator, so a generator that heartbeats
+        forever while genuinely parked hangs the whole test). So this test
+        force-completes ``stream_ready_event`` from a background task
+        scheduled on the SAME loop after several heartbeat intervals --
+        enough to prove the deadline didn't fire while parked -- then lets
+        the route's normal "handle is None" fallback end the response.
+        """
+        from turbohaul.api import chat_completion as cc
+
+        app, client = app_completion_autostart
+        monkeypatch.setattr(cc, "SLOT_READY_TIMEOUT_S", 0.1)
+        monkeypatch.setattr(cc, "HEARTBEAT_INTERVAL_S", 0.03)
+        monkeypatch.setattr(manager_module, "_OOM_REQUEUE_POLL_S", 0.02)
+        monkeypatch.setattr(manager_module, "_OOM_REQUEUE_SETTLE_S", 0.0)
+        monkeypatch.setattr(
+            load_verify_log, "scan_engine_log_for_errors", lambda *a, **k: _OOM_SCAN
+        )
+
+        health_calls = [0]
+
+        async def always_unhealthy(*args, **kwargs):
+            health_calls[0] += 1
+            return False
+
+        mgr = app.state.manager
+        mgr._wait_healthy = always_unhealthy
+
+        orig_submit = mgr.submit_for_streaming
+        captured = {}
+
+        async def wrapped_submit(*a, **k):
+            slot = await orig_submit(*a, **k)
+            captured["slot"] = slot
+
+            async def _force_ready_after_delay():
+                # ~8 heartbeats at HEARTBEAT_INTERVAL_S=0.03s (0.24s), well
+                # past SLOT_READY_TIMEOUT_S=0.1s -- would already have fired
+                # slot_ready_timeout if the deadline weren't exempted.
+                await asyncio.sleep(0.26)
+                if not slot.stream_ready_event.is_set():
+                    slot.stream_ready_event.set()
+
+            asyncio.create_task(_force_ready_after_delay())
+            return slot
+
+        mgr.submit_for_streaming = wrapped_submit
+
+        body_bytes = b""
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            assert r.status_code == 200
+            for chunk in r.iter_bytes():
+                body_bytes += chunk
+
+        heartbeats_seen = body_bytes.count(b": keep-alive\n\n")
+        assert health_calls[0] >= 1, (
+            "precondition: the health check must have run to actually park "
+            "the slot via the real OOM-requeue mechanism"
+        )
+        assert heartbeats_seen >= 6, (
+            f"only {heartbeats_seen} heartbeats in the body -- not enough "
+            "elapsed time to prove the tiny deadline would have fired "
+            "unpaused"
+        )
+        assert b"slot_ready_timeout" not in body_bytes, (
+            "the deadline fired WHILE the slot was still oom_requeue_pending "
+            "-- it must not count down while parked"
+        )
+        assert b"[DONE]" in body_bytes
+
+    def test_control_ordinary_slot_still_times_out_normally(
+        self, app_completion_autostart, monkeypatch
+    ):
+        """Control: an ORDINARY (never OOM-requeued) slot's ready deadline is
+        unaffected by the pausable-budget change -- it must still expire at
+        (approximately) SLOT_READY_TIMEOUT_S. Kills a mutant that widens or
+        removes the exemption check so every slot becomes exempt."""
+        from turbohaul.api import chat_completion as cc
+
+        app, client = app_completion_autostart
+        monkeypatch.setattr(cc, "SLOT_READY_TIMEOUT_S", 0.1)
+        monkeypatch.setattr(cc, "HEARTBEAT_INTERVAL_S", 0.03)
+
+        async def never_healthy(*args, **kwargs):
+            await asyncio.sleep(999)
+            return True
+
+        mgr = app.state.manager
+        mgr._wait_healthy = never_healthy
+
+        started = time.monotonic()
+        body_bytes = b""
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            assert r.status_code == 200
+            for chunk in r.iter_bytes():
+                body_bytes += chunk
+        elapsed = time.monotonic() - started
+
+        assert b"slot_ready_timeout" in body_bytes
+        assert elapsed < 2.0, (
+            f"an ordinary (never-parked) slot took {elapsed:.2f}s to time "
+            "out on a 0.1s deadline -- the pausable-budget change must not "
+            "widen the deadline for a slot that's never OOM-requeued"
+        )
+
+
+# ============================================================================
+# stream_gen's finally sets disconnect_event ONLY when
+# oom_requeue_pending. Dedicated tests.
+# ============================================================================
+
+
+class TestScopedFinallyDisconnectSet:
+    def test_finally_sets_disconnect_event_when_oom_requeue_pending(
+        self, app_completion_autostart, monkeypatch
+    ):
+        """When the stream ends while the slot is still OOM-requeue-parked,
+        stream_gen's finally must set disconnect_event so the parked
+        _oom_requeue_wait_then_readmit companion notices and finishes
+        instead of waiting forever for a watch_disconnect that was
+        just cancelled and will never observe anything again. Parked via the
+        REAL mechanism (see the parked-deadline test above for why a test-injected
+        flag doesn't survive _spawn_for_resident's own admission-start
+        reset), and ended the same way the parked-deadline test ends it (a forced
+        stream_ready_event from a background task on the same loop -- see
+        that test's NOTE for why breaking out of the client-side read
+        doesn't stop a still-running server-side generator under this
+        TestClient). watch_disconnect is neutralized so disconnect_event can
+        only end up set by stream_gen's own finally, not by the pre-existing
+        watcher racing to the same answer."""
+        from turbohaul.api import chat_completion as cc
+
+        app, client = app_completion_autostart
+        monkeypatch.setattr(cc, "SLOT_READY_TIMEOUT_S", 0.1)
+        monkeypatch.setattr(cc, "HEARTBEAT_INTERVAL_S", 0.03)
+        monkeypatch.setattr(manager_module, "_OOM_REQUEUE_POLL_S", 0.02)
+        monkeypatch.setattr(manager_module, "_OOM_REQUEUE_SETTLE_S", 0.0)
+        monkeypatch.setattr(
+            load_verify_log, "scan_engine_log_for_errors", lambda *a, **k: _OOM_SCAN
+        )
+
+        async def inert_watch_disconnect(request, disconnect_event):
+            await asyncio.sleep(999)
+
+        monkeypatch.setattr(cc, "watch_disconnect", inert_watch_disconnect)
+
+        health_calls = [0]
+
+        async def always_unhealthy(*args, **kwargs):
+            health_calls[0] += 1
+            return False
+
+        mgr = app.state.manager
+        mgr._wait_healthy = always_unhealthy
+
+        orig_submit = mgr.submit_for_streaming
+        captured = {}
+
+        async def wrapped_submit(*a, **k):
+            slot = await orig_submit(*a, **k)
+            captured["slot"] = slot
+
+            async def _force_ready_after_delay():
+                await asyncio.sleep(0.15)
+                if not slot.stream_ready_event.is_set():
+                    slot.stream_ready_event.set()
+
+            asyncio.create_task(_force_ready_after_delay())
+            return slot
+
+        mgr.submit_for_streaming = wrapped_submit
+
+        body_bytes = b""
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            assert r.status_code == 200
+            for chunk in r.iter_bytes():
+                body_bytes += chunk
+
+        slot = captured["slot"]
+        assert health_calls[0] >= 1, (
+            "precondition: the health check must have run to actually park "
+            "the slot via the real OOM-requeue mechanism"
+        )
+        assert slot.disconnect_event.is_set(), (
+            "an OOM-requeue-parked stream that ends must set "
+            "disconnect_event in the finally -- watch_disconnect was "
+            "neutralized above, so ONLY stream_gen's own finally could have "
+            "set it here"
+        )
+
+    def test_control_ordinary_stream_finally_leaves_disconnect_event_unset(
+        self, app_completion_autostart
+    ):
+        """Control (scope-control): an ORDINARY stream
+        that ends normally (never OOM-requeue-parked) must NOT have
+        disconnect_event set by stream_gen's finally -- only watch_disconnect
+        (a real client disconnect) may set it for that population. Kills a
+        mutant that sets disconnect_event unconditionally instead of only
+        when oom_requeue_pending."""
+        app, client = app_completion_autostart
+
+        mgr = app.state.manager
+        orig_submit = mgr.submit_for_streaming
+        captured = {}
+
+        async def wrapped_submit(*a, **k):
+            slot = await orig_submit(*a, **k)
+            captured["slot"] = slot
+            return slot
+
+        mgr.submit_for_streaming = wrapped_submit
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            assert r.status_code == 200
+            for _chunk in r.iter_bytes():
+                pass
+
+        slot = captured["slot"]
+        assert not slot.disconnect_event.is_set(), (
+            "an ordinary, never-parked stream's finally must leave "
+            "disconnect_event untouched -- the real client never "
+            "disconnected here (TestClient read the body to completion)"
+        )
+
+
+# ============================================================================
+# Revive the typed capacity_unavailable SSE frame
+# ============================================================================
+
+
+class TestSseCapacityFrame:
+    """The SSE ready-wait no longer times
+    out on a capacity failure (stream_ready_event is now set on failure too), so
+    the `except asyncio.TimeoutError` capacity check never fires for
+    an exception-driven wakeup and control falls to the `handle is None` branch
+    instead -- which, before this change, only knew how to emit a message-only
+    `placement_failed` frame (no cause, no retry_after). This silently retired
+    the typed `capacity_unavailable` frame on the streaming transport while the
+    non-stream 503 kept it. The contract (both transports carry
+    the SAME nested error shape) requires it back.
+    """
+
+    def test_capacity_failure_emits_typed_frame_not_placement_failed(
+        self, app_completion_autostart, monkeypatch
+    ):
+        from turbohaul.api import chat_completion as cc
+        from turbohaul.slot import VramOverCommitError
+
+        app, client = app_completion_autostart
+        mgr = app.state.manager
+
+        # `watch_disconnect`'s cancellation
+        # deadlocks in this exact scheduling shape (a capacity failure resolves
+        # the ready-wait on effectively the FIRST scheduling round, starving the
+        # disconnect watcher of its first tick before `finally` cancels it).
+        # This was also reproduced on a REAL uvicorn socket and
+        # confirmed to wedge for real -- it is NOT a TestClient-only artifact.
+        # Out of scope here. Stub it here only
+        # to keep THIS test's own runtime bounded.
+        #
+        # Scope of that wedge, measured on a real socket:
+        # the wedge is EMBEDDINGS-ROUTE-SPECIFIC. On the identical
+        # already-failed-at-entry timing the SSE path returns this typed frame
+        # immediately and does NOT wedge, while /v1/embeddings never returns.
+        # So stubbing here is belt-and-braces for THIS path, not load-bearing.
+        async def _stub_watch_disconnect(request, disconnect_event):
+            await disconnect_event.wait()
+
+        monkeypatch.setattr(cc, "watch_disconnect", _stub_watch_disconnect)
+
+        async def fake_submit_capacity_fail(model_tag, prompt="", thread_id="",
+                                            client_meta=None, **kwargs):
+            slot = MagicMock()
+            slot.stream_ready_event = asyncio.Event()
+            exc = VramOverCommitError("no VRAM capacity", retry_after_s=7)
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_exception(exc)
+            slot.completion_future = fut
+            # PRECONDITION, constructed directly -- NOT coverage of the manager.
+            # This fake replaces mgr.submit_for_streaming wholesale, so
+            # manager.py::_fail_completion_future never runs in this test. The
+            # two lines below are this fixture standing in for what the manager
+            # would have done on a capacity failure, so
+            # that what actually gets tested is the ROUTE's behaviour: 503
+            # capacity_unavailable with retry_after. Same framing as the matching
+            # comment in test_api_embeddings.py.
+            # ⛔ Do not read this as gating the manager. It cannot -- it asserts
+            # what it just performed. The manager side is gated by
+            # the fail-completion-future wake-up test;
+            # before that test existed, the wake-up code could be deleted
+            # outright with this whole suite still green.
+            slot.stream_ready_failed_reason = str(exc)
+            slot.stream_ready_event.set()
+            slot.stream_handle = None
+            slot.stream_done_event = asyncio.Event()
+            slot.slot_id = "cap-fail"
+            slot.thread_id = thread_id
+            slot.model_tag = model_tag
+            slot.client_meta = client_meta or {}
+            return slot
+
+        mgr.submit_for_streaming = fake_submit_capacity_fail
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            assert r.status_code == 200
+            body_bytes = b""
+            for chunk in r.iter_bytes():
+                body_bytes += chunk
+
+        import json as _json
+        data_lines = [
+            line[len(b"data: "):] for line in body_bytes.split(b"\n\n")
+            if line.startswith(b"data: ") and line != b"data: [DONE]"
+        ]
+        assert data_lines, f"no error frame found in SSE body: {body_bytes!r}"
+        err = _json.loads(data_lines[0])["error"]
+        assert err["type"] == "capacity_unavailable", (
+            f"expected the typed capacity frame, got {err!r} "
+            f"(placement_failed means the typed frame is still silently retired)"
+        )
+        assert err["cause"] == "vram_over_commit"
+        assert err["retry_after"] == 7
+        assert "no VRAM capacity" in err["message"]
+
+
+# ============================================================================
 # keep_alive parser + client_meta plumbing
 # ============================================================================
 
@@ -644,16 +1054,16 @@ class TestParseKeepAlive:
         assert parse_keep_alive("abc") is None
         assert parse_keep_alive("1x") is None  # unknown unit
         assert parse_keep_alive("m") is None  # no digit
-        # Day/week suffixes intentionally NOT supported (over-engineering;
-        # Ollama itself documents s/m/h only).
+        # Day/week suffixes intentionally NOT supported (over-engineering
+        # -- Ollama itself documents s/m/h only).
         assert parse_keep_alive("1d") is None
 
     def test_bool_false_means_zero(self):
         """Ollama keep_alive: false → unload immediately (matches `0`).
 
-        Without this, real Ollama clients sending {"keep_alive": false} would
-        silently fall through to default 300s instead of the immediate
-        teardown they asked for.
+        Regression guard — without this, real Ollama
+        clients sending {"keep_alive": false} would silently fall through
+        to default 300s instead of the immediate teardown they asked for.
         """
         from turbohaul.api.chat_completion import parse_keep_alive
         assert parse_keep_alive(False) == 0
@@ -665,9 +1075,9 @@ class TestParseKeepAlive:
 
 
 class TestKeepAliveClientMetaPlumbing:
-    """Regression: streaming path must propagate keep_alive_s into client_meta
-    (it's Turbohaul-internal, NOT forwarded to llama-server). Streaming-only
-    clients depend on this fix.
+    """Regression: streaming path must propagate
+    keep_alive_s into client_meta (it's Turbohaul-internal, NOT forwarded to
+    llama-server). Agent clients run streaming-only — this is THE fix.
     """
 
     def test_keep_alive_NOT_in_stream_payload(self):
@@ -699,8 +1109,8 @@ class TestKeepAliveClientMetaPlumbing:
 # ============================================================================
 
 
-class TestResponseFormatSUB4a:
-    """json_object contract tests — accept json_object, reject json_schema, no regression.
+class TestResponseFormatContract:
+    """Contract tests — accept json_object, reject json_schema, no regression.
 
     Pattern: override mgr._complete_fn (or _build_stream_payload monkeypatch)
     to capture the slot.client_meta / stream-payload that crosses the
@@ -785,12 +1195,12 @@ class TestResponseFormatSUB4a:
         assert captured, "_complete_fn was never invoked"
         assert captured[0].get("response_format") == {"type": "json_object"}
 
-    # (c) openai json_schema body — schema is now validated rather than rejected.
-    # An earlier revision rejected json_schema as deferred (HTTP 400 "not yet
-    # supported"); the schema is now validated instead: bad schema → 422
-    # schema_validation_failed. This test guards the 422 contract for the
-    # bad-schema path (object type missing additionalProperties: false).
-    # See TestResponseFormatJsonSchema for the comprehensive json_schema set.
+    # (c) openai json_schema body, validated as a schema.
+    # json_schema is validated, not rejected as unsupported (no HTTP 400 "not yet supported").
+    # A bad schema gives 422 schema_validation_failed.
+    # This test guards the 422 contract for the bad-schema path (object
+    # type missing additionalProperties: false).
+    # See the strict json_schema test class for the comprehensive json_schema set.
     def test_c_openai_json_schema_validation_failed_422(self, app_completion_autostart):
         app, client = app_completion_autostart
         # Use the canonical OpenAI structured-outputs envelope (json_schema:{schema:...})
@@ -809,7 +1219,7 @@ class TestResponseFormatSUB4a:
         d1 = r1.json()["detail"]
         assert d1["error"] == "schema_validation_failed"
         assert "additionalProperties" in d1["message"]
-        assert "internal-id" not in str(d1)  # error must not leak internal identifiers
+        assert not re.search(r"\b(?:RC|SUB|WO)-\w+", str(d1))  # no internal ticket-id leak
         # Stream variant — must also reject at entry, BEFORE any SSE
         body_stream = {**body, "stream": True}
         r2 = client.post("/v1/chat/completions", json=body_stream)
@@ -828,14 +1238,51 @@ class TestResponseFormatSUB4a:
         assert captured[0].get("response_format") is None
 
     # (e) ollama stream=True + json_object → response_format carried in client_meta.
+    # Regression guard (previously skipped): ollama_chat
+    # + stream=True must not hang (manager._STREAM_TIMEOUT_S, 3600s) inside
+    # manager.submit()'s stream-event arming: submit() would otherwise arm
+    # slot.stream_ready_event/stream_done_event off client_meta["stream"] ALONE,
+    # regardless of which wrapper called it, so ollama_chat's plain
+    # submit_and_wait() (it never calls submit_for_streaming and never drives
+    # its own httpx stream, unlike openai_chat_completions) would be routed into the
+    # streaming wait branch in _serve_on_resident anyway. Nothing on the
+    # ollama_chat path ever sets stream_done_event, so the worker would block on
+    # asyncio.wait_for(..., timeout=_STREAM_TIMEOUT_S) for the full 3600s before
+    # falling through with a placeholder {"_streamed": True} result -- and
+    # because that path never reaches _complete_fn at all, `captured` would stay
+    # empty and `captured[0]` would raise IndexError, which is the real pre-fix
+    # failure mode this test proves causally (see the timeout-patch below).
+    #
+    # THE FIX: manager.submit() requires an explicit, wrapper-controlled
+    # `arm_stream_events=True` (only submit_for_streaming passes it) in
+    # addition to client_meta["stream"] before it ever creates the events --
+    # client-influenced data alone can no longer arm an internal protocol
+    # handshake. ollama_chat's own client_meta["stream"] is also
+    # unconditionally False (it has no streaming implementation regardless of
+    # what the client asked for), with the client's original request recorded
+    # separately as client_meta["stream_requested"] for observability.
+    #
+    # Background:
     # NOTE: ollama_chat does NOT branch to a streaming helper
     # (unlike openai_chat_completions); the stream flag flows into client_meta
     # but the upstream POST goes through _complete_fn non-streaming. This test
     # guards the "stream flag does NOT strip response_format" regression on the
     # ollama path. The validator still fires (covered by test_g stream variant).
     def test_e_ollama_stream_flag_does_not_strip_response_format(
-        self, app_completion_autostart,
+        self, app_completion_autostart, monkeypatch,
     ):
+        # Patch the real 3600s ceiling down to a tiny value BEFORE
+        # this request fires. Safe either way this test runs: post-fix the
+        # streaming branch is never entered at all (arm_stream_events is False
+        # for submit_and_wait), so this timeout is never consulted; pre-fix
+        # (verified by reverting the fix) it is
+        # exactly what turns an unsafe 3600s real wait into a fast, deterministic
+        # reproduction of the same TimeoutError code path -- never a live engine,
+        # never an unbounded hang, so the run is bounded and
+        # deterministic.
+        import turbohaul.manager as manager_mod
+        monkeypatch.setattr(manager_mod, "_STREAM_TIMEOUT_S", 0.05)
+
         app, client = app_completion_autostart
         captured = self._install_client_meta_capture(app)
         r = client.post(
@@ -848,9 +1295,16 @@ class TestResponseFormatSUB4a:
             },
         )
         assert r.status_code == 200, r.text
+        assert len(captured) == 1, (
+            f"expected exactly one _complete_fn call, got {captured} -- if this "
+            "is empty, ollama_chat's request never reached the non-streaming "
+            "completion path at all (the pre-fix hang shape)"
+        )
         assert captured[0].get("response_format") == {"type": "json_object"}
-        # Confirm the stream flag itself was also carried through
-        assert captured[0].get("stream") is True
+        # The client's request IS recorded, just no longer under the
+        # key that arms the manager's streaming handshake (see comment above).
+        assert captured[0].get("stream") is False
+        assert captured[0].get("stream_requested") is True
 
     # (f) ollama NON-stream + json_object → present in captured client_meta
     def test_f_ollama_nonstream_json_object_in_client_meta(
@@ -869,9 +1323,9 @@ class TestResponseFormatSUB4a:
         assert r.status_code == 200, r.text
         assert captured[0].get("response_format") == {"type": "json_object"}
 
-    # (g) ollama json_schema body — schema is validated rather than rejected.
-    # Earlier 400-reject → current 422-schema-validation. See test_c_openai
-    # docstring + TestResponseFormatJsonSchema for the full json_schema set.
+    # (g) ollama json_schema body, validated as a schema.
+    # A bad schema gives 422 schema_validation_failed. See test_c_openai
+    # docstring + the strict json_schema test class for the full json_schema set.
     def test_g_ollama_json_schema_validation_failed_422(self, app_completion_autostart):
         app, client = app_completion_autostart
         body = {
@@ -887,7 +1341,7 @@ class TestResponseFormatSUB4a:
         d1 = r1.json()["detail"]
         assert d1["error"] == "schema_validation_failed"
         assert "additionalProperties" in d1["message"]
-        assert "internal-id" not in str(d1)  # error must not leak internal identifiers
+        assert not re.search(r"\b(?:RC|SUB|WO)-\w+", str(d1))
         r2 = client.post("/api/chat", json={**body, "stream": True})
         assert r2.status_code == 422
 
@@ -972,7 +1426,7 @@ gguf_size_bytes: 1000
     )
 
 
-class TestResponseFormatJsonSchema:
+class TestResponseFormatJsonSchemaFull:
     """json_schema FULL contract tests — validate+retry+thinking-strip.
 
     Coverage:
@@ -990,7 +1444,7 @@ class TestResponseFormatJsonSchema:
 
     @staticmethod
     def _install_client_meta_capture(app):
-        """Capture pattern — record slot.client_meta passed to _complete_fn."""
+        """Reuse the json_object capture pattern — record slot.client_meta passed to _complete_fn."""
         captured: list[dict] = []
 
         async def capturing_complete(slot, handle):

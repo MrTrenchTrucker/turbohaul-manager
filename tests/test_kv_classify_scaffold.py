@@ -228,7 +228,7 @@ def test_classify_request_curator_no_save_no_manager_remap():
     stays the base thread_id: the manager does NOT remap (a manager remap would
     override + break the client harness thread_id that actually drives main reuse)."""
     sig = kc.RequestSignals(
-        thread_id="main-sess9",   # what the client harness already sends
+        thread_id="hermes-main-sess9",   # what the client harness already sends
         inc_chain=kc._prefix_hash_chain([{"role": "system", "content": "s"}]),
         saved_chain=None,
         warm_chain=None,
@@ -237,7 +237,7 @@ def test_classify_request_curator_no_save_no_manager_remap():
     rc = kc.classify_request({"is_curator": True}, sig)
     assert rc.resolved_from == "POLICIES[curator]"
     assert rc.save_ok is False
-    assert rc.identity == "main-sess9"        # base tid passed through, NOT remapped
+    assert rc.identity == "hermes-main-sess9"        # base tid passed through, NOT remapped
 
 
 def test_classify_request_labels_absent_is_byte_identical():
