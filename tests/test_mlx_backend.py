@@ -16,7 +16,7 @@ import pytest
 import subprocess
 import pydantic
 
-from turbohaul.manifest import Manifest, ManifestValidationError
+from turbohaul.manifest import ManifestValidationError, ModelManifest as Manifest
 from turbohaul.mlx_spawn import (
     SAFE_MLX_FLAGS,
     is_mlx_available,
