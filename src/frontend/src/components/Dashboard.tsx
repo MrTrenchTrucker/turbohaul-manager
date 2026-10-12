@@ -9,14 +9,6 @@ import { Card, KV } from './dashboard/primitives';
 import { ThroughputSection } from './dashboard/ThroughputSection';
 import { ResidentsPanel } from './dashboard/ResidentsPanel';
 
-// RequestIdentityStrip and SpecDowngradeWidget moved into
-// dashboard/RequestIdentityStrip.tsx and dashboard/ResidentCard.tsx
-// respectively. Re-exported here
-// rather than updating every import site, because a production
-// consumer of this exact path exists (components/Queue.tsx:5,108) outside
-// the scope of that change, not just Dashboard.test.tsx:13. Known compatibility
-// shim — migrating Queue.tsx to import the sibling modules directly is a
-// separate, later, unscoped follow-up.
 export { RequestIdentityStrip } from './dashboard/RequestIdentityStrip';
 import { waitingCount } from './queue/waiting';
 export { SpecDowngradeWidget } from './dashboard/ResidentCard';

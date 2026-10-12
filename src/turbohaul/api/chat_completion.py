@@ -31,6 +31,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1620,10 +1621,44 @@ _STREAM_ONLY_KNOBS = ("stream", "stream_options")
 _STREAM_FORWARDED_KNOBS = _COMMON_FORWARDED_KNOBS + _STREAM_ONLY_KNOBS
 
 
-def _build_stream_payload(client_meta: dict, model: str, messages: list) -> dict:
-    """Build the streaming chat-completions payload sent to llama-server."""
+def _resolve_model_identity(
+    model_tag: str,
+    handle_model_id: "str | None",
+    manifests_path: "Path | None",
+) -> str:
+    """Resolve the model identity sent to the sidecar's `model` field.
+
+    mlx_lm server routes each completion by the request `model` field and
+    re-resolves it as a HuggingFace repo. The Turbohaul tag (e.g.
+    "darwin-35b-a3b-opus-oq4") is NOT a valid repo id or local path, so sending
+    it yields a 404 "Repository Not Found". Always prefer a real backend
+    identity: the sidecar handle's model_id (set by mlx_spawn to the --model
+    arg), else the manifest's model_path / model_repo, else the tag as a last
+    resort (llama.cpp serves by tag).
+    """
+    if handle_model_id:
+        return handle_model_id
+    if manifests_path:
+        try:
+            _m = read_manifest(manifests_path, model_tag)
+            identity = _m.model_path or _m.model_repo
+            if identity:
+                return identity
+        except Exception:
+            pass
+    return model_tag
+
+
+def _build_stream_payload(
+    client_meta: dict, model: str, messages: list, model_identity: str | None = None
+) -> dict:
+    """Build the streaming chat-completions payload sent to the sidecar.
+
+    `model_identity` (when provided) is the real backend identity (local path /
+    HF repo id); falls back to `model` (the Turbohaul tag) otherwise.
+    """
     payload: dict = {
-        "model": model,
+        "model": model_identity or model,
         "messages": _collapse_trailing_assistant_messages(messages),
         "stream": True,
     }
@@ -2025,7 +2060,12 @@ async def _openai_chat_completions_stream(
                 handle.pid, mgr._spawn_seq_for_model(model), slot.slot_id or slot.thread_id
             )
 
-            stream_payload = _build_stream_payload(client_meta, model, messages)
+            model_identity = _resolve_model_identity(
+                model, handle.model_id, mgr.boot.storage.manifests_path
+            )
+            stream_payload = _build_stream_payload(
+                client_meta, model, messages, model_identity
+            )
             url = f"http://127.0.0.1:{handle.port}/v1/chat/completions"
 
             async with httpx.AsyncClient(timeout=STREAM_TIMEOUT_S) as client:
@@ -2125,6 +2165,13 @@ async def _openai_chat_completions_stream(
                                 # corrupts the client stream.
                                 try:
                                     mgr.live_output.feed(gen_id_for_tee, chunk_bytes)
+                                except Exception:
+                                    pass
+                                # Real live tok/s for backends without /slots (MLX):
+                                # count this streamed token + measure inter-arrival.
+                                # Backend-agnostic — also sharpens llama.cpp streaming.
+                                try:
+                                    mgr.note_stream_token(gen_id_for_tee)
                                 except Exception:
                                     pass
                                 # Parse the SSE deltas to accumulate the
@@ -2278,6 +2325,10 @@ async def _openai_chat_completions_stream(
             if gen_id_for_tee is not None:
                 with contextlib.suppress(Exception):
                     mgr.live_output.mark_done(gen_id_for_tee)
+                # Drop the stream-derived stats so the poller falls back to honest
+                # idle (no stale tok/s after the generation ends).
+                with contextlib.suppress(Exception):
+                    mgr.clear_stream_stats()
 
     return StreamingResponse(
         stream_gen(),
@@ -2836,6 +2887,7 @@ def _merge_reasoning_into_content(
 def make_llama_server_complete_fn(
     timeout_s: float = 600.0,
     http_client_factory=None,
+    manifests_path: Path | None = None,
 ):
     """Build a completion_fn that forwards to the active sidecar's port via httpx.
 
@@ -2853,8 +2905,11 @@ def make_llama_server_complete_fn(
         messages = slot.context
         if not messages:
             return None
+        model_identity = _resolve_model_identity(
+            slot.model_tag, handle.model_id, manifests_path
+        )
         payload = {
-            "model": slot.model_tag,
+            "model": model_identity,
             "messages": _collapse_trailing_assistant_messages(messages),
             "stream": False,  # streaming SSE is a follow-on polish wave
         }

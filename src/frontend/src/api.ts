@@ -172,6 +172,7 @@ export interface ResidentModel {
   phase?: string;
   remaining_s?: number | null;
   phase_resolved_from?: string;
+  model_resident: boolean | null;
   generation: GenerationInfo | null;
   // Named engine operation for FE Dashboard pill
   engine_op?: string;

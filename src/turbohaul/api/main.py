@@ -142,6 +142,7 @@ def create_app(
         runtime,
         complete_fn=make_llama_server_complete_fn(
             timeout_s=runtime.queue.sidecar_complete_timeout_s,
+            manifests_path=boot.storage.manifests_path,
         ),
     )
     mgr.fastlane_config_error = fastlane_config_error
