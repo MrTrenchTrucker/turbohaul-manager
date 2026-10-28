@@ -51,6 +51,7 @@ controls on the General page (and the Fast Lane tab's rules) are left out of the
 | `queue.grace_seconds` / `idle_hot_load_seconds` | The two warm-hold windows (30 and 600 seconds by default) — see [Queue](02-queue.md) |
 | `queue.safety_*` | The memory, CPU and I/O gates that refuse a spawn rather than risk the host |
 | `kv.ram_cache_max_bytes` | Byte ceiling on the RAM-tier KV-cache save directory (20 GiB by default; 0 disables the ceiling) |
+| `kv.cold_meta_purge_age_hours` | Background reduction of the stored request metadata of old ended slots to their identity keys. Off by default (0); set the age in hours to turn it on. See [the state database](../STATE_DATABASE_MEMORY.md) |
 | `http.max_body_bytes` | Request size limit (64 MiB by default). Raise it if you send inline images or audio |
 | `pull.hf_host_allowlist` | The hosts the HuggingFace pull may fetch from |
 

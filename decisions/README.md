@@ -5,3 +5,4 @@ This folder holds the decisions that shaped the code: why it is the way it is, o
 - [ADR-001](ADR-001-module-system-and-engine-launch.md): Adopt the module system one fix at a time; first module engine_launch (accepted, 2026-09-25)
 - [ADR-002](ADR-002-retire-max-instances-engine-budget.md): Retire the per-model max_instances setting; the box-wide sidecar budget decides (module engine_budget) (accepted, 2026-10-01)
 - [ADR-003](ADR-003-discovered-clients-show-container-names.md): The Fast Lane Discovered list shows a confirmed container name, and adding from it saves a rule by name (module fastlane_client_names) (accepted, 2026-10-01)
+- [ADR-004](ADR-004-coresident-admission-module.md): One co-residence admission rule and one retry read for the free-VRAM probe (module coresident_admission) (accepted, 2026-10-22)

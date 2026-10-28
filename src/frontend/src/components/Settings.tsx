@@ -572,7 +572,7 @@ function GeneralSettings() {
         <h2 className="text-xl font-semibold text-slate-200 mb-4">Licenses + attribution</h2>
         <div className="rounded-lg border border-slate-700 bg-slate-950 p-4 text-sm text-slate-400 space-y-2">
           <p>
-            Turbohaul-Manager v0.8.0 — MIT-licensed wrapper around the inference engine.
+            Turbohaul-Manager v0.8.1 — MIT-licensed wrapper around the inference engine.
           </p>
           <p>
             Inference backend: <span className="font-mono text-slate-300">llama-server</span>{' '}

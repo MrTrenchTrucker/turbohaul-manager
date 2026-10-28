@@ -25,12 +25,12 @@ Turbohaul is built from source; no prebuilt image is published.
 ```bash
 git clone https://github.com/MrTrenchTrucker/turbohaul-manager.git
 cd turbohaul-manager
-docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.8.0 .
+docker build -f Dockerfile.engine-src -t turbohaul-manager:v0.8.1 .
 
 docker run --gpus all -p 127.0.0.1:11401:11401 \
     -v $(pwd)/state:/var/lib/turbohaul \
     -v $(pwd)/models:/var/lib/turbohaul/import-staging \
-    turbohaul-manager:v0.8.0
+    turbohaul-manager:v0.8.1
 ```
 
 Then open **http://127.0.0.1:11401/ui**.
@@ -89,6 +89,8 @@ Full guide: [docs/FAST_LANE.md](docs/FAST_LANE.md)
 | Add and configure a model (backend and dashboard) | [docs/MODELS_AND_MANIFESTS.md](docs/MODELS_AND_MANIFESTS.md) |
 | Look up every manifest field and flag | [docs/MODEL_CONFIG_REFERENCE.md](docs/MODEL_CONFIG_REFERENCE.md) · [docs/TURBOQUANT_FLAGS.md](docs/TURBOQUANT_FLAGS.md) |
 | Understand cache reuse | [docs/KV_CACHE_MATCHING.md](docs/KV_CACHE_MATCHING.md) · [docs/REASONING_KV_REUSE.md](docs/REASONING_KV_REUSE.md) · [docs/KV_CACHE_RAM_LIFECYCLE.md](docs/KV_CACHE_RAM_LIFECYCLE.md) |
+| Understand what the state database stores and why the manager reads it at boot | [docs/STATE_DATABASE_MEMORY.md](docs/STATE_DATABASE_MEMORY.md) |
+| See how TurboHaul uses RAM, and tune it | [docs/RAM_USAGE.md](docs/RAM_USAGE.md) |
 | Plan GPUs and memory | [SYSTEM_REQUIREMENTS.md](SYSTEM_REQUIREMENTS.md) · [docs/SAFETY_GATE_VRAM_MATH.md](docs/SAFETY_GATE_VRAM_MATH.md) · [docs/MULTI_GPU_PLACEMENT.md](docs/MULTI_GPU_PLACEMENT.md) |
 | Share one GPU between many agents | [docs/MULTI_AGENT_SHARING.md](docs/MULTI_AGENT_SHARING.md) · [docs/DEPLOYMENT_PATTERNS.md](docs/DEPLOYMENT_PATTERNS.md) |
 | Run it in production | [docs/PERSISTENCE_CHECKLIST.md](docs/PERSISTENCE_CHECKLIST.md) |

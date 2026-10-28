@@ -6,6 +6,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 GitHub (`https://github.com/MrTrenchTrucker/turbohaul-manager`) is the canonical public repository.
 
+## [v0.8.1] - 2026-10-28
+
+This is a hotpatch release on top of v0.8.0. It fixes memory growth at startup and a set of serving and dashboard defects found running v0.8.0, and holds saved KV caches inside a hard RAM cap. There are no configuration changes to make before upgrading.
+
+### Highlights
+
+- 🧠 **The manager no longer fills its memory at boot.** Startup used to read the full stored text of every past request (tens of gigabytes on a long-running install) and never release it; it now reads only the small identity fields it needs, and whole request bodies are no longer stored at all.
+- 🚛 **More than one engine of a model starts when there is waiting work and room for it.** When requests are waiting and another engine of the same model would safely fit in VRAM, the manager starts it instead of stopping at one, with every safety check still run before each start.
+- 💾 **Saved KV caches stay inside a hard RAM cap.** The RAM disk that holds saved context can no longer fill up: the cap is enforced before a save rather than after, and only one saved pair is kept per conversation.
+
+### Added
+
+**Serving and capacity**
+
+- ✨ When requests are waiting for a model that already runs an engine, and another engine of that model would safely fit in VRAM, the manager now starts it instead of stopping at one. Free VRAM is read again before a start is refused, and every safety check still runs before each start.
+
+**Diagnostics**
+
+- ✨ When an engine dies quietly, the manager now writes exactly one clear log line naming which engine it was and why it exited.
+
+**Maintenance**
+
+- ✨ A one-time cleanup tool shrinks an oversized state database: it makes a verified backup, reduces old stored request text to the identity fields, compacts into a new file, verifies it, then swaps it in. It does nothing on its own; it runs only when an operator starts it, and only after the boot fix below is in place.
+
+### Changed
+
+**KV cache**
+
+- 🔧 Saved KV caches on the RAM disk are held under a hard RAM cap, the cap is checked before a save instead of after, and only one saved KV pair is kept per conversation thread, so the RAM disk can no longer fill up.
+
+**Serving and engine**
+
+- 🔧 An engine set to unload immediately is kept warm for a short, bounded time when it shares the machine with another engine, so it is not thrown away and reloaded straight away.
+
+### Fixed
+
+- 🐛 **Startup no longer reads every stored request into memory.** At boot the manager read the full stored text of every past request and never released it; it now reads only the identity fields it needs, and stops storing whole request bodies going forward.
+- 🐛 With two engines of the same model loaded, an engine that had just finished a turn still counted as busy, so a high-priority request could be queued behind a long running turn while the other engine sat idle. A finished turn no longer counts as load.
+- 🐛 A request whose client hangs up while it is still waiting is now removed straight away, instead of sitting in the queue for over an hour and then being served on a fresh engine for nobody.
+- 🐛 With two engines loaded, the dashboard no longer blanks the resident list for a moment during a swap; the hold is limited to two empty updates.
+- 🐛 Deleting from the Blobs tab now uses the styled confirmation prompt and removes the manifest first, then the blob.
+
 ## [v0.8.0] - 2026-10-05
 
 ### Highlights

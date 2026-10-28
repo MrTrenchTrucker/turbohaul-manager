@@ -2358,7 +2358,8 @@ async def test_the_reclaimable_set_is_pinned_to_idle_evictable_against_a_future_
 # ================================================================================================
 def _stand_in_slot(tag=TAG_CLAIM, **extra):
     import types
-    fields = dict(model_tag=tag, fastlane=None, fastlane_relocated_main_gpu=None, fastlane_relocated_split_mode=None)
+    fields = dict(model_tag=tag, fastlane=None, fastlane_relocated_main_gpu=None, fastlane_relocated_split_mode=None,
+                  is_evicted=False, disconnect_event=None)
     fields.update(extra)
     return types.SimpleNamespace(**fields)
 

@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { ModelTag } from '../api';
-import { getTags } from '../api';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import type { ManifestSummaryRow, ModelTag } from '../api';
+import { deleteBlobApi, deleteManifestApi, getManifests, getTags } from '../api';
 import { SubTabs } from './SubTabs';
-import Models from './Models';
+import Models, { DeleteBlobPrompt } from './Models';
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -103,12 +103,110 @@ async function postJSON(path: string, body: unknown): Promise<Response> {
   });
 }
 
-async function deleteJSON(path: string, body: unknown): Promise<Response> {
-  return fetch(path, {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+// Delete flow for the Blob tab. The raw DELETE this tab used to send
+// never read the response body, so a 409 from the reference check looked like
+// a silent no-op. These helpers go through the api.ts wrappers (which put the
+// backend's detail into the Error text) and take their dependencies as
+// arguments so a test can spy on call order without touching the network.
+export interface BlobDeleteDeps {
+  getManifests: typeof getManifests;
+  deleteManifestApi: typeof deleteManifestApi;
+  deleteBlobApi: typeof deleteBlobApi;
+}
+export interface BlobDeletePlan {
+  ok: boolean;
+  message: string;
+  manifestTags: string[];
+}
+export interface BlobDeleteResult {
+  ok: boolean;
+  message: string;
+}
+
+// ModelTag.digest carries a "sha256:" prefix, ManifestSummaryRow's
+// gguf_blob_sha256 is bare hex. Hidden rows are included on purpose: /api/tags
+// omits them, but a hidden manifest still references the blob and would make
+// the blob delete 409.
+export function manifestTagsForDigest(rows: ManifestSummaryRow[], digest: string): string[] {
+  const bare = digest.startsWith('sha256:') ? digest.slice('sha256:'.length) : digest;
+  const tags: string[] = [];
+  for (const row of rows) {
+    if (row.gguf_blob_sha256 === null || row.gguf_blob_sha256 !== bare) continue;
+    if (!tags.includes(row.model_tag)) tags.push(row.model_tag);
+  }
+  return tags;
+}
+
+export async function loadBlobDeletePlan(
+  digest: string,
+  deps: Pick<BlobDeleteDeps, 'getManifests'>,
+): Promise<BlobDeletePlan> {
+  try {
+    const res = await deps.getManifests();
+    return { ok: true, message: '', manifestTags: manifestTagsForDigest(res.manifests, digest) };
+  } catch (ex: unknown) {
+    return {
+      ok: false,
+      message: `Could not read the manifest list: ${String(ex)} — hit Refresh and retry.`,
+      manifestTags: [],
+    };
+  }
+}
+
+// Mirrors Models.tsx performBlobDelete. The first manifest failure aborts the
+// loop so the blob is never deleted out from under manifests that are still
+// there.
+export async function performBlobTabDelete(
+  args: { digest: string; name: string; manifestTags: string[]; dropManifests: boolean },
+  deps: Pick<BlobDeleteDeps, 'deleteManifestApi' | 'deleteBlobApi'>,
+): Promise<BlobDeleteResult> {
+  const { digest, name, manifestTags, dropManifests } = args;
+  try {
+    if (dropManifests) {
+      for (const tag of manifestTags) {
+        await deps.deleteManifestApi(tag);
+      }
+    }
+    await deps.deleteBlobApi(digest);
+    const message = dropManifests
+      ? `Deleted ${name} and ${manifestTags.length} manifest(s).`
+      : manifestTags.length > 0
+        ? `Deleted ${name}, kept ${manifestTags.length} manifest(s) (now orphaned until re-linked).`
+        : `Deleted ${name}.`;
+    return { ok: true, message };
+  } catch (ex: unknown) {
+    return { ok: false, message: `Delete failed: ${String(ex)} — hit Refresh and retry.` };
+  }
+}
+
+export function BlobDeleteRow({
+  colSpan,
+  manifestCount,
+  busy,
+  onDropManifests,
+  onKeepManifests,
+  onCancel,
+}: {
+  colSpan: number;
+  manifestCount: number;
+  busy: boolean;
+  onDropManifests: () => void;
+  onKeepManifests: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <tr>
+      <td colSpan={colSpan} className="px-4 pb-3">
+        <DeleteBlobPrompt
+          manifestCount={manifestCount}
+          busy={busy}
+          onDropManifests={onDropManifests}
+          onKeepManifests={onKeepManifests}
+          onCancel={onCancel}
+        />
+      </td>
+    </tr>
+  );
 }
 
 // Blob is the SubTabs host for the Blob browse view and Models.
@@ -130,6 +228,13 @@ function BlobContents() {
   const [error, setError] = useState<Error | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<{
+    digest: string;
+    name: string;
+    manifestTags: string[];
+  } | null>(null);
+  const [notice, setNotice] = useState('');
+  const [noticeErr, setNoticeErr] = useState(false);
 
   const [query, setQuery] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('name');
@@ -199,21 +304,43 @@ function BlobContents() {
     }
   }, [source, pullUrl, pullSha, pullTag, hfRepo, hfFile, hfTag, importPath, importTag, refresh]);
 
-  const runDelete = useCallback(
-    async (digest: string) => {
-      if (!window.confirm(`Delete blob ${digest.slice(0, 16)}…?`)) return;
+  const startDelete = useCallback(async (m: ModelTag) => {
+    setNotice('');
+    setNoticeErr(false);
+    setBusy(true);
+    try {
+      const plan = await loadBlobDeletePlan(m.digest, { getManifests });
+      if (!plan.ok) {
+        setNotice(plan.message);
+        setNoticeErr(true);
+        return;
+      }
+      setPendingDelete({ digest: m.digest, name: m.name, manifestTags: plan.manifestTags });
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const confirmDelete = useCallback(
+    async (drop: boolean) => {
+      if (pendingDelete === null) return;
       setBusy(true);
       try {
-        const r = await deleteJSON('/api/delete', { digest });
-        setStatus(`DELETE HTTP ${r.status}: ${(await r.text()).slice(0, 300)}`);
+        const result = await performBlobTabDelete(
+          { ...pendingDelete, dropManifests: drop },
+          { deleteManifestApi, deleteBlobApi },
+        );
+        setNotice(result.message);
+        setNoticeErr(!result.ok);
+        setPendingDelete(null);
+        // Refresh on failure too: a partial failure may already have removed
+        // some manifests, and the list must show what is really left.
         await refresh();
-      } catch (e) {
-        setStatus(`error: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         setBusy(false);
       }
     },
-    [refresh],
+    [pendingDelete, refresh],
   );
 
   return (
@@ -300,7 +427,8 @@ function BlobContents() {
               </thead>
               <tbody className="divide-y divide-slate-800">
                 {(visibleTags ?? []).map((m) => (
-                  <tr key={m.digest} className="text-slate-300">
+                  <Fragment key={m.digest}>
+                  <tr className="text-slate-300">
                     <td className="px-4 py-2 font-mono">{m.name}</td>
                     <td className="px-4 py-2 font-mono text-right">{formatBytes(m.size)}</td>
                     <td className="px-4 py-2 font-mono text-right text-slate-400">{paramsDisplay(m)}</td>
@@ -318,12 +446,25 @@ function BlobContents() {
                       <button
                         className="px-2 py-1 rounded-md bg-rose-900/40 text-rose-300 text-xs hover:bg-rose-900/60"
                         disabled={busy}
-                        onClick={() => void runDelete(m.digest)}
+                        onClick={() => void startDelete(m)}
                       >
                         Delete
                       </button>
                     </td>
                   </tr>
+                  {pendingDelete !== null &&
+                    pendingDelete.digest === m.digest &&
+                    pendingDelete.name === m.name && (
+                      <BlobDeleteRow
+                        colSpan={8}
+                        manifestCount={pendingDelete.manifestTags.length}
+                        busy={busy}
+                        onDropManifests={() => void confirmDelete(true)}
+                        onKeepManifests={() => void confirmDelete(false)}
+                        onCancel={() => setPendingDelete(null)}
+                      />
+                    )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
@@ -382,6 +523,18 @@ function BlobContents() {
           </div>
         </div>
       </div>
+
+      {notice && (
+        <div
+          className={`px-3 py-2 rounded border text-sm ${
+            noticeErr
+              ? 'bg-red-950/40 border-red-700 text-red-200'
+              : 'bg-emerald-950/40 border-emerald-700 text-emerald-200'
+          }`}
+        >
+          {notice}
+        </div>
+      )}
 
       {status && (
         <pre className="rounded-lg border border-slate-700 bg-slate-950 p-3 text-xs text-slate-300 whitespace-pre-wrap break-all">

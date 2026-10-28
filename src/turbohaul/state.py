@@ -5,14 +5,19 @@ Per ARCHITECTURE.md. Supports cold-recovery on boot
 """
 import asyncio
 import json
+import logging
 import sqlite3
 import threading
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from turbohaul.slot_meta_projection import strip_stored_meta
+
+log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
 
@@ -427,12 +432,51 @@ def known_active_pids(conn: sqlite3.Connection) -> set[int]:
     return {row["pid"] for row in cur.fetchall() if row["pid"]}
 
 
+# How often a slot's stored metadata was reduced, left alone or could not be read, by outcome:
+# "stripped", "unchanged", "invalid" (not a JSON object, so left untouched), "missing" (no
+# stored value), "error". Process-wide; read it for tests and diagnostics.
+slot_meta_strip_outcomes: Counter = Counter()
+_strip_outcomes_lock = threading.Lock()
+
+
+def _count_strip(outcome: str) -> str:
+    with _strip_outcomes_lock:
+        slot_meta_strip_outcomes[outcome] += 1
+    return outcome
+
+
+def strip_slot_meta(conn: sqlite3.Connection, slot_id: str) -> str:
+    """Reduce one slot's stored ``client_meta_json`` to its identity keys. Returns the outcome.
+
+    Reads that single row's value and writes it back only if it changed. Only that column is
+    written, so ``updated_at`` and every other column keep their values. A value that is NULL,
+    not JSON, or not a JSON object is left as it is. Never raises: a failure is logged and
+    counted, because ending a slot must not depend on it.
+    """
+    try:
+        row = conn.execute("SELECT client_meta_json FROM slots WHERE slot_id=?", (slot_id,)).fetchone()
+        if row is None or row[0] is None:
+            return _count_strip("missing")
+        stripped = strip_stored_meta(row[0])
+        if stripped is None:
+            return _count_strip("invalid")
+        if stripped == row[0]:
+            return _count_strip("unchanged")
+        conn.execute("UPDATE slots SET client_meta_json=? WHERE slot_id=?", (stripped, slot_id))
+        return _count_strip("stripped")
+    except Exception:
+        log.warning("slot metadata strip failed for %s (left as is)", slot_id, exc_info=True)
+        return _count_strip("error")
+
+
 def mark_slot_ended(conn: sqlite3.Connection, slot_id: str, reason: str) -> None:
     now = utcnow_iso()
     conn.execute(
         "UPDATE slots SET state='COLD', ended_at=?, end_reason=?, updated_at=? WHERE slot_id=?",
         (now, reason, now, slot_id),
     )
+    # The request body is only needed while the request runs. Keep the identity of the slot.
+    strip_slot_meta(conn, slot_id)
 
 
 def reconcile_orphaned_slots(conn: sqlite3.Connection, live_pids: set[int]) -> int:

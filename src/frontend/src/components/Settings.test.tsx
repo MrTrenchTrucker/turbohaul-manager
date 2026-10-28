@@ -201,5 +201,5 @@ test('Settings -> General footer reports the shipped product version', () => {
   // is byte-identical to a real absence.
   assert.match(html, /MIT-licensed wrapper around the inference engine/);
 
-  assert.match(html, /Turbohaul-Manager v0\.8\.0/);
+  assert.match(html, /Turbohaul-Manager v0\.8\.1/);
 });

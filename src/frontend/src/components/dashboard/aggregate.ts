@@ -17,12 +17,29 @@ export type SynthesizeResident = (status: StatusSnapshot) => ResidentModel | nul
  * back to the legacy synthesizeResident(status) path when it is empty.
  * residents[] is empty by design at max_parallel_sidecars<=1 -- a
  * residents[]-only implementation blanks every cap<=1 dashboard.
+ *
+ * (cap>=2 swap-tick HOLD): at max_parallel_sidecars>=2 an empty
+ * status.residents is NEVER a real single-resident state -- it is the ~1-tick
+ * transient where the backend _residents_snapshot empties mid model-swap
+ * (outgoing resident evicted before the incoming one registers). Falling back to ONE synthesizeResident(status) there reads
+ * the singular data.generation alias (the most-recently-active resident) and collapses the multi-resident grid to a single card. So
+ * at cap>=2 we HOLD the last non-empty resident set (passed in as
+ * `heldResidents`, threaded by the caller the same way the backend mirrors its
+ * own alias HOLD in live_monitor) instead of fabricating an alias.
+ * The gate is `parallel_slots.max` -- the CONFIGURED cap (max_parallel_sidecars,
+ * stable across the swap), NOT `parallel_slots.used`, which is a live count that
+ * transiently DROPS during the very swap tick we must hold through. The cap<=1
+ * legacy single-synth path below is unchanged for single-residency boxes.
  */
 export function selectResidents(
   status: StatusSnapshot,
   synthesizeResident: SynthesizeResident,
+  heldResidents: ResidentModel[] = [],
 ): ResidentModel[] {
   if (status.residents.length > 0) return status.residents;
+  // cap>=2: empty residents[] is a transient swap artifact, not a real state --
+  // HOLD the last non-empty set, never fabricate a single alias resident.
+  if (status.parallel_slots.max >= 2) return heldResidents;
   const legacy = synthesizeResident(status);
   return legacy ? [legacy] : [];
 }

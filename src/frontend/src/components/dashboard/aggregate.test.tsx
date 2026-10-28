@@ -54,7 +54,7 @@ function makeStatus(overrides: Partial<StatusSnapshot> = {}): StatusSnapshot {
     loading: null,
     grace: null,
     idle_hot: null,
-    parallel_slots: { used: 0, max: 4 },
+    parallel_slots: { used: 0, max: 1 },
     residents: [],
     vram: null,
     vram_total_mib: null,
@@ -109,6 +109,152 @@ test('selectResidents + combinedTokS end-to-end: cap<=1 (legacy) fallback still 
   assert.equal(residents.length, 1);
   assert.equal(combinedTokS(residents), 42.5, 'a cap<=1 dashboard must not read 0/blank when a real generation is live');
 });
+
+/* ------------------------------------------------------------------ */
+/*  selectResidents -- cap>=2 HOLD across a swap-tick empty snap  */
+/* ------------------------------------------------------------------ */
+
+test(
+  'selectResidents: at cap>=2 an empty residents[] HOLDS the last non-empty set across the swap tick, ' +
+    'never collapsing to ONE synthesized alias resident (the alias reads the singular data.generation)',
+  () => {
+    // A real 2-resident snapshot at cap>=2 (max = max_parallel_sidecars = 2).
+    const cap2 = { parallel_slots: { used: 2, max: 2 } } as Partial<StatusSnapshot>;
+    const resA = makeResident({ model_tag: 'res-A', port: 11500 });
+    const resB = makeResident({ model_tag: 'res-B', port: 11501 });
+    const tickTwoResidents = makeStatus({ ...cap2, residents: [resA, resB] });
+    // The swap tick: the backend _residents_snapshot transiently empties for
+    // one tick (outgoing resident evicted before the incoming one registers).
+    const tickSwapEmpty = makeStatus({ ...cap2, residents: [] });
+
+    // The caller (Dashboard) threads the last non-empty set back in as the
+    // heldResidents argument; selectResidents owns the cap>=2 HOLD decision.
+    let held: ResidentModel[] = [];
+    let synthCalls = 0;
+    const synth = (): ResidentModel => {
+      synthCalls += 1;
+      return makeResident({ model_tag: 'alias-most-recently-active' });
+    };
+    const step = (status: StatusSnapshot): ResidentModel[] => {
+      held = selectResidents(status, synth, held);
+      return held;
+    };
+
+    // tick 1: the real 2-resident set passes straight through.
+    const afterReal = step(tickTwoResidents);
+    assert.deepEqual(afterReal, [resA, resB]);
+
+    // tick 2: the swap-tick empty snapshot at cap>=2 must HOLD the 2, not
+    // collapse to the single synthesized alias resident.
+    const afterSwap = step(tickSwapEmpty);
+    assert.equal(afterSwap.length, 2, 'cap>=2 empty snapshot must HOLD the 2 residents, not collapse to 1');
+    assert.deepEqual(afterSwap, [resA, resB], 'the held set must be the real residents, never a fabricated alias');
+    assert.equal(synthCalls, 0, 'must NEVER synthesize an alias resident at cap>=2 on an empty snapshot');
+  },
+);
+
+test(
+  'selectResidents: cap<=1 legacy single-synth path is UNCHANGED (empty residents[] still synthesizes ONE resident)',
+  () => {
+    // Same empty-snapshot shape, but at cap<=1 (max = 1) the empty residents[]
+    // IS the legitimate single-residency state, so the legacy synth must fire.
+    const cap1 = { parallel_slots: { used: 0, max: 1 } } as Partial<StatusSnapshot>;
+    const status = makeStatus({ ...cap1, residents: [] });
+    const legacy = makeResident({ model_tag: 'legacy-single' });
+    let calls = 0;
+    const result = selectResidents(status, () => {
+      calls += 1;
+      return legacy;
+    });
+    assert.equal(calls, 1, 'cap<=1 empty residents[] must still synthesize (legacy single-residency, unchanged)');
+    assert.deepEqual(result, [legacy]);
+  },
+);
+
+/* ------------------------------------------------------------------ */
+/*  selectResidents -- the HOLD gate reads parallel_slots.max    */
+/* ------------------------------------------------------------------ */
+
+// The gate must read the CONFIGURED cap (max), not the live count (used).
+// A model swap keeps max stable while used drops, so a gate that read used
+// would stop holding on exactly the ticks the grid needs it. Boundary:
+// {used:0,max:2} is the smallest cap that holds; {used:2,max:1} is a
+// full-looking count at cap 1, which must not hold (it synthesizes).
+const HOLD_SLOT_FIXTURES = [
+  { used: 0, max: 2 },
+  { used: 1, max: 2 },
+  { used: 1, max: 4 },
+  { used: 0, max: 4 },
+];
+
+for (const slots of HOLD_SLOT_FIXTURES) {
+  test(
+    `selectResidents: used=${slots.used} max=${slots.max}: empty residents[] HOLDS the held set and never synthesizes`,
+    () => {
+      const cap = { parallel_slots: { used: slots.used, max: slots.max } } as Partial<StatusSnapshot>;
+      const held = [makeResident({ model_tag: 'held-A', port: 11500 }), makeResident({ model_tag: 'held-B', port: 11501 })];
+      const status = makeStatus({ ...cap, residents: [] });
+      let calls = 0;
+      const result = selectResidents(
+        status,
+        () => {
+          calls += 1;
+          return makeResident({ model_tag: 'alias-most-recently-active' });
+        },
+        held,
+      );
+      assert.deepEqual(result, held, 'a configured cap of 2 or more must hold the set even when the live count is low');
+      assert.equal(calls, 0, 'must NEVER synthesize an alias resident at cap>=2 on an empty snapshot');
+    },
+  );
+}
+
+for (const used of [2, 3]) {
+  test(
+    `selectResidents: used=${used} max=1: a full-looking slot count at cap 1 still synthesizes, it does not hold (used is not the gate)`,
+    () => {
+      const cap = { parallel_slots: { used, max: 1 } } as Partial<StatusSnapshot>;
+      const held = [makeResident({ model_tag: 'held-A', port: 11500 }), makeResident({ model_tag: 'held-B', port: 11501 })];
+      const status = makeStatus({ ...cap, residents: [] });
+      const legacy = makeResident({ model_tag: 'legacy-single' });
+      let calls = 0;
+      const result = selectResidents(
+        status,
+        () => {
+          calls += 1;
+          return legacy;
+        },
+        held,
+      );
+      assert.deepEqual(result, [legacy], 'cap 1 must use the legacy single resident, never the held set');
+      assert.equal(calls, 1, 'the legacy synth must fire exactly once at cap 1');
+    },
+  );
+}
+
+test(
+  'selectResidents: a non-empty residents[] passes straight through at every held fixture and never returns the held set',
+  () => {
+    const held = [makeResident({ model_tag: 'held-A', port: 11500 }), makeResident({ model_tag: 'held-B', port: 11501 })];
+    for (const slots of HOLD_SLOT_FIXTURES) {
+      const real = [makeResident({ model_tag: 'real-A', port: 11500 }), makeResident({ model_tag: 'real-B', port: 11501 })];
+      const cap = { parallel_slots: { used: slots.used, max: slots.max } } as Partial<StatusSnapshot>;
+      const status = makeStatus({ ...cap, residents: real });
+      let calls = 0;
+      const result = selectResidents(
+        status,
+        () => {
+          calls += 1;
+          return makeResident({ model_tag: 'alias-most-recently-active' });
+        },
+        held,
+      );
+      assert.deepEqual(result, status.residents, `used=${slots.used} max=${slots.max}: a non-empty residents[] must pass through unchanged`);
+      assert.notDeepEqual(result, held, `used=${slots.used} max=${slots.max}: the held set must not replace a non-empty residents[]`);
+      assert.equal(calls, 0, 'synthesize must not run when residents[] is non-empty');
+    }
+  },
+);
 
 /* ------------------------------------------------------------------ */
 /*  combinedTokS                                                       */

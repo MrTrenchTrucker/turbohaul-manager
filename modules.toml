@@ -31,3 +31,99 @@ does_not_own = "Doing the lookups, their cache, backoff and background task (leg
 depends_on = []
 public = ["name_candidates", "confirmed_name"]
 card = "src/turbohaul/fastlane_client_names/AGENTS.md"
+
+[modules.slot_meta_projection]
+path = "src/turbohaul/slot_meta_projection"
+owns = "Which client-metadata keys are persisted for a slot (identity only, never the request body), the reduction of an already stored body to those keys, and the projection the boot census uses to read the address and class labels back from a stored body without loading it"
+does_not_own = "Running the SQL, building the census and all logging (manager.py), writing slot rows (state.py upsert_slot), what the class labels mean (kv_classify.py), the in-memory client metadata of a running request"
+depends_on = []
+public = ["IDENTITY_KEYS", "CENSUS_KEYS", "CENSUS_SLOTS_SQL", "identity_client_meta", "parse_census_meta", "strip_stored_meta"]
+card = "src/turbohaul/slot_meta_projection/AGENTS.md"
+
+[modules.cold_meta_sweep]
+path = "src/turbohaul/cold_meta_sweep"
+owns = "One bounded run of the retention pass that reduces the stored metadata of old ended slots to their identity keys (database access through the session it is given), and the decision whether a pass is due, with its log line"
+does_not_own = "Which keys are kept (slot_meta_projection), the strip of one row (state.py strip_slot_meta), the setting kv.cold_meta_purge_age_hours (config.py), the sweeper tick that calls it, the batch size, idle time, watermark, timer and counters (manager.py), the boot census"
+depends_on = []
+public = ["run_once", "maybe_sweep"]
+card = "src/turbohaul/cold_meta_sweep/AGENTS.md"
+
+[modules.kv_ram_cap]
+path = "src/turbohaul/kv_ram_cap"
+owns = "The save-time hard RAM cap on the slot KV save directory: byte accounting of the save directory, the HARD and SOFT protection split, the save gate decision, and the GC's age and SOFT-ceiling selection lists"
+does_not_own = "The GC itself and its unlink loop, gathering the live thread state, all logging, the snapshot write and the save directory and cap config (manager.py and the runtime config)"
+depends_on = []
+public = ["dir_accounting", "ProtectionSplit", "split_protection", "cap_exceeded", "SaveGate", "enforce_save_cap", "soft_age_targets", "soft_ceiling_order"]
+card = "src/turbohaul/kv_ram_cap/AGENTS.md"
+
+[modules.kv_stale_pairs]
+path = "src/turbohaul/kv_stale_pairs"
+owns = "Keeping one saved KV pair per thread on the RAM-disk save directory: proving the new pair landed, picking the thread's pairs on ports it left (sparing ports a live turn serves), and removing their bin, checkpoint and metadata files"
+does_not_own = "Gathering the live state, the snapshot write and measuring the landed file, all logging and the scan-cache invalidation (manager.py), and the save-time size gate (kv_ram_cap)"
+depends_on = []
+public = ["drop_stale_pairs", "DropResult", "StalePair"]
+card = "src/turbohaul/kv_stale_pairs/AGENTS.md"
+
+[modules.kv_stack_wiring]
+path = "src/turbohaul/kv_stack_wiring"
+owns = "The manager-facing side of the slot KV save directory cap and the stale-pair drop: reading the live manager for the HARD and SOFT thread hashes and the served ports, the logged directory accounting, the save-time cap gate with its warning, the stale-pair drop after a save with its log lines, and the GC's SOFT-tier fallback loop"
+does_not_own = "The decisions (kv_ram_cap, kv_stale_pairs), the GC itself and its unlink function, the snapshot write, the engine calls and the scan cache (manager.py), the save directory and the cap config"
+depends_on = ["kv_ram_cap", "kv_stale_pairs"]
+public = ["dir_accounting_logged", "live_turn_groups", "live_kv_protection", "save_declined_by_cap", "drop_stale_pairs_after_save", "evict_soft_floor"]
+card = "src/turbohaul/kv_stack_wiring/AGENTS.md"
+
+[modules.co_residence]
+path = "src/turbohaul/co_residence"
+owns = "The fit-based periodic re-check that starts a further engine for a model tag that already runs one: the box-wide debounce, the scan for waiting requests, the per-tag no-room memo, the re-check and arrival verdicts (card picker plus the VRAM gate; the re-check is not limited by max_parallel_sidecars) and the CO_RESIDENCE_DECLINED / CO_RESIDENCE_RECHECK log lines"
+does_not_own = "The probe-retry admission rule (coresident_admission, a separate module), the per-tag engine ceiling and the box budget as a number (engine_budget and manager.py _effective_cap), placement, the card picker, the VRAM math and the reserve itself (manager.py), the registry lock and the clock, the queue, eviction and teardown, the Fast Lane claim, calling the re-check (the dispatch loop in manager.py)"
+depends_on = ["queue_liveness"]
+public = ["RECHECK_MIN_INTERVAL_S", "NO_ROOM_MEMO_S", "DEMAND_MIN_AGE_S", "PROTECTED_DEMAND_MIN_AGE_S", "MEMO_MAX_ENTRIES", "RecheckGate", "recheck_window", "demand_is_eligible", "RecheckInputs", "RecheckDecision", "decide_recheck", "NoRoomMemo", "DeclineReason", "format_step2_decline", "format_recheck_action", "RecheckState", "Candidate", "inbox_slots", "take_from_inbox", "gather_candidates", "pick_candidate", "Verdict", "fit_verdict", "arrival_verdict", "run_recheck", "CoResidenceHost"]
+card = "src/turbohaul/co_residence/AGENTS.md"
+
+[modules.coresident_admission]
+path = "src/turbohaul/coresident_admission"
+owns = "The admission rule for a tensor-isolated model that shares a card with other such models: free VRAM minus the reserve for siblings still booting, plus the credit for in-flight unloads, must cover the need; and the bounded retry of a flaky free-VRAM read"
+does_not_own = "Reading nvidia-smi and the primary free-VRAM read (safety.py), choosing the card or split of a model (manager.py placement), the credit for in-flight unloads (the manager computes it), choosing an eviction, and the structural refusals for layer-split or non-'none' siblings (the manager keeps them)"
+depends_on = []
+public = ["SiblingLoad", "retry_read_free_vram", "reserved_loading_mib", "fits", "admit"]
+card = "src/turbohaul/coresident_admission/AGENTS.md"
+
+[modules.resident_exit]
+path = "src/turbohaul/resident_exit"
+owns = "The keep-warm-or-unload decision for a resident whose request just ended on a co-resident box, and the single exit-class log line (reason, key, thread, port, state before and after) every resident death must produce"
+does_not_own = "Measuring the inputs, evicting or deregistering a resident, parking it IDLE_EVICTABLE, the make-room eviction line, whether a KV save is allowed, and all logging (manager.py)"
+depends_on = []
+public = ["ExitReason", "needs_exit_line", "format_resident_exit", "RetentionInputs", "RetentionDecision", "decide_retention"]
+card = "src/turbohaul/resident_exit/AGENTS.md"
+
+[modules.resident_exit_wiring]
+path = "src/turbohaul/resident_exit_wiring"
+owns = "The manager-facing side of the resident exit feature: measuring the live inputs for the keep-warm decision and asking resident_exit, writing the exit log line for a resident death, and picking the exit reason when the caller did not stamp one"
+does_not_own = "The keep-warm decision and the exit line format (resident_exit), evicting, deregistering or parking a resident, the registry lock, the reason stamps and the order of calls in a death, the make-room eviction line (manager.py)"
+depends_on = ["resident_exit"]
+public = ["hold_warm_window", "log_resident_exit", "resolve_exit_reason"]
+card = "src/turbohaul/resident_exit_wiring/AGENTS.md"
+
+[modules.state_db_cleanup]
+path = "src/turbohaul/state_db_cleanup"
+owns = "The one-time, operator-run cleanup of state.sqlite: reducing every COLD row's stored request value to the identity keys, in a verified, gated sequence (preflight, lock, backup, verify, strip, rebuild with VACUUM INTO, verify, swap), with a dry run and a JSON report"
+does_not_own = "Which keys are identity keys and how a stored body is reduced (slot_meta_projection), the schema and the opening of the live database by the manager (state.py), the slot-end reduction and the background retention sweep (state.py and manager.py), stopping and starting the manager, the operator runbook (docs/STATE_DATABASE_MEMORY.md)"
+depends_on = ["slot_meta_projection"]
+public = ["run", "main", "Config", "Env", "Stop", "parse_args"]
+card = "src/turbohaul/state_db_cleanup/AGENTS.md"
+
+[modules.resident_identity]
+path = "src/turbohaul/resident_identity"
+owns = "The bookkeeping of the last request identity per resident (store, read and forget it, always under the resident's own key; the legacy singleton key and an empty key are never stored; a failed store never raises), and the lookup of the resident that serves a request handle with its spawn counter, falling back to the model's counter when no resident owns the handle, and the load of one resident (riders in flight, plus one for a running turn, plus the inbox depth; the finished last-served slot of a resident in its grace loop, a slot in the finished state, is not a running turn)"
+does_not_own = "The storage and lifetime of the identity dict, building the identity dict (_identity_dict), the resident registry and _model_residents, the generation blocks and their key (live_monitor), the status snapshot shape, the legacy singleton key constant (the caller passes it in), where the calls are made (the driver bind step, the status snapshot, the eviction path, the stream tee, the engine pick: manager.py), the pick key and the affinity record, and the resident's own fields and when they change"
+depends_on = []
+public = ["ResidentIdentityHost", "ResidentLike", "SlotLike", "stash_identity", "identity_for", "forget_identity", "serving_resident", "spawn_seq_for_handle", "LoadLike", "pending_load"]
+card = "src/turbohaul/resident_identity/AGENTS.md"
+
+[modules.queue_liveness]
+path = "src/turbohaul/queue_liveness"
+owns = "Whether the client of a waiting request is still there: the shared liveness predicate, the stamp that flags a slot whose client has gone, the one-shot fail of a gone slot, the source-first eviction of one waiting slot (flags, claim release, removal from the queues and from a busy engine's inbox, failure of the completion future), and the synchronous notify entry a route calls on a hang-up"
+does_not_own = "The queues, the inbox storage and the claims (the queue and manager.py own them; the module removes through the host and asks the host to release the claim), the registry lock, how the manager fails a slot (the module calls the host), the route code that calls the notify entry, the Fast Lane rank logic and the engine reservation"
+depends_on = []
+public = ["QueueLivenessHost", "ResidentLike", "SlotLike", "client_gone", "stamp_if_disconnected", "drop_if_gone", "evict_unstarted", "notify_client_gone"]
+card = "src/turbohaul/queue_liveness/AGENTS.md"

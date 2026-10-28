@@ -226,7 +226,7 @@ async function streamResident(tag: string, signal: AbortSignal, cb: StreamCallba
 
   while (!signal.aborted) {
     try {
-      const resp = await fetch(`${SSE_URL}?model_tag=${encodeURIComponent(tag)}`, {
+      const resp = await fetch(`${SSE_URL}?resident_key=${encodeURIComponent(tag)}`, {
         headers: { Accept: 'text/event-stream' },
         signal,
       });

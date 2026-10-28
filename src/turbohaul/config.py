@@ -282,6 +282,11 @@ class KVConfig(BaseModel):
     # manager.py's `_gc_kv_cache(...)`. The value is reachable
     # through the config API.
     ram_cache_max_age_hours: float = Field(default=6.0, ge=0)
+    # Age, in hours, after which the stored request metadata of an ended (COLD) slot is reduced
+    # to its identity keys by a background pass (the request body is dropped, the row stays).
+    # 0 turns the pass off, which is the default: rows written before the identity-only change
+    # keep their full bodies until an operator turns this on. Read fresh on every pass.
+    cold_meta_purge_age_hours: float = Field(default=0.0, ge=0)
     # Boot-time KV-dir mount/fstype assertion
     # (FAIL LOUD, KEEP SERVING — see manager.py's boot_reconcile /
     # _check_kv_dir_mounts). Config key with a default, never an env var

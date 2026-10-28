@@ -2380,6 +2380,7 @@ class TestMultislotConcurrencyFixes:
         slot = SimpleNamespace(
             model_tag="m3", fastlane=None,
             fastlane_relocated_main_gpu=None, fastlane_relocated_split_mode=None,
+            is_evicted=False, disconnect_event=None,
         )
         # gpu0 over-committed for m3 (4000 < 18000); gpu1 ample.
         with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[4000, 30000]):
@@ -2890,6 +2891,7 @@ class TestMultislotConcurrencyFixes:
         slot = SimpleNamespace(
             model_tag="x", fastlane=None,
             fastlane_relocated_main_gpu=None, fastlane_relocated_split_mode=None,
+            is_evicted=False, disconnect_event=None,
         )
         with patch("turbohaul.safety._read_free_vram_all_mib", return_value=[4000, 4000]):
             await mgr._route_or_reserve(slot)

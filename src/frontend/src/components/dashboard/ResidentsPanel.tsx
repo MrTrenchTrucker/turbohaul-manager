@@ -77,7 +77,7 @@ function resolvePane(
   resident: ResidentModel,
   panes: Record<string, GenPane>,
 ): GenPane | null {
-  return panes[resident.model_tag] ?? null;
+  return panes[resident.resident_key ?? resident.model_tag] ?? null;
 }
 
 export function ResidentsPanel({

@@ -35,7 +35,15 @@ from typing import Any, NamedTuple
 
 from turbohaul.config import KEEP_ALIVE_MAX_S, BootConfig, RuntimeConfig
 from turbohaul.fsm import LEGAL_TRANSITIONS, InvalidTransition, is_terminal, transition
-from turbohaul.live_monitor import LiveOutputBuffer, compute_generation_id, idle_generation
+from turbohaul.live_monitor import LiveOutputBuffer, compute_generation_id, idle_generation, resident_gen_key
+from turbohaul.resident_identity import (
+    forget_identity,
+    identity_for,
+    pending_load,
+    serving_resident,
+    spawn_seq_for_handle,
+    stash_identity,
+)
 from turbohaul.manifest import (
     SPEC_TYPES_NEEDING_RS_SEQ,
     SPEC_TYPES_WITH_STANDALONE_DRAFT_MODEL,
@@ -65,12 +73,14 @@ from turbohaul.singleton import (
 )
 from turbohaul.slot import Slot, SlotEvictedError, SlotState, VramOverCommitError, derive_thread_id_prefix_hash
 from turbohaul import load_verify_log  # observability emitter + /status read (display-only)
+from turbohaul import queue_liveness
 from turbohaul import spec_downgrade_log  # SPEC_DOWNGRADED observability emitter + /status read (display-only)
 from turbohaul.state import (
     audit_db_session,
     known_active_pids,
     known_engine_identities,
     mark_slot_ended,
+    strip_slot_meta,
     record_engine_identity,
     open_state_db,
     reconcile_orphaned_slots,
@@ -2189,6 +2199,8 @@ class Resident:
     sleep_idle_seconds: int = 0
     last_active_monotonic: float = 0.0
     torn_down: bool = False
+    # Stamped by the caller just before its one-argument _begin_unload_locked call (tests fake that method).
+    exit_reason: "ExitReason | None" = None
     driver_task: "asyncio.Task | None" = None
     inbox: "asyncio.Queue | None" = None
     # Residency tag for per-(role,session) ring.
@@ -2283,7 +2295,16 @@ def _first_diff_offset(a: str, b: str) -> int:
         return -2
 
 
+from turbohaul import kv_stack_wiring
 from turbohaul.engine_budget import EngineBudgetInputs, effective_engine_cap
+from turbohaul.slot_meta_projection import CENSUS_SLOTS_SQL, identity_client_meta, parse_census_meta
+from turbohaul import cold_meta_sweep
+from turbohaul.kv_ram_cap import soft_age_targets
+from turbohaul.kv_stale_pairs import drop_stale_pairs
+from turbohaul.co_residence import RecheckState, arrival_verdict, run_recheck  # noqa: E402
+from turbohaul.coresident_admission import SiblingLoad, admit, fits, reserved_loading_mib, retry_read_free_vram
+from turbohaul import resident_exit_wiring
+from turbohaul.resident_exit import ExitReason, format_resident_exit
 
 
 class TurbohaulManager:
@@ -2308,6 +2329,10 @@ class TurbohaulManager:
     # GC piggybacks on the park-sweep loop but is THROTTLED to this floor so a
     # scandir of the multi-GB save dir never runs on the 60s park cadence.
     _KV_GC_MIN_INTERVAL_S = 300
+    # Retention pass over ended slots' stored metadata: rows handled per run (one run per sweeper
+    # tick), and the quiet time after a full pass over the table before the next one starts.
+    _COLD_META_BATCH = 500
+    _COLD_META_IDLE_AFTER_PASS_S = 3600
 
     def __init__(
         self,
@@ -2508,22 +2533,11 @@ class TurbohaulManager:
         # OBSERVABILITY ONLY — read-only surface of the class the manager
         # already resolved; drives no decision.
         self._last_request_identity: dict | None = None
-        # Same identity dict as above, keyed per-resident so /status.residents[]
-        # can show each card its OWN last request instead of every card flip-flopping
-        # to whichever resident served most recently on the single global. Keyed by
-        # model_tag, exactly like `live_generations` one line of intent below.
-        # LIFETIME (deliberately NOT the same as the global above): pruned on FULL
-        # eviction only, mirroring live_generations.pop(tag, None) (live_monitor.py)
-        # -- populated on request, KEPT while the resident is ACTIVE **or** IDLE
-        # (still present in self._residents), popped only when the resident is torn
-        # down and removed from self._residents. NEVER pop this on an idle transition
-        # -- an idle-but-still-resident engine must keep showing what it last served;
-        # popping there would silently blank every idle card's last-request strip.
-        # The top-level global above is never pruned at all (a single entry, so
-        # never-clearing costs nothing); this dict grows one small entry per distinct
-        # model_tag ever served (bounded in practice, ~100 manifest tags = kilobytes)
-        # -- same principle of not losing the operator's answer, different cost shape,
-        # hence the different lifetime.
+        # Same identity dict as above, kept per resident so /status.residents[] shows each card its
+        # OWN last request. Keyed by resident_key (the model tag, or model_tag#N for a sibling), like
+        # `live_generations`; stored at admission, not at enqueue. LIFETIME: kept while the resident is
+        # active or idle, pruned only when it is removed from self._residents. Never prune it on an idle
+        # transition: an idle engine must keep showing what it last served. The global above is never pruned.
         self._last_request_identity_by_model: dict[str, dict] = {}
         # Fast Lane: discovered-address census. address -> record dict
         # (first_seen/last_seen/request_count/served_count/classes/models/
@@ -2712,6 +2726,12 @@ class TurbohaulManager:
         # fires one _KV_GC_MIN_INTERVAL_S AFTER startup (never at t=0), which
         # also keeps short-lived unit-test sweeper spins from touching the dir.
         self._last_kv_gc_monotonic: float = time.monotonic()
+        # Retention pass state: where the last run stopped (a slots rowid), when the next full
+        # pass may start, and lifetime counters.
+        self._cold_meta_watermark: int = 0
+        self._cold_meta_next_pass_monotonic: float = 0.0
+        self._cold_meta_stripped_lifetime: int = 0
+        self._cold_meta_invalid_lifetime: int = 0
         # Monotonic throttle for the sweeper-side fingerprint
         # purge (the startup call is unthrottled). 0.0 = never run -> first sweep
         # after enable purges immediately.
@@ -2736,12 +2756,12 @@ class TurbohaulManager:
         # Per-resident live-inference monitor (cap>=2). The single
         # LiveSlotsPoller above stays the cap<=1 path (byte-identical). At cap>=2 a
         # LiveResidentsSupervisor task polls EACH resident's /slots and writes its
-        # generation into ``live_generations`` (keyed by model_tag), mirroring the
+        # generation into ``live_generations`` (keyed by resident key), mirroring the
         # most-recently-active resident into ``live_generation`` (the back-compat
         # alias status_snapshot + live_stream.py already read). It also caches per-GPU
         # free VRAM off the hot path so status_snapshot can emit ``vram[]`` await-free
         # (status_snapshot is LOCK-FREE and must NEVER call nvidia-smi synchronously).
-        self.live_generations: dict[str, dict] = {}   # model_tag -> generation block
+        self.live_generations: dict[str, dict] = {}   # resident key -> generation block
         self._vram_free_mib: list[int] | None = None  # per-GPU free MiB (cached ~1Hz)
         # Per-GPU SM utilization %, cached the SAME way (same
         # pollers, same ~1Hz cadence, same None-on-probe-failure degrade) so
@@ -3150,11 +3170,7 @@ class TurbohaulManager:
         fut = slot.completion_future
         return (
             slot.state in (SlotState.STAGED, SlotState.ACCEPT_BUFFER)
-            and not slot.is_evicted
-            and not (
-                slot.disconnect_event is not None
-                and slot.disconnect_event.is_set()
-            )
+            and not queue_liveness.client_gone(slot)
             and not (fut is not None and fut.done())
         )
 
@@ -3906,11 +3922,12 @@ class TurbohaulManager:
             )
             log.info("R2B_REQ_IDENTITY %s", json.dumps(identity))
             self._last_request_identity = identity
-            # Same stash, per-resident. model_tag is already a keyword param
-            # of this function -- no threading needed.
-            self._last_request_identity_by_model[model_tag] = identity
+            # The per-resident identity is stored at admission, not at enqueue.
         except Exception:  # noqa: BLE001 — display-only, never fail a request
             log.debug("R2B_REQ_IDENTITY emit failed (ignored)", exc_info=True)
+
+    def _stash_resident_identity(self, r: "Resident", slot: "Slot") -> None:
+        stash_identity(self, r, slot, _SINGLETON_RESIDENT_KEY)
 
     def _live_fastlane_label(self, raw_address: "str | None") -> "str | None":
         """The label the CURRENT rule table gives the rule identified by
@@ -4490,10 +4507,9 @@ class TurbohaulManager:
             from turbohaul.kv_classify import _class_from_label
             self._fastlane_census.clear()
             with state_db_session(self.boot.storage.state_db_path) as conn:
-                rows = conn.execute(
-                    "SELECT slot_id, thread_id, model_tag, created_at, client_meta_json "
-                    "FROM slots"
-                ).fetchall()
+                # The stored body of every slot ever created is the bulk of the database.
+                # Read only the few keys the census needs, built by SQLite, never the body.
+                rows = conn.execute(CENSUS_SLOTS_SQL).fetchall()
                 served_counts: dict[str, int] = {}
                 for slot_id, count in conn.execute(
                     "SELECT slot_id, COUNT(*) FROM audit_events "
@@ -4501,11 +4517,8 @@ class TurbohaulManager:
                     "GROUP BY slot_id"
                 ).fetchall():
                     served_counts[slot_id] = count
-            for slot_id, thread_id, model_tag, created_at, client_meta_json in rows:
-                try:
-                    client_meta = json.loads(client_meta_json) if client_meta_json else {}
-                except (TypeError, ValueError):
-                    client_meta = {}
+            for slot_id, thread_id, model_tag, created_at, projected_meta in rows:
+                client_meta = parse_census_meta(projected_meta)
                 ip = client_meta.get("ip")
                 if not ip:
                     self._fastlane_census_skipped_no_ip += 1
@@ -4802,7 +4815,7 @@ class TurbohaulManager:
                     "model_tag": slot.model_tag,
                     "thread_id": slot.thread_id,
                     "state": slot.state.value,
-                    "client_meta": slot.client_meta,
+                    "client_meta": identity_client_meta(slot.client_meta),
                 },
             )
 
@@ -5336,6 +5349,8 @@ class TurbohaulManager:
             )
             out.append({
                 "model_tag": r.model_tag,
+                # The resident's own dict key; tells two residents of one model apart.
+                "resident_key": r.resident_key,
                 "state": r.state.value,
                 # ADDITIVE -- `state` above is unchanged and still the
                 # raw r.state. `phase` is what r.state WOULD say if ResidentState.GRACE
@@ -5367,15 +5382,15 @@ class TurbohaulManager:
                 # fresh here.
                 "inbox_depth": r.inbox.qsize() if r.inbox is not None else 0,
                 "idle_expires_in_s": idle_in,
-                "generation": self.live_generations.get(r.model_tag),
-                # This resident's OWN LAST-served identity, additive --
+                "generation": self.live_generations.get(resident_gen_key(r)),
+                # this resident's OWN LAST-served identity, additive --
                 # regardless of whether it is still running. Keyed identically
                 # to `generation` above; see the field's declaration in
                 # __init__ for the pruning lifetime (evict-only, never on idle).
                 # See RequestIdentityStrip.tsx for the FE's own naming of
                 # this "last, not current" distinction.
                 "request_identity": self._identity_with_live_label(
-                    self._last_request_identity_by_model.get(r.model_tag)
+                    identity_for(self, r)
                 ),
                 # This resident's identity RIGHT NOW -- null
                 # when this resident is idle, built from r.active_slot (the
@@ -5712,7 +5727,13 @@ class TurbohaulManager:
             return r.spawn_seq
         return self._active_spawn_seq()
 
-    # === State-migration mirror chokepoints ==================
+    def _serving_resident_for_handle(self, handle: "SidecarHandle | None") -> "Resident | None":
+        return serving_resident(self, handle)
+
+    def _spawn_seq_for_handle(self, handle: "SidecarHandle | None", model_tag: "str | None") -> int:
+        return spawn_seq_for_handle(self, handle, model_tag)
+
+    # === state-migration mirror chokepoints ==================
     # Each writes the legacy manager-global scalar (AUTHORITATIVE — zero churn
     # for existing readers) AND mirrors it onto the active resident, exactly
     # like ``_bump_spawn_seq`` does for spawn_seq. At MAX_PARALLEL_SIDECARS == 1
@@ -6200,8 +6221,7 @@ class TurbohaulManager:
                 # Total pending = riders in-flight (+1 while actively
                 # serving) + slots already queued in this engine's inbox, so back-to-back
                 # new sessions before the driver drains the inbox still spread evenly.
-                len(r.inflight) + (1 if r.active_slot is not None else 0)
-                + (r.inbox.qsize() if getattr(r, "inbox", None) is not None else 0),
+                pending_load(r),
                 r.last_active_monotonic,
             ),
         )
@@ -6480,6 +6500,17 @@ class TurbohaulManager:
         cap = self.runtime.queue.max_parallel_sidecars
         return len(self._model_residents()) < cap
 
+    def _co_residence_now(self) -> float:
+        """Clock seam of the co-residence re-check."""
+        return time.monotonic()
+
+    def _co_residence_state(self) -> RecheckState:
+        """Re-check memory, created on first use (a harness may skip ``__init__``)."""
+        st = getattr(self, "_co_residence_st", None)
+        if st is None:
+            st = self._co_residence_st = RecheckState()
+        return st
+
     async def _grace_active_exclusions(self) -> "frozenset[tuple[str, str]]":
         """The set of (thread_id, model_tag) pairs
         pop_next must make invisible to its whole pick ladder for one call --
@@ -6561,6 +6592,7 @@ class TurbohaulManager:
             self.runtime.queue.max_parallel_sidecars,
         )
         while not self._stop_event.is_set():
+            await run_recheck(self)
             residents = len(self._model_residents())
             staging_depth = self.queue.depth()["staging_queue_depth"]
             if residents == 0 and staging_depth > 0:
@@ -6600,9 +6632,6 @@ class TurbohaulManager:
                 finally:
                     self._dispatch_wake.clear()
                 continue
-            if slot.is_evicted:
-                self._handle_unloaded_slot(slot)
-                continue
             try:
                 with self._reserving(slot.model_tag):
                     await self._route_or_reserve(slot)
@@ -6625,6 +6654,14 @@ class TurbohaulManager:
         self._spawn_bg(self._audit_unloaded_slot(slot))
         self._unload_count += 1
         self._last_unloaded_at_iso = datetime.now(timezone.utc).isoformat()  # noqa: UP017
+
+    async def _drop_gone_slot(self, slot: "Slot | None") -> "Slot | None":
+        """None for a taken request whose client has gone (failed once, claim released), else ``slot``."""
+        if slot is not None and queue_liveness.drop_if_gone(self, slot):
+            async with self._registry_lock:
+                self._release_fastlane_claim_locked(slot, "disconnected")
+            return None
+        return slot
 
     async def _audit_unloaded_slot(self, slot: Slot) -> None:
         try:
@@ -7083,6 +7120,7 @@ class TurbohaulManager:
                 self._log_make_room_starved(slot, starved_reason, attribution)
             else:
                 self._log_make_room_unload(victim, unload_reason)
+                victim.exit_reason = ExitReason.MAKE_ROOM
                 self._begin_unload_locked(victim)
         elif frees_count_slot and choice is not None:
             victim = self._lru_idle_unloadable()
@@ -7091,6 +7129,7 @@ class TurbohaulManager:
                 self._log_make_room_starved(slot, starved_reason, attribution)
             else:
                 self._log_make_room_unload(victim, unload_reason)
+                victim.exit_reason = ExitReason.MAKE_ROOM
                 self._begin_unload_locked(victim)
         self._defer_unroutable(slot, evict_pending=True)
 
@@ -8776,14 +8815,11 @@ class TurbohaulManager:
         """The release reason if the request itself is gone (client disconnected,
         evicted, or its completion failed or was cancelled), else ``None``. Sync,
         await-free and read-only."""
-        if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-            return "disconnected"
-        if slot.is_evicted:
+        if queue_liveness.client_gone(slot):
             return "disconnected"
         fut = slot.completion_future
-        if fut is not None and fut.done():
-            if fut.cancelled() or fut.exception() is not None:
-                return "failed"
+        if fut is not None and fut.done() and (fut.cancelled() or fut.exception() is not None):
+            return "failed"
         return None
 
     def _claim_waiter_order(self, slot: "Slot") -> "tuple":
@@ -10116,6 +10152,9 @@ class TurbohaulManager:
         # this block; ADDING one that never ran is not. The residual is stated
         # here instead of being traded for a new cost on the hot path.
         async with self._registry_lock:
+            if queue_liveness.drop_if_gone(self, slot):
+                self._release_fastlane_claim_locked(slot, "disconnected")
+                return  # its client left: no route, no make-room, no reserve
             def _route_to(rr: "Resident") -> None:
                 # Reclaim an idle instance to ACTIVE + hand the slot to its driver,
                 # co-located under the lock — IDENTICAL to the legacy HIT below
@@ -10227,38 +10266,17 @@ class TurbohaulManager:
                 # back to 1 while this path's own read succeeded. Without the count a
                 # cold tag would then start an engine past the budget instead of
                 # making room.
-                if (
-                    len(insts) < eff_cap
-                    and len(self._model_residents()) < self.runtime.queue.max_parallel_sidecars
-                ):
-                    # All three OFF-LOOP -- each reaches nvidia-smi
-                    # (via _auto_pick_gpu, _card_avail_mib and _vram_budget
-                    # respectively). See the block comment at the top of this method.
-                    need, parallel, _mg, _sm, _sleep, _auto, _ = (
-                        await asyncio.to_thread(self._resolve_placement_locked, tag)
+                v = await arrival_verdict(self, tag, insts, eff_cap, slot)
+                if v.admit:
+                    newr = await self._reserve_and_start_locked(
+                        slot, main_gpu_override=v.card, split_mode_override=v.split
                     )
-                    g, sp = await asyncio.to_thread(
-                        self._pick_card_for_new_instance, tag, need
-                    )
-                    # A Fast Lane relocation chosen for this request decides the
-                    # card of a COLD start, exactly as on the single-engine path
-                    # below. A tag that already has an engine keeps the picker's
-                    # choice, so a second copy never lands on a card that already
-                    # hosts one.
-                    if slot.fastlane_relocated_main_gpu is not None and not insts:
-                        g = slot.fastlane_relocated_main_gpu
-                        sp = slot.fastlane_relocated_split_mode
-                    if g is not None and await asyncio.to_thread(
-                        self._vram_admits_locked, need, parallel, g, sp
-                    ):
-                        newr = await self._reserve_and_start_locked(
-                            slot, main_gpu_override=g, split_mode_override=sp
+                    if newr is not None:
+                        self._remember_affinity(
+                            tag, self._session_key_for(slot), newr.resident_key
                         )
-                        if newr is not None:
-                            self._remember_affinity(
-                                tag, self._session_key_for(slot), newr.resident_key
-                            )
-                        return
+                        self._co_residence_state().norom.clear(tag)
+                    return
                 # 3. Cap reached / next instance doesn't fit -> route to the
                 # LEAST-LOADED existing instance (records affinity). Requests beyond
                 # what serves now QUEUE in that instance's inbox (graceful
@@ -10429,6 +10447,7 @@ class TurbohaulManager:
                     self._defer_unroutable(slot)
                     return
                 self._log_make_room_unload(victim, "make_room_count_cap")
+                victim.exit_reason = ExitReason.MAKE_ROOM
                 self._begin_unload_locked(victim)
                 await self._reserve_and_start_locked(
                     slot,
@@ -10610,6 +10629,7 @@ class TurbohaulManager:
                             main_gpu=main_gpu, split_mode=split_mode)
                 if victim is not None:
                     self._log_make_room_unload(victim, "make_room_vram")
+                    victim.exit_reason = ExitReason.MAKE_ROOM
                     self._begin_unload_locked(victim)
                 else:
                     # A request the reclaim-first decision covers looks at every
@@ -11170,6 +11190,10 @@ class TurbohaulManager:
         the per-spawn all_safety_gates in the driver.
         """
         siblings = self._model_residents()
+        loads = [
+            SiblingLoad(r.main_gpu, r.reserved_need_mib, r.state is ResidentState.RESERVED_LOADING)
+            for r in siblings
+        ]
         new_split = (split_mode or "layer").lower()
 
         # Aggregate-scope credit helper, shared by the
@@ -11211,16 +11235,16 @@ class TurbohaulManager:
                 # guess for the unreadable free-VRAM term, only ever add the
                 # already-credited amount, so this can never be less
                 # conservative than the normal (probe-available) path.
-                if _scoped_credit() >= need:
+                if fits(0, 0, _scoped_credit(), need):
                     return True
-                return False  # co-residence without a probe = refuse-blind
+                # A single flaky probe read must not refuse a co-resident that fits.
+                # Re-read through the same reader the primary read uses, a bounded
+                # number of times. If every read flakes, refuse unless credit covers it.
+                vals = retry_read_free_vram(_read_free_vram_all_mib)
+                return admit(vals, main_gpu, loads, _scoped_credit(), need)
             return True  # lone spawn -> driver's all_safety_gates owns the doctrine
-        # Reserve ONLY still-booting (not-yet-in-probe) siblings on THIS card (B1).
-        reserve = 0
-        for r in siblings:
-            if r.state is ResidentState.RESERVED_LOADING and r.main_gpu == main_gpu:
-                reserve += r.reserved_need_mib
-        # For the EVICT DECISION only (credit_pending=True), add VRAM
+        reserve = reserved_loading_mib(loads, main_gpu)
+        # for the EVICT DECISION only (credit_pending=True), add VRAM
         # already pledged-to-free by in-flight teardowns so the over-commit branch
         # stops evicting once enough reclaim is in flight. NEVER credited for the
         # actual reserve (credit_pending stays False there) — we must not spawn onto
@@ -11246,17 +11270,11 @@ class TurbohaulManager:
             # primary read already showed room for. One retry of the SAME
             # primary probe, short-circuited so it costs nothing beyond the
             # single call on the (overwhelmingly common) non-flake path.
-            vals = _read_free_vram_all_mib() or _read_free_vram_all_mib() or []
+            vals = retry_read_free_vram(_read_free_vram_all_mib)
             for g, free_g in enumerate(vals):
-                reserve_g = sum(
-                    r.reserved_need_mib for r in siblings
-                    if r.state is ResidentState.RESERVED_LOADING and r.main_gpu == g
-                )
+                reserve_g = reserved_loading_mib(loads, g)
                 credit_g = self._pending_reclaim_mib.get(g, 0)
-                if (
-                    free_g - reserve_g + credit_g
-                    + (reclaim_mib_by_card or {}).get(g, 0)
-                ) >= need:
+                if fits(free_g, reserve_g, credit_g + (reclaim_mib_by_card or {}).get(g, 0), need):
                     return True
             return False
         credit = _scoped_credit()
@@ -11265,7 +11283,7 @@ class TurbohaulManager:
                 credit += reclaim_mib_by_card.get(main_gpu, 0)
             else:
                 credit += sum(reclaim_mib_by_card.values())
-        return (free_fit - reserve + credit) >= need
+        return fits(free_fit, reserve, credit, need)
 
     def _auto_pick_gpu(self, need_mib: int) -> "tuple[int | None, str]":
         """CALLER HOLDS _registry_lock. Smart GPU auto-placer for
@@ -11378,7 +11396,12 @@ class TurbohaulManager:
         already died via its own finally set DEAD without draining (or only partly),
         and this reaper path is the only other drain site, so an already-DEAD
         resident must still surrender its queued slots. The queue hand-off is
-        one-shot, so re-draining an already-empty inbox is a harmless no-op."""
+        one-shot, so re-draining an already-empty inbox is a harmless no-op.
+
+        It also writes the single RESIDENT_EXIT line for deaths nothing else logs; the reason
+        is the ``exit_reason`` the caller stamped on the resident just before this call, and
+        an unstamped resident (the pinned self idle-timeout caller) resolves to
+        SELF_IDLE_TIMEOUT when idle and to UNSPECIFIED otherwise."""
         # Drain unstarted inbox slots back to the main queue (not lost) — EVERY call.
         # This method is sync (under _registry_lock) so it can't await; collect the
         # slots IN ORDER and hand them to ONE ordered bg re-enqueue task (not one
@@ -11394,13 +11417,16 @@ class TurbohaulManager:
                 self._spawn_bg(self._requeue_slots_or_fail(drained))
         if r.state is ResidentState.DEAD:
             return
+        _state_before = r.state
+        reason = resident_exit_wiring.resolve_exit_reason(r, _state_before is ResidentState.IDLE_EVICTABLE)
         _transition_resident_state(r.state, ResidentState.DEAD)
         r.state = ResidentState.DEAD
-        self._record_staleness_unload(r)  # re-arm this identity's clock
+        self._record_staleness_unload(r)  # re-arm this identity's staleness clock
+        self._log_resident_exit(r, reason, _state_before)
         if self._residents.get(r.resident_key) is r:  # re-key by resident_key
-            # Remember WHICH model was on the card, immediately before the
-            # registry entry is destroyed. Otherwise the UI just shows the old model name
-            # until the VRAM drops. After this `del` the tag is UNRECOVERABLE -- captured
+            # remember WHICH model was on the card, immediately before the
+            # registry entry is destroyed. Without this the status display keeps showing the old
+            # model name until the VRAM drops. After this `del` the tag is UNRECOVERABLE -- captured
             # here or not at all.
             # DELIBERATELY NOT a field on __init__: tests that build the manager with __new__
             # (to dodge the sqlite boot DB) break whenever __init__ grows -- the documented
@@ -11433,18 +11459,9 @@ class TurbohaulManager:
         # would otherwise raise here.
         self._unload_count = getattr(self, "_unload_count", 0) + 1
         self._last_unloaded_at_iso = datetime.now(timezone.utc).isoformat()
-        # Prune the per-model
-        # identity ONLY when this resident is the LAST live resident of its
-        # model_tag. Under multi-instance routing one tag can hold several live
-        # residents (distinct resident_keys), so the old model_tag-keyed `is r`
-        # guard no longer identifies "the" owner; popping on the FIRST instance's
-        # death would delete a still-serving sibling's identity (the stale-reap
-        # race an earlier guard closed, re-opened by the re-key). Mirrors live_generations.pop.
-        if not any(
-            x.model_tag == r.model_tag for x in self._model_residents()
-        ):
-            self._last_request_identity_by_model.pop(r.model_tag, None)
-        # Drop this instance's session->engine affinity entries
+        # Pruned on eviction only, never when a resident goes idle.
+        forget_identity(self, r)
+        # drop this instance's session->engine affinity entries
         # right after deregister so a later same-session request re-homes to a live
         # instance instead of routing to this dead one (no-op for a default tag: its
         # sessions may map to model_tag; the sticky-lookup re-check + _drop_affinity
@@ -11514,9 +11531,18 @@ class TurbohaulManager:
             # DIFFERENT resident's genuinely orphaned credit.
             self._register_card_release_task(r.main_gpu, teardown_task)
 
+    def _log_resident_exit(
+        self, r: "Resident", reason: "ExitReason", state_before: object, port: object = None,
+    ) -> None:
+        """One RESIDENT_EXIT line per resident death. Best-effort: never raises into the death path."""
+        resident_exit_wiring.log_resident_exit(
+            r, reason, state_before, port,
+            format_line=format_resident_exit, state_after=ResidentState.DEAD,
+        )
+
     async def _reap_multi_engine_orphans(self, reason: str) -> dict:
-        """Cap>=2 twin of the cap<=1 post-teardown orphan reap
-        (_teardown). Runs the SAME two calls with the SAME
+        """cap>=2 twin of the cap<=1 post-teardown orphan reap
+        (_unload_teardown). Runs the SAME two calls with the SAME
         argument shapes after a cap>=2 resident teardown, because the kill
         chain (drained_sigterm -> killpg on the sidecar's own session) cannot
         reach Tom's Fork setsid-detached helpers (see manager.py and
@@ -12275,6 +12301,7 @@ class TurbohaulManager:
             if ev is not None and not ev.is_set():
                 ev.set()
         async with self._registry_lock:
+            r.exit_reason = ExitReason.DRIVER_REAP
             self._begin_unload_locked(r)
 
     def _idle_window_seconds(self, keep_alive_s: "int | None", default: int) -> int:
@@ -12366,6 +12393,12 @@ class TurbohaulManager:
             r.model_tag, _SAME_MODEL_QUEUED_HOLD_S,
         )
         return _SAME_MODEL_QUEUED_HOLD_S
+
+    def _hold_warm_window_locked(self, r: "Resident", idle_window: float) -> "float | None":
+        """CALLER HOLDS ``_registry_lock``. The window to park a finishing co-resident with, or None to evict now."""
+        return resident_exit_wiring.hold_warm_window(
+            self, r, idle_window, _SAME_MODEL_QUEUED_HOLD_S, active_state=ResidentState.ACTIVE,
+        )
 
     async def _spawn_for_resident(
         self, r: "Resident", slot: Slot
@@ -13128,9 +13161,8 @@ class TurbohaulManager:
         outcome = "unknown"
         try:
             while True:
-                if slot.disconnect_event is not None and slot.disconnect_event.is_set():
+                if queue_liveness.drop_if_gone(self, slot):
                     outcome = "disconnected"
-                    self._handle_unloaded_slot(slot)
                     return False
                 if r.state is ResidentState.DEAD:
                     outcome = "resident_dead"
@@ -13160,7 +13192,7 @@ class TurbohaulManager:
                 await asyncio.wait(watch, timeout=tick)
                 regates += 1
                 failed = await self._run_spawn_safety_gate(r, slot)
-                if not failed:
+                if not failed and not queue_liveness.client_gone(slot):  # else the loop top drops it
                     outcome = "cleared"
                     return True
             detail = "; ".join(f"{g.name}: {g.detail}" for g in failed)
@@ -13336,15 +13368,10 @@ class TurbohaulManager:
                 break
         live: list[Slot] = []
         for s in drained:
-            # Same flag the queue's pop paths set: a parked request whose client
-            # is gone is dropped here, with its claim, and never served.
-            if s.disconnect_event is not None and s.disconnect_event.is_set():
-                s.is_evicted = True
-            if s.is_evicted:
+            # A parked request whose client is gone is dropped here, with its claim, never served.
+            if queue_liveness.stamp_if_disconnected(s):
                 self._release_fastlane_claim_locked(s, "disconnected")
-                self._fail_completion_future(
-                    s, SlotEvictedError(f"slot {s.slot_id} evicted")
-                )
+                self._fail_completion_future(s, SlotEvictedError(f"slot {s.slot_id} evicted"))
             else:
                 live.append(s)
         if not live:
@@ -13463,6 +13490,8 @@ class TurbohaulManager:
         engine_up = False
         try:
             slot = await r.inbox.get()  # the reservation's first slot
+            if await self._drop_gone_slot(slot) is None:
+                return  # its client left: no engine for it; the finally frees the reservation
             handle = await self._spawn_for_resident(r, slot)
             if handle is None:
                 return
@@ -13503,6 +13532,7 @@ class TurbohaulManager:
                         _transition_resident_state(r.state, ResidentState.ACTIVE)
                         r.state = ResidentState.ACTIVE
                         r.active_slot = slot
+                        self._stash_resident_identity(r, slot)  # NEW ADMISSION
                         began_slot = slot  # its turn has begun
                         r.rank_client_meta = slot.client_meta
                     try:
@@ -13523,6 +13553,7 @@ class TurbohaulManager:
                     _transition_resident_state(r.state, ResidentState.ACTIVE)
                     r.state = ResidentState.ACTIVE
                     r.active_slot = slot
+                    self._stash_resident_identity(r, slot)  # NEW ADMISSION
                     began_slot = slot  # its turn has begun
                     # The slot's own turn starts now: its claim (if it waited in
                     # the inbox) is released here.
@@ -13595,12 +13626,12 @@ class TurbohaulManager:
                     # registers a claim and re-queues the slot on a
                     # BACKGROUND TASK after a real backoff, so a genuinely
                     # outranking claimant is routinely live-but-unstaged for
-                    # whole seconds at a time; existing
-                    # tests construct their victim scenario
-                    # the same way
-                    # and would fail under a staging-based check.
+                    # whole seconds at a time; a staging-based check
+                    # would wrongly treat such a claimant as absent.
+                    _hold_s = None  # set only when the walrus below runs and chooses to hold
                     if (
-                        idle_window <= 0 and not self._parked_claim_outranks_holder_locked(r)
+                        (_a := idle_window <= 0 and not self._parked_claim_outranks_holder_locked(r))
+                        and (_hold_s := self._hold_warm_window_locked(r, idle_window)) is None
                     ) or self._is_designated_unload_target_locked(r):
                         # Capture thread_id for KV save on immediate eviction
                         # Source from grace_tip, NOT the raw anchor `slot` --
@@ -13646,6 +13677,7 @@ class TurbohaulManager:
                                     break
                             if drained:
                                 self._spawn_bg(self._requeue_slots_tail_or_fail(drained))
+                        r.exit_reason = ExitReason.IMMEDIATE_EVICT if _a else ExitReason.DESIGNATED_VICTIM
                         self._begin_unload_locked(r)
                         # The designated victim's own
                         # turn just released capacity with no immediate
@@ -13665,6 +13697,9 @@ class TurbohaulManager:
                         self._dispatch_wake.set()
                         self._make_room_signal.notify_all()
                         break
+                    if _hold_s is not None:
+                        # keep_alive<=0 co-resident with an active same-model sibling: park for the hold.
+                        idle_window = _hold_s
                     _transition_resident_state(r.state, ResidentState.IDLE_EVICTABLE)
                     r.state = ResidentState.IDLE_EVICTABLE
                     # r just became a make-room candidate --
@@ -13870,11 +13905,16 @@ class TurbohaulManager:
                             except asyncio.QueueEmpty:
                                 break
                     if self._residents.get(r.resident_key) is r:  # re-key
+                        _state_before = r.state
                         _transition_resident_state(r.state, ResidentState.DEAD)
                         r.state = ResidentState.DEAD
-                        # Remember WHICH model was on the card, immediately before the
-                        # registry entry is destroyed, so a status view can still name it
-                        # until the VRAM drops. After this `del` the tag is UNRECOVERABLE -- captured
+                        self._log_resident_exit(
+                            r, ExitReason.DRIVER_EXIT, _state_before,
+                            port=getattr(handle, "port", None),
+                        )
+                        # remember WHICH model was on the card, immediately before the
+                        # registry entry is destroyed. The operator: "it just shows the old model name
+                        # until the VRAM drops." After this `del` the tag is UNRECOVERABLE -- captured
                         # here or not at all.
                         # DELIBERATELY NOT a field on __init__: tests that build the manager with __new__
                         # (to dodge the sqlite boot DB) break whenever __init__ grows -- the documented
@@ -13884,17 +13924,9 @@ class TurbohaulManager:
                             "main_gpu": getattr(r, "main_gpu", None),
                         }
                         del self._residents[r.resident_key]
-                        # Ported to the resident_key re-keying: see the
-                        # identical guard in the reap path above — prune the per-model
-                        # identity only when NO other live resident holds this tag, so
-                        # a multi-instance sibling's identity survives this instance's
-                        # death (the `is r` guard above protects the registry slot only).
-                        if not any(
-                            x.model_tag == r.model_tag
-                            for x in self._model_residents()
-                        ):
-                            self._last_request_identity_by_model.pop(r.model_tag, None)
-                        # Purge this instance's session
+                        # Pruned on eviction only, never when a resident goes idle.
+                        forget_identity(self, r)
+                        # purge this instance's session
                         # affinity on the driver-finally deregister too (mirrors
                         # _begin_unload_locked; under _registry_lock here) so a stale entry
                         # can't mis-route a session to a later-reused idx. Self-heals via
@@ -14533,6 +14565,7 @@ class TurbohaulManager:
                     matched = await self.queue.pop_matched_thread(
                         slot.thread_id, slot.model_tag
                     )
+                matched = await self._drop_gone_slot(matched)
                 # ── STABLE IDENTITY WITHOUT A CLIENT session_id ──────
                 # thread_id is derived by hashing request CONTENT, so it churns on
                 # every turn; pop_matched_thread therefore misses, the request is
@@ -14599,10 +14632,12 @@ class TurbohaulManager:
                         _anchor_chain, slot.model_tag, slot.grace_started_at,
                         inbox=r.inbox,
                     )
+                    matched = await self._drop_gone_slot(matched)
                 if matched is not None:
                     matched.port = handle.port
                     matched.pid = handle.pid
                     r.active_slot = matched
+                    self._stash_resident_identity(r, matched)  # NEW ADMISSION (follow-up)
                     # Release the staging_arrival claim for the matched
                     # follow-up. pop_matched_thread dequeues from the queue but
                     # the claim registered at staging-arrival
@@ -19485,6 +19520,8 @@ class TurbohaulManager:
                 "slot KV save REFUSED (D2 disposable identity): role=%s thread=%s "
                 "— no bin written", _save_role, (_eff_tid or "?")[:60])
             return False
+        if await kv_stack_wiring.save_declined_by_cap(self):
+            return False
         from turbohaul.subprocess_mgr import SLOT_SAVE_DIR
         try:
             # A short read timeout can starve a multi-GB engine action=save mid-decode
@@ -19821,9 +19858,11 @@ class TurbohaulManager:
                         # here, and the only remaining evidence is the next restore's stale
                         # value, by which point the cause is two steps away. Log what was
                         # asked for beside what came back so the two can never be confused.
+                        _n_written = None
                         try:
                             _sv = save_resp.json()
                             _n_saved = _sv.get("n_saved")
+                            _n_written = _sv.get("n_written")
                             log.info(
                                 "KV_SAVE_ACK limit_sent=%s src=%s slot_n_prompt_tokens=%s "
                                 "n_saved=%s n_written=%s honoured=%s bin=%s "
@@ -20009,7 +20048,12 @@ class TurbohaulManager:
                         # Invalidate the scan cache after the .json sidecar write
                         self._kvcache_scan_cache_invalidate()
                         log.info("slot KV saved: %s (reason: %s)", bin_fn, decision.reason)
-                        # Durable manager: INERT ring store + residency tag + LOG would-be reload.
+                        # One pair per thread: the new pair has landed, so the pairs this
+                        # thread left on other ports go. Best-effort, never fails the save.
+                        kv_stack_wiring.drop_stale_pairs_after_save(
+                            self, drop_stale_pairs, SLOT_SAVE_DIR, model_tag, thread_hash, port,
+                            final_path, _n_written, bin_fn)
+                        # Durable manager: inert ring store + residency tag + LOG would-be reload.
                         # Reads client_meta labels (role, session_id) from slot to key the per-(role,session) ring.
                         # ZERO behavior change when TURBOHAUL_DURABLE_RING=OFF (default); just observability.
                         if _durable_ring_enabled() and slot is not None:
@@ -20406,9 +20450,12 @@ class TurbohaulManager:
                 "no_slot_id" if _slot_id is None else "no_handle",
             )
             return
-        _expected_gen_id = compute_generation_id(
-            _pid, self._spawn_seq_for_model(slot.model_tag), _slot_id)
-        _heartbeat = self.live_generations.get(slot.model_tag) or self.live_generation or {}
+        # The serving resident owns its spawn counter and key; no match keeps the model-tag fallback.
+        _serving = self._serving_resident_for_handle(handle)
+        _spawn = self._spawn_seq_for_handle(handle, slot.model_tag)
+        _expected_gen_id = compute_generation_id(_pid, _spawn, _slot_id)
+        _rkey = resident_gen_key(_serving) if _serving is not None else slot.model_tag
+        _heartbeat = self.live_generations.get(_rkey) or self.live_generation or {}
         if _heartbeat.get("generation_id") != _expected_gen_id:
             log.info(
                 "KV_REUSE_OUTCOME slot_id=%s thread_hash=%s wait_state=completed "
@@ -22780,63 +22827,26 @@ class TurbohaulManager:
             log.debug("DURABLE_RING warm reload best-effort failed", exc_info=True)
             return (False, None)
 
-    def _live_protected_thread_hashes(self) -> set[str]:
-        """thread_hash set whose KV ``.bin`` + sidecar MUST NOT be GC-evicted:
-        the active slot, every in-flight slot, the idle-held thread, and every
-        resident's idle thread (grep ``_active_slot`` / ``_idle_thread_id``).
+    def _live_kv_protection(self) -> "tuple[set[str], set[str]]":
+        """Split live KV-protection into (HARD, SOFT) thread_hash sets.
 
-        Resolves cap-awarely. At cap>=2, self._active_slot and
-        self._inflight are PERMANENTLY unwritten (only written inside
-        _process_slot / _fan_out_and_drain, which are never reached again
-        after the cap fork at worker_loop). The live per-resident
-        active_slot / inflight are maintained by _drive_resident /
-        _serve_on_resident.
-
-        Protecting the whole live thread (not just its clean anchor) covers the
-        constraint "never evict a clean_prefix bin belonging to a live thread"
-        AND its non-clean bins. The set is transient — a thread drops out once it
-        goes idle/dead, so this cannot leak unboundedly. Best-effort: never
-        raises; an empty/unknown thread_id is skipped (``nothread`` is never
-        protected, so it cannot silently defeat the ceiling).
+        HARD = a live turn's bins (never evicted); SOFT = idle-held bins (reclaimable under pressure).
+        ``_live_protected_thread_hashes`` is the union view. The gather lives in ``kv_stack_wiring``.
         """
-        hashes: set[str] = set()
-        try:
-            def _add(tid: str | None, cm: dict | None = None, chain: list | None = None) -> None:
-                # SPEC-V2 WAVE A: protect BOTH the (session,role) identity hash and
-                # the raw thread_id hash (legacy bins during the one-time migration).
-                if tid:
-                    hashes.add(self._thread_hash(tid))
-                ident = _bin_identity(tid or "", cm, chain)
-                if ident and ident != (tid or ""):
-                    hashes.add(self._thread_hash(ident))
-            # Resolve cap-awarely (template: _resolve_top_level_active_slot).
-            # At cap>=2, self._active_slot is PERMANENTLY unwritten. Scan the
-            # per-resident active_slot / inflight that _drive_resident maintains.
-            residents = self._model_residents()
-            if residents:
-                for r in residents:
-                    active = r.active_slot
-                    _add(getattr(active, "thread_id", None) if active is not None else None,
-                         getattr(active, "client_meta", None) if active is not None else None,
-                         getattr(active, "admission_hash_chain", None) if active is not None else None)
-                    for s in list(r.inflight):
-                        _add(getattr(s, "thread_id", None), getattr(s, "client_meta", None),
-                             getattr(s, "admission_hash_chain", None))
-            else:
-                # cap<=1: legacy singleton (byte-identical to the earlier cap-unaware behaviour)
-                active = self._active_slot
-                _add(getattr(active, "thread_id", None) if active is not None else None,
-                     getattr(active, "client_meta", None) if active is not None else None,
-                     getattr(active, "admission_hash_chain", None) if active is not None else None)
-                for s in list(self._inflight):
-                    _add(getattr(s, "thread_id", None), getattr(s, "client_meta", None),
-                         getattr(s, "admission_hash_chain", None))
-            _add(self._idle_thread_id, self._idle_client_meta)
-            for r in list(self._residents.values()):
-                _add(getattr(r, "idle_thread_id", None), getattr(r, "idle_client_meta", None))
-        except Exception:
-            log.debug("live protected thread-hash scan failed (best-effort)", exc_info=True)
-        return hashes
+        return kv_stack_wiring.live_kv_protection(self, _bin_identity)
+
+    def _live_protected_thread_hashes(self) -> set[str]:
+        """Union (HARD | SOFT) of ``_live_kv_protection``. Kept as the
+        single-set view for callers that only need "is this thread protected at
+        all" (e.g. the cap>=2 protection test); ``_gc_kv_cache`` uses
+        the split directly so it can reclaim SOFT idle bins while never touching
+        a HARD live-turn bin."""
+        hard, soft = self._live_kv_protection()
+        return hard | soft
+
+    def _live_turn_groups(self):
+        """Which engine ports a live turn serves, as the stale-pair drop wants them (None when the scan fails)."""
+        return kv_stack_wiring.live_turn_groups(self, _bin_identity)
 
     def _persist_kvcache_snapshot(self) -> dict:
         """Best-effort snapshot of the persist KV cache directory (SSD) for FE display.
@@ -22886,6 +22896,11 @@ class TurbohaulManager:
                 "over_cap": False,
             }
 
+    def _kvcache_dir_accounting(self) -> "tuple[int, list[tuple]]":
+        """Scan SLOT_SAVE_DIR and return ``(total_bytes, bins)``; the scan lives in ``kv_stack_wiring``."""
+        from turbohaul.subprocess_mgr import SLOT_SAVE_DIR
+        return kv_stack_wiring.dir_accounting_logged(SLOT_SAVE_DIR)
+
     async def _gc_kv_cache(self, max_age_hours: float | None = None, max_files: int = 100) -> int:
         """Background GC for orphaned KV cache files.
 
@@ -22928,8 +22943,11 @@ class TurbohaulManager:
                 return 0
             now = time.time()
             # Live-thread guard (constraint): resolve the protected thread_hash
-            # set ONCE per GC pass from the manager's live state.
-            protected_hashes = self._live_protected_thread_hashes()
+            # set ONCE per GC pass from the manager's live state. split
+            # into HARD (active/in-flight — NEVER evict) and SOFT (idle-held /
+            # resident-idle — reclaimable under age/ceiling pressure).
+            hard_hashes, soft_hashes = self._live_kv_protection()
+            protected_hashes = hard_hashes | soft_hashes
             # The keep-warm recency window — the configured
             # `QueueConfig.idle_hot_load_seconds`, read live, NOT a constant —
             # used to gate the clean-anchor pin below: a DEAD anchor still inside
@@ -23047,7 +23065,9 @@ class TurbohaulManager:
                 return removed
 
             def _protected(fpath: str) -> bool:
-                # per-group clean anchor OR a bin owned by a live thread
+                # per-group clean anchor OR a bin owned by a live thread (HARD or
+                # SOFT). The predicate is `pinned OR hash in hard OR hash in soft`;
+                # protected_hashes is hard|soft.
                 return fpath in pinned_paths or hash_by_path.get(fpath) in protected_hashes
 
             # candidates = everything EXCEPT the pinned clean winners AND live-thread bins
@@ -23099,7 +23119,14 @@ class TurbohaulManager:
             if max_age_hours is None:
                 max_age_hours = self.runtime.kv.ram_cache_max_age_hours
             age_cutoff = now - (max_age_hours * 3600)
-            for fn, fpath, mtime, size in candidates:
+            # age-prune reclaims UNPROTECTED candidates AND idle-held /
+            # resident-idle (SOFT-thread) bins past the cutoff. A live (HARD)
+            # thread's bin is never age-evicted; a warm recency clean-anchor keeps
+            # its age protection (it self-expires from the pin once
+            # past the keep-warm window, then falls to `candidates` on its own);
+            # the RAM-cap idle-held / resident-idle snapshots are the ones age-evicted here.
+            age_targets = soft_age_targets(candidates, entries, hash_by_path, soft_hashes)
+            for fn, fpath, mtime, size in age_targets:
                 if mtime < age_cutoff and _unlink_pair(fpath):
                     deleted += 1
             # --- LRU count eviction (existing knob) if still over limit ---
@@ -23190,9 +23217,14 @@ class TurbohaulManager:
                                     model_by_path.get(fpath, "unknown"), fn,
                                     int(now - mtime), size)
                     if total > max_bytes:
+                        _soft_removed, total = kv_stack_wiring.evict_soft_floor(
+                            surviving, deleted_paths, hard_hashes, soft_hashes, pinned_paths, hash_by_path,
+                            total, max_bytes, _unlink_pair)
+                        deleted += _soft_removed
+                    if total > max_bytes:
                         log.warning(
                             "slot KV GC ceiling: still %d byte(s) over cap after evicting "
-                            "every unprotected bin (pinned/live-thread bins hold the floor)",
+                            "every unprotected + SOFT bin (HARD active/in-flight bins hold the floor)",
                             total - max_bytes,
                         )
             # --- SSD persist-dir sweep ----------
@@ -23858,20 +23890,18 @@ class TurbohaulManager:
         window before its handle is set.
         """
         live: set[int] = set()
-        # cap-gate the multi-resident union so at cap<=1 this function is LITERALLY
-        # the legacy two-if body below (structural byte-identity, not argued — the
-        # entire dispatcher/registry surface is unreachable at cap=1, and the
-        # _residents singleton's booting_pid is never written on that path).
-        if self.runtime.queue.max_parallel_sidecars >= 2:
-            for r in list(self._residents.values()):  # await-free atomic snapshot
-                h = r.handle
-                if h is not None and h.is_alive():
-                    live.add(h.pid)
-                ih = r.idle_handle
-                if ih is not None and ih.is_alive():
-                    live.add(ih.pid)
-                if r.booting_pid is not None:
-                    live.add(r.booting_pid)
+        # Unconditional at every budget: a budget of 1 can hold several engines once the
+        # re-check admits on fit, and an empty set here would let the post-teardown orphan
+        # scan terminate a healthy co-resident engine.
+        for r in list(self._residents.values()):  # await-free atomic snapshot
+            h = r.handle
+            if h is not None and h.is_alive():
+                live.add(h.pid)
+            ih = r.idle_handle
+            if ih is not None and ih.is_alive():
+                live.add(ih.pid)
+            if r.booting_pid is not None:
+                live.add(r.booting_pid)
         # Legacy manager-global holders (primary mirror) — belt-and-suspenders so
         # cap==1 stays byte-identical even if a singleton mirror ever lagged.
         # Read handle into local var first to avoid TOCTOU between
@@ -23976,7 +24006,7 @@ class TurbohaulManager:
                         "port": slot.port,
                         "pid": slot.pid,
                         "extension_count": slot.extension_count,
-                        "client_meta": slot.client_meta,
+                        "client_meta": identity_client_meta(slot.client_meta),
                     },
                 )
             with audit_db_session(self.boot.storage.state_db_path) as conn:
@@ -24138,6 +24168,7 @@ class TurbohaulManager:
                             r.model_tag, handle.port, getattr(handle, "pid", None),
                         )
                         self._record_bin_death_strike(handle.port)
+                        r.exit_reason = ExitReason.IDLE_ENGINE_DEAD
                         self._begin_unload_locked(r)
                         # Wake dispatch loop alongside make-room signal
                         self._dispatch_wake.set()
@@ -24240,6 +24271,12 @@ class TurbohaulManager:
                     "fingerprint purge (sweeper) failed (best-effort)"
                 )
             try:
+                await self._maybe_sweep_cold_meta()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("cold slot metadata sweep failed (best-effort)")
+            try:
                 await asyncio.wait_for(
                     self._stop_event.wait(), timeout=interval,
                 )
@@ -24294,6 +24331,18 @@ class TurbohaulManager:
                 "background_sweeper_run audit emit failed (best-effort)"
             )
         return len(finalized)
+
+    def _cold_meta_sweep_once(self, age_hours: float) -> dict:
+        """One bounded run of the retention pass over ended slots. Synchronous; call it off the loop."""
+        counts, self._cold_meta_watermark = cold_meta_sweep.run_once(
+            state_db_session, strip_slot_meta, self.boot.storage.state_db_path,
+            self._cold_meta_watermark, age_hours, self._COLD_META_BATCH,
+        )
+        return counts
+
+    async def _maybe_sweep_cold_meta(self) -> dict | None:
+        """Run one retention run if the setting is on and the pass is due. Returns its counts, or None."""
+        return await cold_meta_sweep.maybe_sweep(self)
 
     # === Shutdown ============================================================
 
