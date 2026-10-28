@@ -184,19 +184,19 @@ docs/                             operator guides and reference notes
 
 ### 3.1 Admission
 
-Routes call `submit_and_wait` (non-streaming; adds a completion cache and single-flight) and `submit_for_streaming` (returns the slot at once; the route attaches to the stream later). Both wrap **`submit()`**, the single admission chokepoint:
+Routes call `submit_and_wait` (non-streaming; adds a completion cache and single-flight) and `submit_for_streaming` (returns the slot at once; the route attaches later). Both wrap **`submit()`**, the admission chokepoint:
 
 1. Refuses work after shutdown (`QueueClosed`).
 2. Derives a missing `thread_id` from the prompt-prefix hash (§4.1).
 3. Creates the `Slot` (`RECEIVED`) with `admission_ctx_len` and the admission prefix-hash chain.
 4. Stamps `slot.admission_role = _bin_role(client_meta)`, which survives later `client_meta` identity restoration (§4.7).
-5. Matches the Fast Lane table (`match_fastlane`); a matcher failure means "no match".
+5. Matches the Fast Lane table (`match_fastlane`); a failure means "no match".
 6. Enqueues FIFO: `TurbohaulQueue.enqueue` uses staging (`STAGED`) while it has room, else the acceptance buffer (`ACCEPT_BUFFER`).
 
 **Queue** (`queue.py`): a **staging queue** (`staging_queue_depth`, default 100) and an **acceptance buffer** (`acceptance_buffer_max`, default 10,000) under one lock.
 
 - Overflow raises `QueueFull` (HTTP 500).
-- A disconnect watcher sets the slot's `disconnect_event`; a popped slot with that event set is flagged evicted and failed with `SlotEvictedError` (HTTP 499).
+- A hang-up sets `disconnect_event`; a waiting slot leaves the queue, acceptance buffer or mid-turn engine inbox, frees or passes on its claim, and fails with `SlotEvictedError` (HTTP 499).
 
 **Priority ladder** (`pop_next`), re-evaluated each pop:
 

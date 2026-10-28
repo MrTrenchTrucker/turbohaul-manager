@@ -97,7 +97,7 @@ class TestHealth:
         # `__version__`, the very constant the app reads, could not fail on a
         # version bump, so the package version could drift unnoticed from the
         # documented release. Bump this deliberately.
-        assert body["version"] == "0.8.0"
+        assert body["version"] == "0.8.1"
 
 
 class TestStatus:
@@ -124,7 +124,7 @@ class TestApiVersion:
         # `__version__`, the very constant the app reads, could not fail on a
         # version bump, so the package version could drift unnoticed from the
         # documented release. Bump this deliberately.
-        assert body["version"] == "0.8.0"
+        assert body["version"] == "0.8.1"
         assert body["api_compat"] == "ollama-superset"
         assert "Ollama-compatible" in body["user_agent"]
         assert body["backend_sha_pinned"] is False

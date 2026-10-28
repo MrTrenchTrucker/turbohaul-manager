@@ -68,6 +68,16 @@ def compute_generation_id(pid, spawn_seq, thread_or_slot) -> str:
     return hashlib.blake2b(raw, digest_size=4).hexdigest()  # 8 hex chars
 
 
+def resident_gen_key(r) -> str:
+    """The key a resident's generation block lives under in ``mgr.live_generations``.
+
+    It is the resident key (``model_tag`` for instance 0, ``model_tag#N`` for a sibling of the
+    same model), so two residents of one model never share an entry. Falls back to the
+    ``model_tag`` for objects that carry no resident key (test doubles).
+    """
+    return getattr(r, "resident_key", "") or r.model_tag
+
+
 def _read_spawn_seq(mgr) -> int:
     """Active resident's spawn_seq, defensively.
 
@@ -449,7 +459,7 @@ class LiveSlotsPoller:
         state machine, fetch ``/slots`` (the only external await), re-validate identity
         AFTER the await against the live source (the fixed-port 11500 reuse race), and
         return the generation dict. PURE: never stores — the caller routes the result
-        to ``mgr.live_generation`` (legacy) or ``mgr.live_generations[tag]`` (per
+        to ``mgr.live_generation`` (legacy) or ``mgr.live_generations[resident key]`` (per
         resident). ``cur_handle_getter``/``cur_spawn_getter`` re-read the CURRENT handle
         + spawn_seq (the legacy globals, or the resident's fields)."""
         snap_handle = handle
@@ -751,7 +761,7 @@ class ResidentSlotsPoller(LiveSlotsPoller):
     per-model rates never cross-contaminate), but reads identity from a SPECIFIC
     ``Resident`` (its ``handle``/``active_slot``/``spawn_seq``) instead of the legacy
     ``_active_*`` globals, and RETURNS the generation block (the supervisor stores it
-    into ``mgr.live_generations[model_tag]``). It never runs its own loop — the
+    into ``mgr.live_generations[resident_gen_key(r)]``). It never runs its own loop -- the
     supervisor owns the ~1Hz cadence and calls :meth:`poll_once`."""
 
     async def poll_once(self, resident) -> dict:
@@ -775,7 +785,7 @@ class ResidentSlotsPoller(LiveSlotsPoller):
 class LiveResidentsSupervisor:
     """cap>=2 live-inference monitor: ONE ~1Hz task that polls EVERY live resident's
     ``/slots`` CONCURRENTLY and writes each resident's generation into
-    ``mgr.live_generations`` (keyed by ``model_tag``), mirroring the most-recently-
+    ``mgr.live_generations`` (keyed by the resident key, see ``resident_gen_key``), mirroring the most-recently-
     active resident's generation into ``mgr.live_generation`` (the back-compat alias
     ``status_snapshot`` + ``live_stream.py`` already read). It also refreshes the
     per-GPU free-VRAM cache (``mgr._vram_free_mib``) OFF the hot path so
@@ -792,7 +802,7 @@ class LiveResidentsSupervisor:
     def __init__(self, mgr, interval_s: float = 1.0) -> None:
         self._mgr = mgr
         self._interval = max(0.1, float(interval_s))
-        self._pollers: dict[str, ResidentSlotsPoller] = {}  # model_tag -> poller
+        self._pollers: dict[str, ResidentSlotsPoller] = {}  # resident key -> poller
 
     async def run(self) -> None:
         try:
@@ -814,51 +824,59 @@ class LiveResidentsSupervisor:
     async def _tick(self) -> None:
         mgr = self._mgr
         residents = mgr._model_residents()  # await-free; excludes singleton + DEAD
-        live_tags: set[str] = set()
+        live_keys: set[str] = set()
         polls = []
         for r in residents:
             tag = r.model_tag
             if tag is None:
                 continue
-            live_tags.add(tag)
-            poller = self._pollers.get(tag)
+            # one poller, one block and one live key per RESIDENT, not per model_tag.
+            key = resident_gen_key(r)
+            live_keys.add(key)
+            poller = self._pollers.get(key)
             if poller is None:
                 poller = ResidentSlotsPoller(mgr, interval_s=self._interval)
-                self._pollers[tag] = poller
-            polls.append(self._poll_one(tag, poller, r))
+                self._pollers[key] = poller
+            polls.append(self._poll_one(key, poller, r))
         if polls:
             await asyncio.gather(*polls, return_exceptions=True)
-        await self._gc_vanished(live_tags)
+        await self._gc_vanished(live_keys)
         self._update_primary_alias(residents)
         await self._refresh_vram()
 
-    async def _poll_one(self, tag: str, poller: ResidentSlotsPoller, resident) -> None:
+    async def _poll_one(self, key: str, poller: ResidentSlotsPoller, resident) -> None:
+        """Poll ONE resident and write its generation block under its resident key."""
         gen = await poller.poll_once(resident)
         # The resident can be EVICTED/DEAD during the /slots await. poll_once's
         # post-await re-validate catches a handle SWAP, but not a same-handle DEAD
         # transition — so re-check liveness here before writing, else we'd publish a
-        # ZOMBIE generation that _gc_vanished only clears next tick (the tag is still
-        # in this tick's live_tags). No await between the check and the write, so the
+        # ZOMBIE generation that _gc_vanished only clears next tick (the key is still
+        # in this tick's live keys). No await between the check and the write, so the
         # single-threaded loop makes them atomic.
-        if self._mgr._live_resident_for(tag) is None:
+        # the check is on THIS resident object, not on the model_tag: the object
+        # registered under this key must still be it and not DEAD. A sibling of the
+        # same model can therefore never make this resident's write land or be dropped.
+        cur = self._mgr._residents.get(key)
+        if cur is not resident or getattr(cur.state, "name", None) == "DEAD":
             # Evicted/dead mid-poll: DROP any stale gen NOW (not just skip the write).
             # _update_primary_alias runs right after this tick's gather — BEFORE
-            # _gc_vanished can act (the tag is still in this tick's live_tags) — so
+            # _gc_vanished can act (the key is still in this tick's live keys) -- so
             # leaving a prior tick's 'generating' entry here would let the alias mirror
             # a DEAD resident's stale gen for one tick (PL pre-cutover polish #2).
-            self._mgr.live_generations.pop(tag, None)
+            self._mgr.live_generations.pop(key, None)
             return
-        self._mgr.live_generations[tag] = gen
+        self._mgr.live_generations[key] = gen
         # contentless WS nudge so the FE refetches /status ~1Hz (denylist untouched).
         if gen.get("state") in ("generating", "prefill", "finishing", "stalled", "loading"):
             with contextlib.suppress(Exception):
                 self._mgr.event_bus.publish_nowait({"event": "generation_tick"})
 
     async def _gc_vanished(self, live_tags: set[str]) -> None:
-        for tag in list(self._pollers):
-            if tag not in live_tags:
-                gone = self._pollers.pop(tag, None)
-                self._mgr.live_generations.pop(tag, None)
+        # ``live_tags`` holds the resident KEYS live this tick (the name is kept for callers).
+        for key in list(self._pollers):
+            if key not in live_tags:
+                gone = self._pollers.pop(key, None)
+                self._mgr.live_generations.pop(key, None)
                 if gone is not None:
                     with contextlib.suppress(Exception):
                         await gone._client.aclose()
@@ -909,7 +927,7 @@ class LiveResidentsSupervisor:
         best = None
         best_t: float | None = None
         for r in residents:
-            g = mgr.live_generations.get(r.model_tag)
+            g = mgr.live_generations.get(resident_gen_key(r))
             if g is None:
                 continue
             t = getattr(r, "last_active_monotonic", 0.0)

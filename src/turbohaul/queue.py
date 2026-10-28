@@ -10,6 +10,7 @@ import time
 from collections import deque
 from typing import Callable, Optional
 
+from turbohaul import queue_liveness
 from turbohaul.slot import Slot, SlotState
 from turbohaul.fsm import transition as fsm_transition
 from turbohaul.kv_classify import CLASS_COMPRESSION, CLASS_MAIN, _class_from_label
@@ -426,8 +427,11 @@ class TurbohaulQueue:
                 _match_from_inbox = None
                 try:
                     for s in _inbox_all:
+                        # A follow-up whose client has gone is not a match: it goes back
+                        # with the others, in order, for the resident's own drain to discard.
                         if (
                             _match_from_inbox is None
+                            and not queue_liveness.stamp_if_disconnected(s)
                             and _predicate(s)
                             and not self._decline_for_better_same_client_locked(
                                 s, also_waiting=_inbox_all, via="pop_matched_hash_chain_inbox"
@@ -640,10 +644,8 @@ class TurbohaulQueue:
         while buf and examined < max_drain:
             slot = buf.popleft()
             examined += 1
-            if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-                # Evicted in flight — flag + return for caller-handled audit.
-                slot.is_evicted = True
-                return slot
+            # Evicted in flight — flag it; the caller handles the audit.
+            queue_liveness.stamp_if_disconnected(slot)
             return slot
         return None
 
@@ -683,10 +685,9 @@ class TurbohaulQueue:
                 # Skip — leave it in place, keeping its FIFO position.
                 continue
             del buf[i]
-            if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-                # Evicted in flight — flag + return for caller-handled audit
-                # (symmetric with _pop_first_non_unloaded_from).
-                slot.is_evicted = True
+            # Evicted in flight — flag it; the caller handles the audit
+            # (symmetric with _pop_first_non_unloaded_from).
+            queue_liveness.stamp_if_disconnected(slot)
             return slot
         return None
 
@@ -779,8 +780,7 @@ class TurbohaulQueue:
             ):
                 continue
             del self._staging[i]
-            if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-                slot.is_evicted = True
+            queue_liveness.stamp_if_disconnected(slot)
             self._credit_floor_serve_locked(slot)
             self._log_admitted_without_pick(slot, via=via, guard_anchor=guard_anchor)
             return slot
@@ -1322,8 +1322,7 @@ class TurbohaulQueue:
                             self._served_class_for(s) for s in list(self._staging)[:i] if s is not oldest_normal
                         ]
                         del buf[i]
-                        if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-                            slot.is_evicted = True
+                        queue_liveness.stamp_if_disconnected(slot)
                         # This IS the one-turn wall-clock fairness floor promoting
                         # an unregistered slot (slot.fastlane is None by this
                         # branch's own oldest_normal filter above) -- observability
@@ -1455,8 +1454,7 @@ class TurbohaulQueue:
                     self._served_class_for(s) for s in list(self._staging)[:i]
                 ]
                 del self._staging[i]
-                if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-                    slot.is_evicted = True
+                queue_liveness.stamp_if_disconnected(slot)
                 self._log_queue_priority(
                     slot,
                     reason="fastlane",
@@ -1489,8 +1487,7 @@ class TurbohaulQueue:
         for i, slot in enumerate(buf):
             if slot is target:
                 del buf[i]
-                if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-                    slot.is_evicted = True
+                queue_liveness.stamp_if_disconnected(slot)
                 return slot
         return None
 
@@ -1738,8 +1735,7 @@ class TurbohaulQueue:
                 del buf[i]
                 if slot.state is SlotState.ACCEPT_BUFFER:
                     fsm_transition(slot, SlotState.STAGED)
-                if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-                    slot.is_evicted = True
+                queue_liveness.stamp_if_disconnected(slot)
                 self._log_queue_priority(
                     slot,
                     reason="main-lane",
@@ -1792,8 +1788,7 @@ class TurbohaulQueue:
                 del buf[i]
                 if slot.state is SlotState.ACCEPT_BUFFER:
                     fsm_transition(slot, SlotState.STAGED)
-                if slot.disconnect_event is not None and slot.disconnect_event.is_set():
-                    slot.is_evicted = True
+                queue_liveness.stamp_if_disconnected(slot)
                 self._log_queue_priority(
                     slot,
                     reason="compression",
@@ -2822,6 +2817,12 @@ class TurbohaulQueue:
         """
         return list(self._staging)
 
+    def waiting_snapshot(self) -> "list[Slot]":
+        """AWAIT-FREE snapshot of every waiting request: ``_staging``, then
+        ``_accept_buf``. Like :meth:`staging_snapshot` it returns the LIVE ``Slot``
+        objects (callers match by identity) and is never capped.
+        """
+        return list(self._staging) + list(self._accept_buf)
 
     def depth(self, *, inbox_waiting: int = 0, claims_waiting: int = 0) -> dict:
         """Sync snapshot of queue depths. Minor lock-skip OK for /status.

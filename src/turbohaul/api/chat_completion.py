@@ -39,6 +39,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
+from turbohaul import queue_liveness
 from turbohaul.config import KEEP_ALIVE_MAX_S  # re-exported for tests + manager
 from turbohaul.kv_policy import (
     compute_ctx_len,       # shared admission/save size rule
@@ -65,6 +66,21 @@ from turbohaul.api.tool_call_recovery import maybe_recover_tool_calls  # text-JS
 _DISCONNECT_POLL_INTERVAL_S = 2.0
 
 
+def _notify_client_gone(mgr: Any, disconnect_event: asyncio.Event) -> None:
+    """Tell the manager this request's client has gone, so a request that still waits is removed.
+
+    Synchronous on purpose: it is also called from a task that is being cancelled, which cannot
+    await. A missing manager means there is nothing to tell; a failure here must never replace
+    the outcome the caller is already producing.
+    """
+    if mgr is None:
+        return
+    try:
+        queue_liveness.notify_client_gone(mgr, disconnect_event)
+    except Exception:  # noqa: BLE001 - never replace the outcome the caller is producing
+        log.debug("could not tell the manager a client has gone", exc_info=True)
+
+
 async def watch_disconnect(
     request: Request,
     disconnect_event: asyncio.Event,
@@ -80,6 +96,10 @@ async def watch_disconnect(
         try:
             if await request.is_disconnected():
                 disconnect_event.set()
+                _notify_client_gone(
+                    getattr(getattr(getattr(request, "app", None), "state", None), "manager", None),
+                    disconnect_event,
+                )
                 return
         except Exception:
             # Transient ASGI receive() errors are non-fatal; keep polling.
@@ -1562,6 +1582,11 @@ async def openai_chat_completions(payload: dict, request: Request):
     except RuntimeError as e:
         # loading-fail / safety-gate-refused / unknown worker exception → 500
         raise HTTPException(status_code=500, detail=f"sidecar failed: {e}") from e
+    except asyncio.CancelledError:
+        # The request task was cancelled (client gone, server stopping): a request
+        # that still waits must not outlive it. Sync, then let the cancellation go on.
+        _notify_client_gone(mgr, disconnect_event)
+        raise
     finally:
         # Tear down the disconnect watcher cleanly.
         # contextlib.suppress so a normal cancellation doesn't surface from finally.
@@ -2014,15 +2039,17 @@ async def _openai_chat_completions_stream(
             # poller (same pid:spawn_seq:slot_id -> same generation_id). slot_id
             # is per-request unique, so turns of one conversation never collide.
             # Use the spawn_seq of the resident actually
-            # serving THIS model_tag, not the singleton. At cap>=2 the dispatcher
+            # serving THIS request, not the singleton. At cap>=2 the dispatcher
             # never bumps the singleton's spawn_seq (stays 0) while the metrics
             # supervisor hashes the model_tag resident's bumped spawn_seq; using
-            # _read_spawn_seq(mgr) (=singleton) here would make the text-plane tee feed a
-            # DIFFERENT generation_id than the SSE anchor, so the live pane would
-            # subscribe to an unfed buffer and show nothing. _spawn_seq_for_model
-            # unifies both planes (byte-identical at cap<=1).
+            # _read_spawn_seq(mgr) (=singleton) here made the text-plane tee feed a
+            # DIFFERENT generation_id than the SSE anchor, so the live pane
+            # subscribed to an unfed buffer and showed nothing. The serving
+            # resident is resolved from THIS request's handle (per RESIDENT, not per
+            # model_tag), so each same-model sibling tees into its own pane. The value
+            # is byte-identical at cap<=1, where no model resident owns the handle.
             gen_id_for_tee = compute_generation_id(
-                handle.pid, mgr._spawn_seq_for_model(model), slot.slot_id or slot.thread_id
+                handle.pid, mgr._spawn_seq_for_handle(handle, model), slot.slot_id or slot.thread_id
             )
 
             stream_payload = _build_stream_payload(client_meta, model, messages)
@@ -2225,6 +2252,10 @@ async def _openai_chat_completions_stream(
                 "client disconnect during stream slot=%s thread=%s",
                 slot.slot_id, slot.thread_id,
             )
+            # The watcher is cancelled in the finally below before it can poll again,
+            # so this is the only place that sees the hang-up. Sync: this task is
+            # being cancelled and cannot await.
+            _notify_client_gone(mgr, disconnect_event)
             raise
         except Exception as e:  # pragma: no cover — defensive
             log.exception(
@@ -2684,6 +2715,10 @@ async def ollama_chat(payload: dict, request: Request) -> dict:
         ) from e
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=f"sidecar failed: {e}") from e
+    except asyncio.CancelledError:
+        # Same as the OpenAI non-streaming site: tell the manager, then re-raise.
+        _notify_client_gone(mgr, disconnect_event)
+        raise
     finally:
         # Tear down disconnect watcher (ollama_chat).
         watch_task.cancel()

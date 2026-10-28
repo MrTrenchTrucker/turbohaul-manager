@@ -147,6 +147,10 @@ export interface GenerationInfo {
 
 export interface ResidentModel {
   model_tag: string;
+  // unique per-resident id (= backend r.resident_key), present on every
+  // modern backend. Optional for back-compat (older backends omit it) -- callers
+  // fall back to model_tag, which is byte-identical at cap<=1.
+  resident_key?: string;
   state: string;
   port: number;
   pid: number;

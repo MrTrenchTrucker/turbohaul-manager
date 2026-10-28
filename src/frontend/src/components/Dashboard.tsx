@@ -1,4 +1,5 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ResidentModel } from '../api';
 import { useStatus } from '../hooks/useStatus';
 import { useLiveStream } from '../hooks/useLiveStream';
 import { synthesizeResident } from './dashboard/synthesizeResident';
@@ -94,6 +95,10 @@ export function QueueCard({
 /*  Main Dashboard (split view)                                          */
 /* ------------------------------------------------------------------ */
 
+// Consecutive empty snapshots (at parallel_slots.max >= 2) that may still show
+// the held residents. The empty snapshot after these releases the held set.
+const MAX_HELD_EMPTY_SNAPSHOTS = 2;
+
 export default function Dashboard() {
   const { data, error, lastUpdate } = useStatus();
 
@@ -101,12 +106,37 @@ export default function Dashboard() {
   // partial ResidentModel from the legacy active/loading/grace/idle_hot
   // fields + the generation alias. This bridges the split-view frontend
   // back to the data the operator wants to see.
-  // THE ONE RULE lives in exactly ONE place: selectResidents (dashboard/aggregate.ts),
-  // so the dashboard cannot diverge from it: a fix to selectResidents
-  // reaches the dashboard automatically.
+  // THE ONE RULE lives in exactly ONE place: selectResidents (dashboard/aggregate.ts).
+  // Do not reimplement this rule inline here: selectResidents is the single source,
+  // so a fix to it reaches the dashboard.
+  //
+  // At cap>=2 an empty residents[] is usually a one-tick model-swap transient,
+  // not a real single-resident state. The held set is kept across up to two
+  // consecutive empty snapshots, so the grid does not collapse to one
+  // synthesized card during a swap. A third consecutive empty snapshot means
+  // the residents really left: the grid empties and no per-resident stream is
+  // opened for them. A non-empty snapshot replaces the held set and restarts the count.
+  const [heldResidents, setHeldResidents] = useState<ResidentModel[]>([]);
+  const emptyStreak = useRef(0);
+  useEffect(() => {
+    if (!data) return;
+    if (data.residents.length > 0) {
+      emptyStreak.current = 0;
+      setHeldResidents(data.residents);
+      return;
+    }
+    if (data.parallel_slots.max < 2) {
+      emptyStreak.current = 0;
+      return;
+    }
+    emptyStreak.current += 1;
+    if (emptyStreak.current > MAX_HELD_EMPTY_SNAPSHOTS) {
+      setHeldResidents((prev) => (prev.length === 0 ? prev : []));
+    }
+  }, [data]);
   const effectiveResidents = useMemo(
-    () => (data ? selectResidents(data, synthesizeResident) : []),
-    [data],
+    () => (data ? selectResidents(data, synthesizeResident, heldResidents) : []),
+    [data, heldResidents],
   );
 
   // One SSE connection PER RESIDENT, keyed off the same list the cards render
@@ -116,7 +146,7 @@ export default function Dashboard() {
   // witness while open: after a refresh it showed exactly one live output box
   // no matter how many residents were generating.
   const { panes, connected: streamConnected } = useLiveStream(
-    effectiveResidents.map((r) => r.model_tag),
+    effectiveResidents.map((r) => r.resident_key ?? r.model_tag),
   );
 
   if (!data) {

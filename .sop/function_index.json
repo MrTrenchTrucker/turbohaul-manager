@@ -62,5 +62,717 @@
   "doc": "The name to show for ``address``, or ``None`` when no candidate confirms.",
   "file": "src/turbohaul/fastlane_client_names/__init__.py",
   "line": 54
+ },
+ {
+  "module": "slot_meta_projection",
+  "name": "IDENTITY_KEYS",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/slot_meta_projection/projection.py",
+  "line": 11
+ },
+ {
+  "module": "slot_meta_projection",
+  "name": "CENSUS_KEYS",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/slot_meta_projection/projection.py",
+  "line": 24
+ },
+ {
+  "module": "slot_meta_projection",
+  "name": "CENSUS_SLOTS_SQL",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/slot_meta_projection/projection.py",
+  "line": 31
+ },
+ {
+  "module": "slot_meta_projection",
+  "name": "identity_client_meta",
+  "signature": "(client_meta)",
+  "doc": "Return the identity keys of ``client_meta`` that are present, and nothing else.",
+  "file": "src/turbohaul/slot_meta_projection/projection.py",
+  "line": 38
+ },
+ {
+  "module": "slot_meta_projection",
+  "name": "parse_census_meta",
+  "signature": "(projected)",
+  "doc": "Rebuild the small metadata dict the census needs from one projected array.",
+  "file": "src/turbohaul/slot_meta_projection/projection.py",
+  "line": 48
+ },
+ {
+  "module": "slot_meta_projection",
+  "name": "strip_stored_meta",
+  "signature": "(stored)",
+  "doc": "Return the identity-only JSON text for a stored slot body, or None when it cannot be reduced.",
+  "file": "src/turbohaul/slot_meta_projection/projection.py",
+  "line": 67
+ },
+ {
+  "module": "cold_meta_sweep",
+  "name": "run_once",
+  "signature": "(session, strip_one, db_path, watermark, age_hours, batch)",
+  "doc": "One bounded run of the retention pass over ended slots. Synchronous; call it off the event loop.",
+  "file": "src/turbohaul/cold_meta_sweep/sweep.py",
+  "line": 29
+ },
+ {
+  "module": "cold_meta_sweep",
+  "name": "maybe_sweep",
+  "signature": "(host)",
+  "doc": "Run one retention run if the setting is on and the pass is due. Returns its counts, or None.",
+  "file": "src/turbohaul/cold_meta_sweep/sweep.py",
+  "line": 67
+ },
+ {
+  "module": "kv_ram_cap",
+  "name": "dir_accounting",
+  "signature": "(save_dir, on_error)",
+  "doc": "Return ``(total_bytes, bins)`` for the ``.bin`` files in ``save_dir``.",
+  "file": "src/turbohaul/kv_ram_cap/accounting.py",
+  "line": 13
+ },
+ {
+  "module": "kv_ram_cap",
+  "name": "cap_exceeded",
+  "signature": "(total_bytes, cap_bytes)",
+  "doc": "True when ``total_bytes`` has reached ``cap_bytes``.",
+  "file": "src/turbohaul/kv_ram_cap/gate.py",
+  "line": 15
+ },
+ {
+  "module": "kv_ram_cap",
+  "name": "SaveGate",
+  "signature": "",
+  "doc": "The outcome of :func:`enforce_save_cap`, with the numbers a log line needs.",
+  "file": "src/turbohaul/kv_ram_cap/gate.py",
+  "line": 25
+ },
+ {
+  "module": "kv_ram_cap",
+  "name": "enforce_save_cap",
+  "signature": "(cap_bytes, measure, make_room)",
+  "doc": "Decide whether a save may proceed, driving ``make_room`` once if the cap is reached.",
+  "file": "src/turbohaul/kv_ram_cap/gate.py",
+  "line": 34
+ },
+ {
+  "module": "kv_ram_cap",
+  "name": "ProtectionSplit",
+  "signature": "",
+  "doc": "The two protection tiers, as sets of thread hashes.",
+  "file": "src/turbohaul/kv_ram_cap/protection.py",
+  "line": 15
+ },
+ {
+  "module": "kv_ram_cap",
+  "name": "split_protection",
+  "signature": "(hard_threads, soft_threads, thread_hash, bin_identity, on_error)",
+  "doc": "Build the HARD and SOFT hash sets from ``(thread_id, client_meta, chain)`` triples.",
+  "file": "src/turbohaul/kv_ram_cap/protection.py",
+  "line": 38
+ },
+ {
+  "module": "kv_ram_cap",
+  "name": "soft_age_targets",
+  "signature": "(candidates, entries, hash_by_path, soft_hashes)",
+  "doc": "Bins the age prune may reclaim: the unprotected candidates, then the SOFT-thread bins.",
+  "file": "src/turbohaul/kv_ram_cap/selection.py",
+  "line": 12
+ },
+ {
+  "module": "kv_ram_cap",
+  "name": "soft_ceiling_order",
+  "signature": "(surviving, deleted_paths, hard_hashes, soft_hashes, pinned_paths, hash_by_path)",
+  "doc": "SOFT bins the ceiling prune may take once every unprotected bin has gone, oldest first.",
+  "file": "src/turbohaul/kv_ram_cap/selection.py",
+  "line": 22
+ },
+ {
+  "module": "kv_stale_pairs",
+  "name": "drop_stale_pairs",
+  "signature": "(save_dir, model_tag, thread_hash, new_port, live_turns, landed_bytes, n_written, remove)",
+  "doc": "Remove the pairs ``thread_hash`` left on ports other than ``new_port``, and report what went.",
+  "file": "src/turbohaul/kv_stale_pairs/drop.py",
+  "line": 94
+ },
+ {
+  "module": "kv_stale_pairs",
+  "name": "StalePair",
+  "signature": "",
+  "doc": "One saved bin of the thread on a port it left, and the bytes its pair held.",
+  "file": "src/turbohaul/kv_stale_pairs/model.py",
+  "line": 9
+ },
+ {
+  "module": "kv_stale_pairs",
+  "name": "DropResult",
+  "signature": "",
+  "doc": "What a drop did.",
+  "file": "src/turbohaul/kv_stale_pairs/model.py",
+  "line": 19
+ },
+ {
+  "module": "kv_stack_wiring",
+  "name": "live_turn_groups",
+  "signature": "(host, bin_identity)",
+  "doc": "Which engine ports a live turn serves, as the stale-pair drop wants them.",
+  "file": "src/turbohaul/kv_stack_wiring/live_state.py",
+  "line": 35
+ },
+ {
+  "module": "kv_stack_wiring",
+  "name": "live_kv_protection",
+  "signature": "(host, bin_identity)",
+  "doc": "Split live KV-protection into (HARD, SOFT) thread_hash sets.",
+  "file": "src/turbohaul/kv_stack_wiring/live_state.py",
+  "line": 69
+ },
+ {
+  "module": "kv_stack_wiring",
+  "name": "dir_accounting_logged",
+  "signature": "(save_dir)",
+  "doc": "Return ``(total_bytes, bins)`` for ``save_dir``, logging a failed scan at DEBUG.",
+  "file": "src/turbohaul/kv_stack_wiring/save_path.py",
+  "line": 35
+ },
+ {
+  "module": "kv_stack_wiring",
+  "name": "save_declined_by_cap",
+  "signature": "(host)",
+  "doc": "True when the slot KV save must be declined because the RAM cap holds.",
+  "file": "src/turbohaul/kv_stack_wiring/save_path.py",
+  "line": 48
+ },
+ {
+  "module": "kv_stack_wiring",
+  "name": "drop_stale_pairs_after_save",
+  "signature": "(host, drop_fn, save_dir, model_tag, thread_hash, port, final_path, n_written, bin_fn)",
+  "doc": "One pair per thread: the new pair has landed, so the pairs this thread left on other ports go.",
+  "file": "src/turbohaul/kv_stack_wiring/save_path.py",
+  "line": 77
+ },
+ {
+  "module": "kv_stack_wiring",
+  "name": "evict_soft_floor",
+  "signature": "(surviving, deleted_paths, hard_hashes, soft_hashes, pinned_paths, hash_by_path, total, max_bytes, unlink_pair)",
+  "doc": "The GC's fallback when a HARD floor holds the directory over its cap.",
+  "file": "src/turbohaul/kv_stack_wiring/save_path.py",
+  "line": 111
+ },
+ {
+  "module": "co_residence",
+  "name": "RECHECK_MIN_INTERVAL_S",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/co_residence/constants.py",
+  "line": 11
+ },
+ {
+  "module": "co_residence",
+  "name": "NO_ROOM_MEMO_S",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/co_residence/constants.py",
+  "line": 15
+ },
+ {
+  "module": "co_residence",
+  "name": "DEMAND_MIN_AGE_S",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/co_residence/constants.py",
+  "line": 19
+ },
+ {
+  "module": "co_residence",
+  "name": "PROTECTED_DEMAND_MIN_AGE_S",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/co_residence/constants.py",
+  "line": 23
+ },
+ {
+  "module": "co_residence",
+  "name": "MEMO_MAX_ENTRIES",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/co_residence/constants.py",
+  "line": 27
+ },
+ {
+  "module": "co_residence",
+  "name": "RecheckInputs",
+  "signature": "",
+  "doc": "What the caller measured for one tag.",
+  "file": "src/turbohaul/co_residence/decision.py",
+  "line": 13
+ },
+ {
+  "module": "co_residence",
+  "name": "RecheckDecision",
+  "signature": "",
+  "doc": "The decision, with the reason attached so a log can say which rule applied.",
+  "file": "src/turbohaul/co_residence/decision.py",
+  "line": 27
+ },
+ {
+  "module": "co_residence",
+  "name": "decide_recheck",
+  "signature": "(inputs)",
+  "doc": "Say whether to re-ask the second-engine spawn path for this tag.",
+  "file": "src/turbohaul/co_residence/decision.py",
+  "line": 34
+ },
+ {
+  "module": "co_residence",
+  "name": "CoResidenceHost",
+  "signature": "",
+  "doc": "Everything the module touches on the manager. Nothing else may be used.",
+  "file": "src/turbohaul/co_residence/host.py",
+  "line": 89
+ },
+ {
+  "module": "co_residence",
+  "name": "DeclineReason",
+  "signature": "",
+  "doc": "Why the step-2 spawn path did not add a second engine for a tag.",
+  "file": "src/turbohaul/co_residence/lines.py",
+  "line": 14
+ },
+ {
+  "module": "co_residence",
+  "name": "format_step2_decline",
+  "signature": "()",
+  "doc": "The single INFO line for a declined second engine; no trailing newline.",
+  "file": "src/turbohaul/co_residence/lines.py",
+  "line": 45
+ },
+ {
+  "module": "co_residence",
+  "name": "format_recheck_action",
+  "signature": "()",
+  "doc": "The single INFO line for a re-check that is about to take a waiting slot; no trailing newline.",
+  "file": "src/turbohaul/co_residence/lines.py",
+  "line": 67
+ },
+ {
+  "module": "co_residence",
+  "name": "NoRoomMemo",
+  "signature": "",
+  "doc": "Key -> expiry time, with a fixed time-to-live and a fixed size bound.",
+  "file": "src/turbohaul/co_residence/memo.py",
+  "line": 14
+ },
+ {
+  "module": "co_residence",
+  "name": "run_recheck",
+  "signature": "(host)",
+  "doc": "Run one re-check pass. Never raises, except for a cancellation.",
+  "file": "src/turbohaul/co_residence/recheck.py",
+  "line": 35
+ },
+ {
+  "module": "co_residence",
+  "name": "Candidate",
+  "signature": "",
+  "doc": "One waiting request: its age, source rank (0 staged, 1 inbox), source, slot and owner.",
+  "file": "src/turbohaul/co_residence/scan.py",
+  "line": 23
+ },
+ {
+  "module": "co_residence",
+  "name": "inbox_slots",
+  "signature": "(r)",
+  "doc": "The slots waiting in ``r``'s inbox right now, oldest first.",
+  "file": "src/turbohaul/co_residence/scan.py",
+  "line": 33
+ },
+ {
+  "module": "co_residence",
+  "name": "take_from_inbox",
+  "signature": "(r, slot)",
+  "doc": "Take ``slot`` (matched by identity) out of ``r``'s inbox; None when it is not there.",
+  "file": "src/turbohaul/co_residence/scan.py",
+  "line": 41
+ },
+ {
+  "module": "co_residence",
+  "name": "gather_candidates",
+  "signature": "(host, now, grace_pairs)",
+  "doc": "Every waiting request old enough to count, oldest first, staged before inbox on a tie.",
+  "file": "src/turbohaul/co_residence/scan.py",
+  "line": 65
+ },
+ {
+  "module": "co_residence",
+  "name": "pick_candidate",
+  "signature": "(host, state, cands, now)",
+  "doc": "The oldest candidate of the first tag the per-tag decision lets run, or None.",
+  "file": "src/turbohaul/co_residence/scan.py",
+  "line": 96
+ },
+ {
+  "module": "co_residence",
+  "name": "RecheckState",
+  "signature": "",
+  "doc": "When the last attempt ran, and the two bounded memos the re-check uses.",
+  "file": "src/turbohaul/co_residence/state.py",
+  "line": 11
+ },
+ {
+  "module": "co_residence",
+  "name": "Verdict",
+  "signature": "",
+  "doc": "Admit a further engine on ``card`` / ``split`` (need in MiB), or decline with ``reason``.",
+  "file": "src/turbohaul/co_residence/verdict.py",
+  "line": 27
+ },
+ {
+  "module": "co_residence",
+  "name": "fit_verdict",
+  "signature": "(host, state, tag, insts, now)",
+  "doc": "The re-check verdict: does one more engine of ``tag`` fit? Caller holds the registry lock.",
+  "file": "src/turbohaul/co_residence/verdict.py",
+  "line": 65
+ },
+ {
+  "module": "co_residence",
+  "name": "arrival_verdict",
+  "signature": "(host, tag, insts, eff_cap, slot)",
+  "doc": "The arrival verdict: the tag's own ceiling and the box budget first, then the fit.",
+  "file": "src/turbohaul/co_residence/verdict.py",
+  "line": 101
+ },
+ {
+  "module": "co_residence",
+  "name": "RecheckGate",
+  "signature": "",
+  "doc": "Whether a re-check attempt may run now, with the reason attached for a log.",
+  "file": "src/turbohaul/co_residence/window.py",
+  "line": 18
+ },
+ {
+  "module": "co_residence",
+  "name": "recheck_window",
+  "signature": "()",
+  "doc": "Decide whether the box-wide re-check may run an attempt now: debounce only.",
+  "file": "src/turbohaul/co_residence/window.py",
+  "line": 25
+ },
+ {
+  "module": "co_residence",
+  "name": "demand_is_eligible",
+  "signature": "()",
+  "doc": "True when a waiting request has waited long enough to count as starved demand.",
+  "file": "src/turbohaul/co_residence/window.py",
+  "line": 38
+ },
+ {
+  "module": "coresident_admission",
+  "name": "SiblingLoad",
+  "signature": "",
+  "doc": "One model already resident on the box, as the caller sees it.",
+  "file": "src/turbohaul/coresident_admission/__init__.py",
+  "line": 46
+ },
+ {
+  "module": "coresident_admission",
+  "name": "retry_read_free_vram",
+  "signature": "(read, attempts)",
+  "doc": "Return the first non-empty per-card free-MiB reading, or an empty list.",
+  "file": "src/turbohaul/coresident_admission/__init__.py",
+  "line": 63
+ },
+ {
+  "module": "coresident_admission",
+  "name": "reserved_loading_mib",
+  "signature": "(siblings, gpu)",
+  "doc": "Return the VRAM still to be taken by booting siblings on card ``gpu``.",
+  "file": "src/turbohaul/coresident_admission/__init__.py",
+  "line": 83
+ },
+ {
+  "module": "coresident_admission",
+  "name": "fits",
+  "signature": "(free_mib, reserve_mib, credit_mib, need_mib)",
+  "doc": "Return True when the card has room for ``need_mib`` after reserve and credit.",
+  "file": "src/turbohaul/coresident_admission/__init__.py",
+  "line": 93
+ },
+ {
+  "module": "coresident_admission",
+  "name": "admit",
+  "signature": "(vals, main_gpu, siblings, credit, need)",
+  "doc": "Decide admission from a per-card free-MiB reading.",
+  "file": "src/turbohaul/coresident_admission/__init__.py",
+  "line": 102
+ },
+ {
+  "module": "resident_exit",
+  "name": "needs_exit_line",
+  "signature": "(reason)",
+  "doc": "False only for MAKE_ROOM, whose death is already logged by the make-room path.",
+  "file": "src/turbohaul/resident_exit/exit_line.py",
+  "line": 14
+ },
+ {
+  "module": "resident_exit",
+  "name": "format_resident_exit",
+  "signature": "()",
+  "doc": "The one RESIDENT_EXIT line for a death, with no trailing newline.",
+  "file": "src/turbohaul/resident_exit/exit_line.py",
+  "line": 57
+ },
+ {
+  "module": "resident_exit",
+  "name": "ExitReason",
+  "signature": "",
+  "doc": "The cause recorded on a resident's exit line.",
+  "file": "src/turbohaul/resident_exit/reasons.py",
+  "line": 13
+ },
+ {
+  "module": "resident_exit",
+  "name": "RetentionInputs",
+  "signature": "",
+  "doc": "Everything the keep-warm decision needs, measured by the caller.",
+  "file": "src/turbohaul/resident_exit/retention.py",
+  "line": 22
+ },
+ {
+  "module": "resident_exit",
+  "name": "RetentionDecision",
+  "signature": "",
+  "doc": "The keep-warm answer, with the rule that produced it so a log can say why.",
+  "file": "src/turbohaul/resident_exit/retention.py",
+  "line": 53
+ },
+ {
+  "module": "resident_exit",
+  "name": "decide_retention",
+  "signature": "(inputs)",
+  "doc": "Apply the rules in order; the first one that matches decides.",
+  "file": "src/turbohaul/resident_exit/retention.py",
+  "line": 66
+ },
+ {
+  "module": "resident_exit_wiring",
+  "name": "log_resident_exit",
+  "signature": "(r, reason, state_before, port)",
+  "doc": "One RESIDENT_EXIT line per resident death. Best-effort: never raises into the death path.",
+  "file": "src/turbohaul/resident_exit_wiring/exit_log.py",
+  "line": 19
+ },
+ {
+  "module": "resident_exit_wiring",
+  "name": "resolve_exit_reason",
+  "signature": "(r, idle)",
+  "doc": "The reason a resident's death is logged under: the one the caller stamped, else a default.",
+  "file": "src/turbohaul/resident_exit_wiring/exit_log.py",
+  "line": 40
+ },
+ {
+  "module": "resident_exit_wiring",
+  "name": "hold_warm_window",
+  "signature": "(host, r, idle_window, hold_window_s)",
+  "doc": "Keep a finishing co-resident warm for a bounded window.",
+  "file": "src/turbohaul/resident_exit_wiring/hold.py",
+  "line": 29
+ },
+ {
+  "module": "state_db_cleanup",
+  "name": "parse_args",
+  "signature": "(argv)",
+  "doc": "",
+  "file": "src/turbohaul/state_db_cleanup/cli.py",
+  "line": 15
+ },
+ {
+  "module": "state_db_cleanup",
+  "name": "main",
+  "signature": "(argv, env)",
+  "doc": "",
+  "file": "src/turbohaul/state_db_cleanup/cli.py",
+  "line": 35
+ },
+ {
+  "module": "state_db_cleanup",
+  "name": "Stop",
+  "signature": "",
+  "doc": "A gate failed. The run ends here; ``step`` names the gate.",
+  "file": "src/turbohaul/state_db_cleanup/config.py",
+  "line": 20
+ },
+ {
+  "module": "state_db_cleanup",
+  "name": "Config",
+  "signature": "",
+  "doc": "",
+  "file": "src/turbohaul/state_db_cleanup/config.py",
+  "line": 30
+ },
+ {
+  "module": "state_db_cleanup",
+  "name": "run",
+  "signature": "(cfg, env)",
+  "doc": "",
+  "file": "src/turbohaul/state_db_cleanup/sequence.py",
+  "line": 25
+ },
+ {
+  "module": "state_db_cleanup",
+  "name": "Env",
+  "signature": "",
+  "doc": "The run's view of the outside world.",
+  "file": "src/turbohaul/state_db_cleanup/world.py",
+  "line": 40
+ },
+ {
+  "module": "resident_identity",
+  "name": "LoadLike",
+  "signature": "",
+  "doc": "One engine's registry entry: the attributes the load reads.",
+  "file": "src/turbohaul/resident_identity/engine_load.py",
+  "line": 24
+ },
+ {
+  "module": "resident_identity",
+  "name": "pending_load",
+  "signature": "(r)",
+  "doc": "The work pending on engine ``r``: riders in flight, plus one for a running turn, plus the inbox depth.",
+  "file": "src/turbohaul/resident_identity/engine_load.py",
+  "line": 38
+ },
+ {
+  "module": "resident_identity",
+  "name": "stash_identity",
+  "signature": "(host, r, slot, singleton_key)",
+  "doc": "Store the identity of the request just bound to resident ``r`` under ``r.resident_key``.",
+  "file": "src/turbohaul/resident_identity/identity.py",
+  "line": 18
+ },
+ {
+  "module": "resident_identity",
+  "name": "identity_for",
+  "signature": "(host, r)",
+  "doc": "The stored identity of resident ``r``, or None. A resident with no key reads the entry of its model tag.",
+  "file": "src/turbohaul/resident_identity/identity.py",
+  "line": 41
+ },
+ {
+  "module": "resident_identity",
+  "name": "forget_identity",
+  "signature": "(host, r)",
+  "doc": "Drop the identity stored under ``r.resident_key``, always exactly that key: a same-model sibling has its own.",
+  "file": "src/turbohaul/resident_identity/identity.py",
+  "line": 46
+ },
+ {
+  "module": "resident_identity",
+  "name": "ResidentLike",
+  "signature": "",
+  "doc": "One engine's registry entry: the attributes the module reads.",
+  "file": "src/turbohaul/resident_identity/identity_host.py",
+  "line": 16
+ },
+ {
+  "module": "resident_identity",
+  "name": "SlotLike",
+  "signature": "",
+  "doc": "The request just bound to a resident: the attributes the identity is built from.",
+  "file": "src/turbohaul/resident_identity/identity_host.py",
+  "line": 25
+ },
+ {
+  "module": "resident_identity",
+  "name": "ResidentIdentityHost",
+  "signature": "",
+  "doc": "The manager, reduced to the four members the module uses.",
+  "file": "src/turbohaul/resident_identity/identity_host.py",
+  "line": 34
+ },
+ {
+  "module": "resident_identity",
+  "name": "serving_resident",
+  "signature": "(host, handle)",
+  "doc": "The first resident of the host's snapshot whose ``handle`` is ``handle``, or None.",
+  "file": "src/turbohaul/resident_identity/serving.py",
+  "line": 8
+ },
+ {
+  "module": "resident_identity",
+  "name": "spawn_seq_for_handle",
+  "signature": "(host, handle, model_tag)",
+  "doc": "The spawn counter of the resident serving ``handle``.",
+  "file": "src/turbohaul/resident_identity/serving.py",
+  "line": 20
+ },
+ {
+  "module": "queue_liveness",
+  "name": "evict_unstarted",
+  "signature": "(host, slot)",
+  "doc": "Remove one waiting request at the source: flag it, free its claim, drop it from the queues, fail it.",
+  "file": "src/turbohaul/queue_liveness/eviction.py",
+  "line": 58
+ },
+ {
+  "module": "queue_liveness",
+  "name": "notify_client_gone",
+  "signature": "(host, event)",
+  "doc": "Tell the system a client has gone: set its event and schedule the eviction of its waiting requests.",
+  "file": "src/turbohaul/queue_liveness/eviction.py",
+  "line": 110
+ },
+ {
+  "module": "queue_liveness",
+  "name": "client_gone",
+  "signature": "(slot)",
+  "doc": "True when the request's client has gone: the slot is already flagged evicted, or its",
+  "file": "src/turbohaul/queue_liveness/liveness.py",
+  "line": 12
+ },
+ {
+  "module": "queue_liveness",
+  "name": "stamp_if_disconnected",
+  "signature": "(slot)",
+  "doc": "Flag the slot evicted when its disconnect event is set, and say whether its client is gone.",
+  "file": "src/turbohaul/queue_liveness/liveness.py",
+  "line": 19
+ },
+ {
+  "module": "queue_liveness",
+  "name": "drop_if_gone",
+  "signature": "(host, slot)",
+  "doc": "Flag the slot if its client has gone and, if so, fail it once. True iff the client is gone.",
+  "file": "src/turbohaul/queue_liveness/liveness.py",
+  "line": 44
+ },
+ {
+  "module": "queue_liveness",
+  "name": "SlotLike",
+  "signature": "",
+  "doc": "One waiting request: the attributes the module reads and writes.",
+  "file": "src/turbohaul/queue_liveness/liveness_host.py",
+  "line": 37
+ },
+ {
+  "module": "queue_liveness",
+  "name": "ResidentLike",
+  "signature": "",
+  "doc": "One engine's registry entry: the attributes the module reads.",
+  "file": "src/turbohaul/queue_liveness/liveness_host.py",
+  "line": 47
+ },
+ {
+  "module": "queue_liveness",
+  "name": "QueueLivenessHost",
+  "signature": "",
+  "doc": "The manager, reduced to the six members the module uses.",
+  "file": "src/turbohaul/queue_liveness/liveness_host.py",
+  "line": 67
  }
 ]
